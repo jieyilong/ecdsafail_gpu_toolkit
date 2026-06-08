@@ -108,11 +108,11 @@ search)
   KENV=$( [ "$KERNEL" = 3 ] && echo "KERNEL3=1" || echo "KERNEL2=1" )
   if [ "$GPU" = local ]; then
     [ -x "$KBIN" ] || die "run './island.sh build' first (kernel $KERNEL)"
-    GPU_ISLAND_BIN="$KBIN" GPU_STATE_FILE="$STATE" BLOCKS="$BLOCKS" $KENV \
+    GPU_ISLAND_BIN="$KBIN" GPU_STATE_FILE="$STATE" BLOCKS="$BLOCKS" env $KENV \
       bash "$HERE/runtime/search_driver.sh" "$START" "$N" "$CHUNK" "$GPUS"
   else
     need_remote; rcp "$STATE" state.bin
-    rsh "GPU_ISLAND_BIN=\$HOME/$RDIR/gpu_island GPU_STATE_FILE=\$HOME/$RDIR/state.bin BLOCKS=$BLOCKS $KENV \
+    rsh "GPU_ISLAND_BIN=\$HOME/$RDIR/gpu_island GPU_STATE_FILE=\$HOME/$RDIR/state.bin BLOCKS=$BLOCKS env $KENV \
          bash \$HOME/$RDIR/search_driver.sh $START $N $CHUNK $GPUS"
   fi
   ;;

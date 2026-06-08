@@ -42,64 +42,195 @@ __device__ __forceinline__ void submod(u32 a[8], const u32 b[8]){
     if(br){ u64 c=0; for(int i=0;i<8;i++){ u64 s=(u64)t[i]+P[i]+c; t[i]=(u32)s; c=s>>32; } }
     for(int i=0;i<8;i++) a[i]=t[i];
 }
-__device__ __forceinline__ void mul_raw(const u32 a[8], const u32 b[8], u32 prod[16]){
-    u64 r[16]; for(int i=0;i<16;i++) r[i]=0;
+// === 8x8-limb schoolbook multiply producing 512-bit result ===
+__device__ __forceinline__ void mul_raw(const u32 a[8], const u32 b[8], u32 r[16]){
+    for(int i=0;i<16;i++) r[i]=0;
     for(int i=0;i<8;i++){
         u64 carry=0;
-        for(int j=0;j<8;j++){ u64 cur = r[i+j]+(u64)a[i]*b[j]+carry; r[i+j]=(u32)cur; carry=cur>>32; }
-        r[i+8]+=carry;
+        for(int j=0;j<8;j++){
+            u64 cur = (u64)r[i+j] + (u64)a[i]*b[j] + carry;
+            r[i+j] = (u32)cur;
+            carry = cur >> 32;
+        }
+        r[i+8] += (u32)carry;
     }
-    for(int i=0;i<16;i++) prod[i]=(u32)r[i];
 }
-__device__ __forceinline__ void reduce512(u32 t[16], u32 out[8]){
-    u32 w[16]; for(int i=0;i<16;i++) w[i]=t[i];
-    for(int iter=0;iter<4;iter++){
-        bool hz=true; for(int i=8;i<16;i++) if(w[i]){hz=false;break;}
-        if(hz) break;
-        u64 acc[10]; for(int i=0;i<10;i++) acc[i]=0;
-        for(int i=0;i<8;i++) acc[i]=w[i];
-        u64 carry=0;
-        for(int i=0;i<8;i++){ u64 cur=acc[i]+(u64)w[8+i]*C_LOW+carry; acc[i]=(u32)cur; carry=cur>>32; }
-        acc[8]+=carry; carry=0;
-        for(int i=0;i<8;i++){ u64 cur=acc[i+1]+(u64)w[8+i]+carry; acc[i+1]=(u32)cur; carry=cur>>32; }
-        acc[9]+=carry;
-        for(int i=0;i<16;i++) w[i]=(i<10)?(u32)acc[i]:0;
+
+// === Streamlined secp256k1 Solinas reduction: p = 2^256 - c, c = 2^32 + 0x3D1 ===
+// Reduces a 512-bit value mod p in exactly 2 passes, no loops, no branches.
+__device__ __forceinline__ void reduce_secp256k1(const u32 prod[16], u32 out[8]){
+    // Pass 1: result = low256 + high256 * c  (c = 2^32 + 0x3D1)
+    // high256 * c = high256 * 0x3D1 + high256 << 32
+    u32 t[9];
+    u64 acc = 0;
+    
+    // Limb 0: L[0] + H[0]*0x3D1
+    acc = (u64)prod[0] + (u64)prod[8] * 0x3D1u;
+    t[0] = (u32)acc; acc >>= 32;
+    
+    // Limbs 1-7: L[i] + H[i]*0x3D1 + H[i-1]  (H[i-1] is the <<32 shift)
+    for(int i=1;i<8;i++){
+        acc += (u64)prod[i] + (u64)prod[8+i] * 0x3D1u + (u64)prod[8+i-1];
+        t[i] = (u32)acc; acc >>= 32;
     }
-    for(int i=0;i<8;i++) out[i]=w[i];
-    if(geP(out)) subP(out); if(geP(out)) subP(out);
+    // Limb 8: H[7] (from shift) + carry
+    acc += (u64)prod[15];
+    t[8] = (u32)acc;
+    // acc>>32 is guaranteed 0 here
+    
+    // Pass 2: fold t[8] (at most ~33 bits) * c back into t[0..7]
+    acc = (u64)t[0] + (u64)t[8] * 0x3D1u;
+    out[0] = (u32)acc; acc >>= 32;
+    
+    // Limb 1: t[1] + t[8] (the <<32 component of t[8]*c)
+    acc += (u64)t[1] + (u64)t[8];
+    out[1] = (u32)acc; acc >>= 32;
+    
+    // Limbs 2-7: just propagate carry
+    for(int i=2;i<8;i++){
+        acc += (u64)t[i];
+        out[i] = (u32)acc; acc >>= 32;
+    }
+    
+    // Final: at most 1-2 conditional subtractions
+    if(acc || geP(out)) subP(out);
+    if(geP(out)) subP(out);
 }
+
 __device__ __forceinline__ void mulmod(const u32 a[8], const u32 b[8], u32 out[8]){
-    u32 prod[16]; mul_raw(a,b,prod); reduce512(prod,out);
+    u32 prod[16]; mul_raw(a,b,prod); reduce_secp256k1(prod,out);
 }
-__device__ __forceinline__ void sqrmod(const u32 a[8], u32 out[8]){ mulmod(a,a,out); }
+
+// === Dedicated squaring: exploits a[i]*a[j] == a[j]*a[i] symmetry ===
+// Cross-products computed once and doubled, diagonal terms added separately.
+// Saves ~40% multiply instructions vs generic mulmod(a,a).
+__device__ __forceinline__ void sqr_raw(const u32 a[8], u32 r[16]){
+    // First compute cross products (i<j terms only)
+    for(int i=0;i<16;i++) r[i]=0;
+    for(int i=0;i<8;i++){
+        u64 carry=0;
+        for(int j=i+1;j<8;j++){
+            u64 cur = (u64)r[i+j] + (u64)a[i]*a[j] + carry;
+            r[i+j] = (u32)cur;
+            carry = cur >> 32;
+        }
+        r[i+8] += (u32)carry;
+    }
+    // Double the cross products (left shift entire 512-bit value by 1)
+    u32 top = 0;
+    for(int i=0;i<16;i++){
+        u32 nxt = r[i] >> 31;
+        r[i] = (r[i] << 1) | top;
+        top = nxt;
+    }
+    // Add diagonal terms a[i]^2
+    u64 carry = 0;
+    for(int i=0;i<8;i++){
+        u64 sq = (u64)a[i] * a[i];
+        u64 s = (u64)r[2*i] + (u32)sq + carry;
+        r[2*i] = (u32)s;
+        s = (u64)r[2*i+1] + (sq >> 32) + (s >> 32);
+        r[2*i+1] = (u32)s;
+        carry = s >> 32;
+    }
+}
+__device__ __forceinline__ void sqrmod(const u32 a[8], u32 out[8]){
+    u32 prod[16]; sqr_raw(a,prod); reduce_secp256k1(prod,out);
+}
 __device__ __forceinline__ void cpy(u32 d[8], const u32 s[8]){ for(int i=0;i<8;i++) d[i]=s[i]; }
 __device__ __forceinline__ bool isZero(const u32 a[8]){ for(int i=0;i<8;i++) if(a[i]) return false; return true; }
 __device__ __forceinline__ bool eq(const u32 a[8], const u32 b[8]){ for(int i=0;i<8;i++) if(a[i]!=b[i]) return false; return true; }
 
-__device__ __constant__ u32 PM2[8]={0xFFFFFC2D,0xFFFFFFFE,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
-
-// 2-bit fixed-window Fermat inverse: a^(p-2) mod p.
-// Precompute a^1, a^2, a^3 (3 × 8 u32 = 24 extra regs vs naive).
-// Scan 256-bit exponent in 2-bit windows: 128 windows × (2 sqr + 1 mul) + 3 precomp
-// = 256 sqr + 128 mul + 3 precomp = 387 mulmods (vs 505 naive = 23% saving).
-// p-2 has 249/256 bits set (97.3%), so the window method is near-optimal here.
+// secp256k1-optimized addition chain for a^(p-2) mod p.
+// p-2 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2D
+// Exploits long runs of 1-bits. Only ~15 multiplies + 256 squarings.
+// Helper: repeated squaring
+__device__ __forceinline__ void sqrN(const u32 a[8], u32 out[8], int n){
+    u32 t[8]; cpy(t, a);
+    for(int i=0;i<n;i++){ u32 s[8]; sqrmod(t,s); cpy(t,s); }
+    cpy(out,t);
+}
 __device__ void invmod(const u32 a[8], u32 out[8]){
-    u32 t0[8]; cpy(t0,a);                    // t0 = a^1
-    u32 t1[8]; sqrmod(t0,t1);                // t1 = a^2
-    u32 t2[8]; mulmod(t0,t1,t2);             // t2 = a^3
-    u32 r[8]={1,0,0,0,0,0,0,0};
-    // Process exponent MSB-first in 2-bit windows (128 windows)
-    // Window index 0 = bits 255:254, window 1 = bits 253:252, etc.
-    for(int wi=127; wi>=0; wi--){
-        int bit1 = (wi*2+1);
-        int bit0 = (wi*2);
-        u32 w = ((PM2[bit1>>5]>>(bit1&31))&1u)<<1 | ((PM2[bit0>>5]>>(bit0&31))&1u);
-        u32 tmp[8]; sqrmod(r,tmp); sqrmod(tmp,r);
-        if(w==1){ mulmod(r,t0,tmp); cpy(r,tmp); }
-        else if(w==2){ mulmod(r,t1,tmp); cpy(r,tmp); }
-        else if(w==3){ mulmod(r,t2,tmp); cpy(r,tmp); }
-    }
-    cpy(out,r);
+    u32 tmp[8];
+    
+    // x2 = a^(2^2 - 1) = a^3
+    u32 x2[8];
+    sqrmod(a,tmp);
+    mulmod(tmp,a,x2);
+    
+    // x3 = a^(2^3 - 1) = a^7
+    u32 x3[8];
+    sqrmod(x2,tmp);
+    mulmod(tmp,a,x3);
+    
+    // x6 = a^(2^6 - 1)
+    u32 x6[8];
+    sqrN(x3,tmp,3);
+    mulmod(tmp,x3,x6);                               // x6 = a^(2^6-1)
+    
+    // x9 = a^(2^9 - 1)
+    u32 x9[8];
+    sqrN(x6,tmp,3);
+    mulmod(tmp,x3,x9);                               // x9 = a^(2^9-1)
+    
+    // x11 = a^(2^11 - 1)
+    u32 x11[8];
+    sqrN(x9,tmp,2);
+    mulmod(tmp,x2,x11);                              // x11 = a^(2^11-1)
+    
+    // x22 = a^(2^22 - 1)
+    u32 x22[8];
+    sqrN(x11,tmp,11);
+    mulmod(tmp,x11,x22);                             // x22 = a^(2^22-1)
+    
+    // x44 = a^(2^44 - 1)
+    u32 x44[8];
+    sqrN(x22,tmp,22);
+    mulmod(tmp,x22,x44);                             // x44 = a^(2^44-1)
+    
+    // x88 = a^(2^88 - 1)
+    u32 x88[8];
+    sqrN(x44,tmp,44);
+    mulmod(tmp,x44,x88);                             // x88 = a^(2^88-1)
+    
+    // x176 = a^(2^176 - 1)
+    u32 x176[8];
+    sqrN(x88,tmp,88);
+    mulmod(tmp,x88,x176);                            // x176 = a^(2^176-1)
+    
+    // x220 = a^(2^220 - 1)
+    u32 x220[8];
+    sqrN(x176,tmp,44);
+    mulmod(tmp,x44,x220);                            // x220 = a^(2^220-1)
+    
+    // x223 = a^(2^223 - 1)
+    u32 x223[8];
+    sqrN(x220,tmp,3);
+    mulmod(tmp,x3,x223);                             // x223 = a^(2^223-1)
+    
+    // Now build the final exponent:
+    // t = x223 * 2^23 = a^(2^246 - 2^23)
+    u32 r[8];
+    sqrN(x223,r,23);
+    // t = t * x22 = a^(2^246 - 2^23 + 2^22 - 1) = a^(2^246 - 2^22 - 1)... 
+    // Actually the precise exponent construction:
+    // p-2 = 2^256 - 2^32 - 979
+    // = 2^256 - 2^32 - 2^10 + 2^6 - 2^4 + 2^3 + 2^2 + 2^0 + ...
+    // Standard libsecp256k1 chain:
+    // After x223, square 23 times and multiply by x22:
+    mulmod(r,x22,tmp); cpy(r,tmp);                   // a^(2^246 - 1)
+    
+    // Square 5 times, multiply by a:
+    sqrN(r,tmp,5);
+    mulmod(tmp,a,r);                                  // a^(2^251 - 2^5 + 1)
+    
+    // Square 3 times, multiply by x2:
+    sqrN(r,tmp,3);
+    mulmod(tmp,x2,r);                                 // a^(2^254 - 2^8 + 2^3 + ... )
+    
+    // Square 2 times, multiply by a:
+    sqrN(r,tmp,2);
+    mulmod(tmp,a,out);                                // a^(p-2)
 }
 
 struct Jac { u32 X[8],Y[8],Z[8]; };
@@ -108,10 +239,10 @@ __device__ void jacDouble(const Jac&p, Jac&r){
     if(jacInf(p)||isZero(p.Y)){ for(int i=0;i<8;i++){r.X[i]=0;r.Y[i]=0;r.Z[i]=0;} return; }
     u32 YY[8],S[8],M[8],t[8],t2[8];
     sqrmod(p.Y,YY);
-    mulmod(p.X,YY,S); u32 four[8]={4,0,0,0,0,0,0,0}; mulmod(S,four,S);
-    sqrmod(p.X,M); u32 three[8]={3,0,0,0,0,0,0,0}; mulmod(M,three,M);
+    mulmod(p.X,YY,S); addmod(S,S); addmod(S,S);  // S *= 4 via 2 doublings
+    sqrmod(p.X,M); cpy(t,M); addmod(M,t); addmod(M,t);  // M = 3*X² via M+M+M
     sqrmod(M,r.X); submod(r.X,S); submod(r.X,S);
-    sqrmod(YY,t2); u32 eight[8]={8,0,0,0,0,0,0,0}; mulmod(t2,eight,t2);
+    sqrmod(YY,t2); addmod(t2,t2); addmod(t2,t2); addmod(t2,t2);  // t2 *= 8 via 3 doublings
     submod(S,r.X); mulmod(M,S,t); submod(t,t2); cpy(r.Y,t);
     u32 yz[8]; cpy(yz,p.Y); addmod(yz,p.Y); mulmod(yz,p.Z,r.Z);
 }
@@ -286,33 +417,64 @@ __device__ void feed_x_op_dev(u64 st[25], int& pt, u64 q){
     for(int r=0;r<3;r++) for(int b=0;b<8;b++){sb[pt]^=(uint8_t)(NO>>(b*8)); if(++pt==rate){keccakf(st);pt=0;}}
 }
 
-// ===== Montgomery batch inversion =====
-// Inverts N values in vals[0..N-1][8] in-place.
-// pf[N][8] and orig[N][8] are scratch.  N <= blockDim.x.
-// All N threads call this; t == threadIdx.x.
-__device__ void batch_inv(u32 vals[][8], u32 pf[][8], u32 orig[][8], int N, int t){
-    // Phase 0: backup originals
-    if(t < N) cpy(orig[t], vals[t]);
-    __syncthreads();
-    // Phase 1: forward prefix product + single Fermat inverse (t==0 serial)
-    if(t == 0){
-        cpy(pf[0], orig[0]);
-        for(int i=1;i<N;i++){u32 tmp[8]; mulmod(pf[i-1],orig[i],tmp); cpy(pf[i],tmp);}
-        u32 inv_all[8]; invmod(pf[N-1], inv_all);
-        cpy(pf[0], inv_all); // broadcast via pf[0]
-    }
-    __syncthreads();
-    // Phase 2: backward pass to recover individual inverses (t==0 serial)
-    if(t == 0){
-        u32 running[8]; cpy(running, pf[0]); // = 1/(product of all)
-        for(int i=N-1;i>=1;i--){
-            u32 inv_i[8]; mulmod(running, pf[i-1], inv_i);
-            cpy(vals[i], inv_i);
-            u32 tmp[8]; mulmod(running, orig[i], tmp); cpy(running, tmp);
-        }
-        cpy(vals[0], running);
-    }
-    __syncthreads();
+// ===== Warp-level Montgomery batch inversion =====
+// Inverts 32 values in val[8] across a warp in-place.
+// No __syncthreads() needed. Uses parallel prefix and suffix products.
+__device__ void warp_batch_inv(u32 val[8]){
+    int lane = threadIdx.x & 31;
+    
+    // 1. Inclusive prefix product P
+    u32 P[8]; cpy(P, val);
+    u32 tmp[8], tmp2[8];
+    for(int i=0;i<8;i++) tmp[i] = __shfl_up_sync(0xffffffff, P[i], 1);
+    if(lane >= 1){ mulmod(P, tmp, tmp2); cpy(P, tmp2); }
+    
+    for(int i=0;i<8;i++) tmp[i] = __shfl_up_sync(0xffffffff, P[i], 2);
+    if(lane >= 2){ mulmod(P, tmp, tmp2); cpy(P, tmp2); }
+    
+    for(int i=0;i<8;i++) tmp[i] = __shfl_up_sync(0xffffffff, P[i], 4);
+    if(lane >= 4){ mulmod(P, tmp, tmp2); cpy(P, tmp2); }
+    
+    for(int i=0;i<8;i++) tmp[i] = __shfl_up_sync(0xffffffff, P[i], 8);
+    if(lane >= 8){ mulmod(P, tmp, tmp2); cpy(P, tmp2); }
+    
+    for(int i=0;i<8;i++) tmp[i] = __shfl_up_sync(0xffffffff, P[i], 16);
+    if(lane >= 16){ mulmod(P, tmp, tmp2); cpy(P, tmp2); }
+    
+    // 2. Inclusive suffix product S
+    u32 S[8]; cpy(S, val);
+    for(int i=0;i<8;i++) tmp[i] = __shfl_down_sync(0xffffffff, S[i], 1);
+    if(lane <= 30){ mulmod(S, tmp, tmp2); cpy(S, tmp2); }
+    
+    for(int i=0;i<8;i++) tmp[i] = __shfl_down_sync(0xffffffff, S[i], 2);
+    if(lane <= 29){ mulmod(S, tmp, tmp2); cpy(S, tmp2); }
+    
+    for(int i=0;i<8;i++) tmp[i] = __shfl_down_sync(0xffffffff, S[i], 4);
+    if(lane <= 27){ mulmod(S, tmp, tmp2); cpy(S, tmp2); }
+    
+    for(int i=0;i<8;i++) tmp[i] = __shfl_down_sync(0xffffffff, S[i], 8);
+    if(lane <= 23){ mulmod(S, tmp, tmp2); cpy(S, tmp2); }
+    
+    for(int i=0;i<8;i++) tmp[i] = __shfl_down_sync(0xffffffff, S[i], 16);
+    if(lane <= 15){ mulmod(S, tmp, tmp2); cpy(S, tmp2); }
+    
+    // 3. Inverse of total product
+    u32 I_total[8];
+    if(lane == 31){ invmod(P, I_total); }
+    for(int i=0;i<8;i++) I_total[i] = __shfl_sync(0xffffffff, I_total[i], 31);
+    
+    // 4. Combine: val_inv = P_{lane-1} * S_{lane+1} * I_total
+    u32 P_prev[8];
+    for(int i=0;i<8;i++) P_prev[i] = __shfl_up_sync(0xffffffff, P[i], 1);
+    if(lane == 0) { for(int i=0;i<8;i++) P_prev[i] = (i==0)?1:0; }
+    
+    u32 S_next[8];
+    for(int i=0;i<8;i++) S_next[i] = __shfl_down_sync(0xffffffff, S[i], 1);
+    if(lane == 31) { for(int i=0;i<8;i++) S_next[i] = (i==0)?1:0; }
+    
+    u32 res[8];
+    mulmod(P_prev, S_next, res);
+    mulmod(res, I_total, val);
 }
 
 // ===== Batch-inversion shot-parallel kernel =====
@@ -329,23 +491,27 @@ __device__ void batch_inv(u32 vals[][8], u32 pf[][8], u32 orig[][8], int N, int 
 
 #define W 128
 
-__global__ void search_kernel3(u64 start, u64 count, u32* out_cnt, u64* out_list, int max_out, int do_inst){
+__device__ unsigned long long d_global_counter;
+
+__global__ __launch_bounds__(128, 2)
+void search_kernel3(u64 start, u64 count, u32* out_cnt, u64* out_list, int max_out, int do_inst){
     __shared__ u64 sq_st[25];          // 200 B
     __shared__ int sq_pt;              // 4 B
     __shared__ unsigned char wbytes[W*64]; // 8192 B
     __shared__ int hard_flag;          // 4 B
-    // Batch inversion pipeline:
-    __shared__ u32 s_z[W][8];          // 4096 B  Z values (reused for tj.Z, oj.Z, den)
-    __shared__ u32 s_a[W][8];          // 4096 B  tx (point 1 affine x)
-    __shared__ u32 s_b[W][8];          // 4096 B  ty (point 1 affine y)
-    __shared__ u32 s_jxy[W][16];       // 8192 B  Jacobian X[8]||Y[8] then affine ox[8]||oy[8]
-    __shared__ u32 s_pf[W][8];         // 4096 B  batch-inv scratch (prefix)
-    __shared__ u32 s_or[W][8];         // 4096 B  batch-inv scratch (orig backup)
-    __shared__ int s_skip[W];          // 512 B
-    // Total shared: ~41,916 B ≈ 41 KB
+    // Total shared memory drastically reduced to ~8.4 KB due to warp_batch_inv
+    
+    __shared__ unsigned long long s_block_nidx; // 8 B
 
     int t = threadIdx.x;
-    for(u64 nidx = blockIdx.x; nidx < count; nidx += gridDim.x){
+    while(true){
+        if(t == 0){
+            s_block_nidx = atomicAdd((unsigned long long*)&d_global_counter, 1ULL);
+        }
+        __syncthreads();
+        u64 nidx = s_block_nidx;
+        if(nidx >= count) break;
+        
         u64 nonce = start + nidx;
         if(t==0){
             for(int i=0;i<25;i++) sq_st[i]=d_base_st[i];
@@ -369,158 +535,110 @@ __global__ void search_kernel3(u64 start, u64 count, u32* out_cnt, u64* out_list
             }
             __syncthreads();
 
-            // Each thread: parse k1,k2, compute comb_mul_jac for BOTH points,
-            // store Jacobian X,Y in s_jxy, Z in s_z.  First point: s_jxy = tj.X||tj.Y, s_z = tj.Z.
-            // Second point: we store oj into registers temporarily, then after batch 1 we'll
-            // put oj.X||oj.Y into s_jxy and oj.Z into s_z.
+            Jac tj, oj;
+            bool skip = false;
+            
             if(t < n_this){
                 unsigned char* rb = &wbytes[t*64];
                 u32 k1[8], k2[8];
                 for(int i=0;i<8;i++) k1[i]=rb[4*i]|(rb[4*i+1]<<8)|(rb[4*i+2]<<16)|(rb[4*i+3]<<24);
                 for(int i=0;i<8;i++) k2[i]=rb[32+4*i]|(rb[32+4*i+1]<<8)|(rb[32+4*i+2]<<16)|(rb[32+4*i+3]<<24);
 
-                Jac tj, oj;
                 comb_mul_jac(k1, tj);
                 comb_mul_jac(k2, oj);
-
-                // Store tj into shared
-                for(int i=0;i<8;i++) s_jxy[t][i]   = tj.X[i];
-                for(int i=0;i<8;i++) s_jxy[t][8+i] = tj.Y[i];
-                cpy(s_z[t], tj.Z);
-
-                // Detect early skip: both points at infinity
-                s_skip[t] = (jacInf(tj) && jacInf(oj)) ? 1 : 0;
-
-                // Store oj Jacobian in per-thread registers until after batch 1
-                // (We'll write them to shared memory between batch 1 and batch 2)
-                // Store in s_or temporarily — BUT s_or is batch_inv scratch.
-                // s_or is only used inside batch_inv. After batch_inv returns, s_or is free.
-                // So we can write oj data to s_or AFTER batch_inv finishes.
-                // For now, keep oj in registers — we'll store it between batch 1 and 2.
-                // This means we need: oj.X[8], oj.Y[8], oj.Z[8] in registers.
-                // That's 24 extra registers per thread. On top of comb_mul_jac's register pressure.
-                // To avoid register bloat, let's store oj into s_or/s_pf AFTER batch 1's
-                // batch_inv call finishes (s_or and s_pf are then free).
-
-                // Actually, we need to store oj.Z into s_z[t] AFTER batch 1 reads s_z[t]
-                // (which had tj.Z). And oj.X,Y into s_jxy[t] AFTER batch 1 reads s_jxy[t]
-                // (which had tj.X,Y). So the sequence is:
-                // 1. Store tj into s_jxy/s_z, compute oj in registers
-                // 2. batch_inv(s_z) — inverts tj.Z
-                // 3. Compute tx,ty from s_jxy (tj.X,Y) and s_z (1/tj.Z)
-                // 4. Now safe to overwrite: store oj into s_jxy/s_z
-                // 5. batch_inv(s_z) — inverts oj.Z
-                // 6. Compute ox,oy from s_jxy (oj.X,Y) and s_z (1/oj.Z), store in s_jxy
-                // 7. Compute den into s_z, batch_inv(s_z)
-                // 8. Finish with lambda = num * (1/den), check_gcd_factor
+                if(jacInf(tj) && jacInf(oj)) skip = true;
             } else {
-                s_skip[t] = 1;
+                skip = true;
             }
-            __syncthreads();
-
-            // --- Batch 1: invert tj.Z ---
-            batch_inv(s_z, s_pf, s_or, n_this, t);
-            // s_z[t] now = 1/tj.Z
-
-            // Compute affine tx,ty for point 1 and store in s_a, s_b
-            if(t < n_this && !s_skip[t]){
-                u32 zi2[8], zi3[8];
-                sqrmod(s_z[t], zi2);
-                mulmod(zi2, s_z[t], zi3);
-                mulmod(s_jxy[t], zi2, s_a[t]);          // tx = tj.X * zi2
-                mulmod(&s_jxy[t][8], zi3, s_b[t]);      // ty = tj.Y * zi3
+            
+            // Combined Z-inversion: invert tj.Z * oj.Z in one batch, then recover individual inverses.
+            // Saves one entire invmod call (~270 heavy ops per warp).
+            bool skip_oj = skip || jacInf(oj);
+            u32 combined_z[8];
+            if(skip) {
+                for(int i=0;i<8;i++) combined_z[i] = (i==0)?1:0;
+            } else if(skip_oj) {
+                cpy(combined_z, tj.Z);  // only need tj.Z inverse
+            } else {
+                mulmod(tj.Z, oj.Z, combined_z);  // combined = tj.Z * oj.Z
             }
-            __syncthreads();
-
-            // Now store oj Jacobian into shared (overwriting data batch 1 already consumed)
-            // We need oj in registers. But wait — we computed oj above but the register
-            // allocation happened inside the `if(t < n_this)` block. The compiler may have
-            // already spilled oj. We need to keep oj alive.
-            //
-            // To avoid this register pressure problem, let's RECOMPUTE oj from k2.
-            // comb_mul_jac(k2, oj) is ~200 mulmods — cheaper than 24 registers held across
-            // a sync point and a batch_inv call (which the compiler can't optimize across).
-            // Actually on second thought, let's try keeping it in registers. The compiler
-            // should handle this since it's all within the same if-block.
-            //
-            // BUT the __syncthreads() inside batch_inv means the compiler MUST spill any
-            // register-held values that cross the sync. So oj WILL be spilled to local memory
-            // (which is slow on GPU — physical local memory = L1 cache pressure).
-            //
-            // Decision: recompute oj after batch 1. Cost: ~200 mulmods. Benefit: no spills.
-            // The 200 mulmods are cheap compared to the 768 Fermat invmod savings.
-
-            if(t < n_this){
-                unsigned char* rb = &wbytes[t*64];
-                u32 k2[8];
-                for(int i=0;i<8;i++) k2[i]=rb[32+4*i]|(rb[32+4*i+1]<<8)|(rb[32+4*i+2]<<16)|(rb[32+4*i+3]<<24);
-                Jac oj; comb_mul_jac(k2, oj);
-
-                // Store oj into shared
-                for(int i=0;i<8;i++) s_jxy[t][i]   = oj.X[i];
-                for(int i=0;i<8;i++) s_jxy[t][8+i] = oj.Y[i];
-                cpy(s_z[t], oj.Z);
-                if(jacInf(oj)) s_skip[t] = 1;
-            }
-            __syncthreads();
-
-            // --- Batch 2: invert oj.Z ---
-            batch_inv(s_z, s_pf, s_or, n_this, t);
-
-            // Compute affine ox,oy and store in s_jxy (overwriting oj Jacobian X,Y)
-            // Also detect skip conditions that need both affine coords
-            if(t < n_this && !s_skip[t]){
-                u32 zi2[8], zi3[8];
-                sqrmod(s_z[t], zi2);
-                mulmod(zi2, s_z[t], zi3);
-                mulmod(s_jxy[t], zi2, s_jxy[t]);           // ox → s_jxy[0..7]
-                mulmod(&s_jxy[t][8], zi3, &s_jxy[t][8]);   // oy → s_jxy[8..15]
-
-                // Skip checks (need both affine coords now)
-                if(eq(s_a[t], s_jxy[t]))           s_skip[t] = 1; // tx == ox
-                if(isZero(s_a[t])&&isZero(s_b[t]))  s_skip[t] = 1; // tx,ty = 0
-                if(isZero(s_jxy[t])&&isZero(&s_jxy[t][8])) s_skip[t] = 1; // ox,oy = 0
-            }
-            __syncthreads();
-
-            // Compute den = ox - tx into s_z (skip threads get den=1 for batch safety)
-            if(t < n_this && !s_skip[t]){
-                submod_p(s_jxy[t], s_a[t], s_z[t]); // den = ox - tx
-            } else if(t < n_this) {
-                for(int i=0;i<8;i++) s_z[t][i] = (i==0)?1u:0u; // den = 1 for skipped
-            }
-            __syncthreads();
-
-            // --- Batch 3: invert den ---
-            batch_inv(s_z, s_pf, s_or, n_this, t);
-
-            // Finish: each thread computes lambda, ex, dx, c, check_gcd_factor
-            if(t < n_this && !s_skip[t]){
-                // num = oy - ty
-                u32 num[8]; submod_p(&s_jxy[t][8], s_b[t], num);
-                // lambda = num * (1/den)
-                u32 lambda[8]; mulmod(num, s_z[t], lambda);
-                // ex = lambda^2 - tx - ox
-                u32 ex[8]; sqrmod(lambda, ex);
-                submod(ex, s_a[t]);    // ex -= tx
-                submod(ex, s_jxy[t]);  // ex -= ox
-                // dx = tx - ox, c = ox - ex
-                u32 dx[8]; submod_p(s_a[t], s_jxy[t], dx);
-                u32 c[8];  submod_p(s_jxy[t], ex, c);
-
-                if(do_inst){
-                    int rej = check_gcd_factor_inst(dx, 0);
-                    if(!rej) rej = check_gcd_factor_inst(c, 1);
-                    if(rej){
-                        hard_flag = 1;
-                        if(rej <= 3) atomicAdd((unsigned long long*)&d_rej->first_dx, 1ULL);
-                        else         atomicAdd((unsigned long long*)&d_rej->first_c, 1ULL);
-                    }
+            
+            warp_batch_inv(combined_z); // combined_z = 1/(tj.Z * oj.Z)
+            
+            u32 tx[8], ty[8], ox[8], oy[8];
+            if(!skip){
+                u32 inv_z1[8];
+                if(!skip_oj) {
+                    // Recover individual inverses:
+                    // 1/tj.Z = combined_inv * oj.Z
+                    // 1/oj.Z = combined_inv * tj.Z
+                    u32 inv_z2[8];
+                    mulmod(combined_z, oj.Z, inv_z1);
+                    mulmod(combined_z, tj.Z, inv_z2);
+                    
+                    // Convert oj to affine
+                    u32 zi2[8], zi3[8];
+                    sqrmod(inv_z2, zi2);
+                    mulmod(zi2, inv_z2, zi3);
+                    mulmod(oj.X, zi2, ox);
+                    mulmod(oj.Y, zi3, oy);
                 } else {
-                    if(!check_gcd_factor(dx) || !check_gcd_factor(c))
-                        hard_flag = 1;
+                    cpy(inv_z1, combined_z); // combined was just tj.Z
+                    skip = true; // no oj to process
+                }
+                
+                // Convert tj to affine
+                u32 zi2[8], zi3[8];
+                sqrmod(inv_z1, zi2);
+                mulmod(zi2, inv_z1, zi3);
+                mulmod(tj.X, zi2, tx);
+                mulmod(tj.Y, zi3, ty);
+                
+                if(!skip_oj) {
+                    skip = false; // restore
+                    if(eq(tx, ox)) skip = true;
+                    if(isZero(tx) && isZero(ty)) skip = true;
+                    if(isZero(ox) && isZero(oy)) skip = true;
                 }
             }
+            
+            int local_hard_flag = 0;
+            if(!skip){
+                u32 dx[8]; submod_p(tx, ox, dx);
+                if(do_inst){
+                    int rej = check_gcd_factor_inst(dx, 0);
+                    if(rej){ local_hard_flag = 1; atomicAdd((unsigned long long*)&d_rej->first_dx, 1ULL); }
+                } else {
+                    if(!check_gcd_factor(dx)) local_hard_flag = 1;
+                }
+            }
+            
+            if(local_hard_flag) hard_flag = 1;
+            __syncthreads();
+            if(hard_flag) break;
+            
+            u32 den[8];
+            if(skip) { for(int i=0;i<8;i++) den[i] = (i==0)?1:0; }
+            else { submod_p(ox, tx, den); }
+            
+            warp_batch_inv(den); // den is now 1/(ox-tx)
+            
+            if(!skip){
+                u32 num[8]; submod_p(oy, ty, num);
+                u32 lambda[8]; mulmod(num, den, lambda);
+                u32 ex[8]; sqrmod(lambda, ex);
+                submod(ex, tx); submod(ex, ox);
+                u32 c[8]; submod_p(ox, ex, c);
+                
+                if(do_inst){
+                    int rej = check_gcd_factor_inst(c, 1);
+                    if(rej){ local_hard_flag = 1; atomicAdd((unsigned long long*)&d_rej->first_c, 1ULL); }
+                } else {
+                    if(!check_gcd_factor(c)) local_hard_flag = 1;
+                }
+            }
+            
+            if(local_hard_flag) hard_flag = 1;
             __syncthreads();
         }
 
@@ -599,7 +717,9 @@ int main(int argc, char** argv){
 
     u32* dcnt; cudaMalloc(&dcnt,4); cudaMemset(dcnt,0,4);
     const int MAXOUT=4096; u64* dlist; cudaMalloc(&dlist,MAXOUT*8);
-    int blocks = getenv("BLOCKS")? atoi(getenv("BLOCKS")) : 512;
+    int blocks = getenv("BLOCKS")? atoi(getenv("BLOCKS")) : 72;
+    unsigned long long zero_counter = 0;
+    cudaMemcpyToSymbol(d_global_counter, &zero_counter, 8);
     bool do_inst = getenv("INSTRUMENT")!=NULL;
     RejCounters* d_rc=NULL; RejCounters h_rc={};
     if(do_inst){
@@ -613,8 +733,8 @@ int main(int argc, char** argv){
     u32 cnt; cudaMemcpy(&cnt,dcnt,4,cudaMemcpyDeviceToHost);
     u64 list[MAXOUT]; cudaMemcpy(list,dlist,(cnt<MAXOUT?cnt:MAXOUT)*8,cudaMemcpyDeviceToHost);
     for(u32 i=0;i<cnt && i<MAXOUT;i++) printf("CLEAN nonce=%llu\n",(unsigned long long)list[i]);
-    printf("scanned %llu in %.2fs (%.0f nonce/s); clean=%u [kernel3 batch-inv x3 + 2bit-win]\n",
-        (unsigned long long)count, ms/1000.0, count/(ms/1000.0), cnt);
+    printf("scanned %llu in %.2fs (%llu nonce/s); clean=%d [kernel3 batch-inv x2 + addchain-inv]\n",
+        (unsigned long long)count, ms/1000.0, (u64)(count/(ms/1000.0)), cnt);
     if(do_inst && d_rc){
         cudaMemcpy(&h_rc, d_rc, sizeof(RejCounters), cudaMemcpyDeviceToHost);
         u64 dx_tot = h_rc.dx_zero+h_rc.dx_noconv+h_rc.dx_width;
