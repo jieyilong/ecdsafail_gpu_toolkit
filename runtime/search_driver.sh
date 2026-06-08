@@ -10,6 +10,10 @@ START="${1:?START}"; COUNT="${2:?COUNT}"; CHUNK="${3:-200000}"; NGPU="${4:-auto}
 BIN="${GPU_ISLAND_BIN:?set GPU_ISLAND_BIN}"; STATE="${GPU_STATE_FILE:?set GPU_STATE_FILE}"; BLOCKS="${BLOCKS:-512}"
 [ -x "$BIN" ] || { echo "ERROR: kernel binary not found/executable: $BIN (run build)" >&2; exit 1; }
 [ -f "$STATE" ] || { echo "ERROR: state file not found: $STATE" >&2; exit 1; }
+# Kernel env: KERNEL3=1 (batch-inv) or KERNEL2=1 (original shot-parallel) or neither (serial)
+KFLAG=""
+[ "${KERNEL3:-0}" = 1 ] && KFLAG="KERNEL3=1"
+[ "${KERNEL2:-0}" = 1 ] && KFLAG="KERNEL2=1"
 if [ "$NGPU" = auto ] || [ -z "$NGPU" ]; then
   NGPU=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')
 fi
@@ -24,7 +28,7 @@ for (( g=0; g<NGPU; g++ )); do
     d=0
     while [ "$d" -lt "$gcount" ]; do
       c=$(( gcount-d < CHUNK ? gcount-d : CHUNK )); s=$(( gstart+d )); d=$(( d+CHUNK ))
-      CUDA_VISIBLE_DEVICES="$g" GPU_STATE="$STATE" KERNEL2=1 BLOCKS="$BLOCKS" \
+      CUDA_VISIBLE_DEVICES="$g" GPU_STATE="$STATE" $KFLAG BLOCKS="$BLOCKS" \
         "$BIN" "$s" "$c" 2>/dev/null | grep -oE "CLEAN nonce=[0-9]+" >> "$TMP/g$g"
     done
   ) &
