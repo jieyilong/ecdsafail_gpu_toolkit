@@ -4,6 +4,72 @@ This file records not only what changed, but also why we made the change, what s
 we expect, and what still needs to be validated. For future work, add an entry whenever a
 change affects search behavior, performance assumptions, correctness risk, or workflow.
 
+## 2026-06-09 - GPU knob throughput benchmark
+
+Branch: `quick_filtering`
+
+### Summary
+
+Added `./island.sh bench-gpu-knobs` so speedup claims for the experimental CUDA knobs can
+be measured from the same SOTA state, same nonce range, same warmup policy, and same raw
+kernel timer.
+
+### Rationale
+
+Correctness checks tell us whether a knob is safe, but they do not tell us whether it is
+worth using in the island search loop. The previous manual approach mixed kernel time,
+remote chunk orchestration, first-run PTX JIT, and operator memory. A dedicated benchmark
+command makes the A/B test repeatable and produces a single table that can be pasted into
+future research notes.
+
+### Main Changes
+
+- Added `run_raw_search`, which invokes `gpu_island2` directly with `KERNEL2=1` while
+  preserving the binary's `scanned ... (nonce/s)` timing output.
+- Added `bench_variant`, which runs configurable warmups and measured repeats, then records
+  average/min/max nonce throughput.
+- Added `./island.sh bench-gpu-knobs [CFG] [START] [N]` with default variants for the
+  baseline, isolated knobs, and combined exact paths.
+- Extended `test-gpu-knobs` to cover the same combined exact paths, so benchmarked
+  combinations have an explicit candidate-set guard.
+- In remote mode, uploaded the benchmark state once and reused it across variants instead
+  of re-copying it before every measured run.
+- Documented the speed-validation workflow and caveats in `README.md`.
+
+### Expected Impact
+
+No circuit-score change. The expected workflow speedup is decision speed: we can reject
+unhelpful kernel knobs after a small controlled benchmark instead of discovering later
+during a long island run. The command should also make architecture-specific tuning more
+honest, especially on RTX 50 cards where old CUDA toolkits may JIT PTX instead of building
+native `sm_120` code.
+
+### Validation Plan
+
+- Shell syntax checks and `git diff --check` passed locally.
+- `test-gpu-knobs` passed on the RTX 5090 remote for the baked SOTA nonce `4591773` and
+  range `[0, 1024)`, including combined exact variants.
+- `bench-gpu-knobs` ran on the RTX 5090 remote over range `[0, 8192)` with one warmup and
+  two measured repeats per variant. The remote used CUDA 11.5 PTX fallback on `sm_120`, so
+  absolute rates may improve with a newer CUDA toolkit, but relative numbers are still an
+  apples-to-apples comparison:
+
+```text
+variant        avg_nonce_s   speedup_vs_baseline
+baseline              7550    1.000x
+trunc_first           7697    1.019x
+wave64                5515    0.730x
+wave256               7836    1.038x
+batch_inv            11310    1.498x
+comb16                8440    1.118x
+batch_wave256         9225    1.222x
+batch_comb16         12813    1.697x
+all_exact            10288    1.363x
+```
+
+The best measured exact combination was `GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_WAVE=128`
+at about `1.70x` kernel throughput over this slice.
+
 ## 2026-06-09 - GPU knob correctness smoke tests
 
 Branch: `quick_filtering`

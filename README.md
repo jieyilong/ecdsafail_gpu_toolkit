@@ -172,8 +172,35 @@ Before trusting a new GPU build, run the integrated correctness smoke:
 
 It rebuilds the helper binaries, builds the CUDA kernel, dumps the current state, checks the
 GPU Keccak probe, verifies that every knob still finds the baked `DIALOG_TAIL_NONCE`, and
-compares exact candidate sets over the requested range. Use `ISLAND_CONFIG=/tmp/box.env` to
-point the same repo at a one-off remote GPU without editing the tracked `config.env`.
+compares exact candidate sets over the requested range, including the combined exact paths
+used by the benchmark. Use `ISLAND_CONFIG=/tmp/box.env` to point the same repo at a one-off
+remote GPU without editing the tracked `config.env`.
+
+To validate speedups after correctness passes, run the fixed-range throughput benchmark:
+
+```bash
+GPU_BENCH_RUNS=3 GPU_BENCH_WARMUPS=1 ./island.sh bench-gpu-knobs "" 0 16384
+```
+
+This dumps the current SOTA state once, uploads it once in remote mode, warms up each
+variant, then runs the raw `gpu_island2` binary over the same nonce interval and prints
+average/min/max `nonce/s` plus speedup relative to the default baseline. The default
+benchmark variants include isolated knobs (`trunc_first`, `wave64`, `wave256`,
+`batch_inv`, `comb16`) and combined exact paths (`batch_wave256`, `batch_comb16`,
+`all_exact`). Use `GPU_BENCH_SKIP_INSTALL=1` or `GPU_BENCH_SKIP_BUILD=1` when the Rust
+helpers or CUDA binary are already fresh.
+
+Interpretation caveats:
+
+- Run `test-gpu-knobs` first; speed is only meaningful for variants that preserve the
+  expected candidate set, except intentionally noisy modes.
+- Use a fixed challenge commit, config, start nonce, and range size for every comparison.
+- Warmups matter on new cards or old toolkits because PTX may be JIT-compiled on the first
+  run.
+- The benchmark measures single-process kernel throughput. Multi-GPU scheduling speed is
+  still best checked with `./island.sh search`.
+- For `GPU_COMB_BITS=16`, the one-time table construction cost is outside the timed CUDA
+  event, so also check wall-clock behavior for very small chunks.
 
 ### Local vs remote GPU
 `init-local` / `init-remote` set this up for you. In remote mode, `build`/`search`/`doctor`

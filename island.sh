@@ -12,6 +12,7 @@
 #   ./island.sh probe  STATE                            # GPU Keccak probe cross-check
 #   ./island.sh search STATE START N [CHUNK]            # multi-GPU search -> CLEAN nonce=...
 #   ./island.sh test-gpu-knobs [CFG] [START] [N]        # correctness smoke for GPU knobs
+#   ./island.sh bench-gpu-knobs [CFG] [START] [N]       # throughput benchmark for GPU knobs
 #   ./island.sh validate CFG NONCE...                  # quantum-confirm 0/0/0 + score
 #   ./island.sh bake   KEY VALUE [...]                  # CRLF-safe mod.rs edit + ecdsafail run
 #   ./island.sh hunt   CFG START N                      # measure -> dump -> search -> validate
@@ -103,6 +104,40 @@ check_subset(){ # name envs state start n chunk baseline_file
   fi
   rm -f "$got" "$missing"
 }
+run_raw_search(){ # envs state start n
+  local envs="$1" state="$2" start="$3" n="$4"
+  if [ "$GPU" = local ]; then
+    [ -x "$HERE/gpu_island2" ] || die "run './island.sh build' first"
+    env $envs GPU_STATE="$state" KERNEL2=1 BLOCKS="$BLOCKS" "$HERE/gpu_island2" "$start" "$n"
+  else
+    need_remote
+    rsh "GPU_STATE=$state KERNEL2=1 BLOCKS=$BLOCKS $envs \$HOME/$RDIR/gpu_island2 $start $n"
+  fi
+}
+bench_variant(){ # name envs state start n summary_file
+  local name="$1" envs="$2" state="$3" start="$4" n="$5" summary="$6"
+  local warmups="${GPU_BENCH_WARMUPS:-1}" runs="${GPU_BENCH_RUNS:-3}"
+  local total=$((warmups + runs)) rates out rate secs clean i rate_file
+  rate_file="$(mktemp)"
+  echo ">> bench: $name  env='$envs'"
+  for ((i=1; i<=total; i++)); do
+    out=$(run_raw_search "$envs" "$state" "$start" "$n")
+    rate=$(echo "$out" | sed -n 's/.*(\([0-9][0-9]*\) nonce\/s).*/\1/p' | tail -1)
+    secs=$(echo "$out" | sed -n 's/.* in \([0-9.][0-9.]*\)s .*/\1/p' | tail -1)
+    clean=$(echo "$out" | sed -n 's/.* clean=\([0-9][0-9]*\).*/\1/p' | tail -1)
+    [ -n "$rate" ] || { echo "$out"; rm -f "$rate_file"; die "could not parse benchmark rate for $name"; }
+    if [ "$i" -le "$warmups" ]; then
+      printf "   warmup %d/%d: %s nonce/s in %ss clean=%s\n" "$i" "$warmups" "$rate" "${secs:-?}" "${clean:-?}"
+    else
+      printf "   run %d/%d: %s nonce/s in %ss clean=%s\n" "$((i-warmups))" "$runs" "$rate" "${secs:-?}" "${clean:-?}"
+      echo "$rate" >> "$rate_file"
+    fi
+  done
+  rates=$(awk '{sum+=$1; if(NR==1||$1<min)min=$1; if($1>max)max=$1} END{if(NR){printf "%.0f %d %d", sum/NR, min, max}}' "$rate_file")
+  rm -f "$rate_file"
+  set -- $rates
+  printf "%s %s %s %s\n" "$name" "$1" "$2" "$3" >> "$summary"
+}
 
 case "$cmd" in
 
@@ -192,6 +227,9 @@ test-gpu-knobs)
   require_variant_clean "wave256" "GPU_WAVE=256" "$STATE" "$KNOWN"
   require_variant_clean "batch_inv" "GPU_BATCH_INV=1 GPU_WAVE=128" "$STATE" "$KNOWN"
   require_variant_clean "comb16" "GPU_COMB_BITS=16 GPU_WAVE=128" "$STATE" "$KNOWN"
+  require_variant_clean "batch_wave256" "GPU_BATCH_INV=1 GPU_WAVE=256" "$STATE" "$KNOWN"
+  require_variant_clean "batch_comb16" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_WAVE=128" "$STATE" "$KNOWN"
+  require_variant_clean "all_exact" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_GCD_MODE=trunc_first GPU_WAVE=256" "$STATE" "$KNOWN"
   require_variant_clean "trunc_only" "GPU_GCD_MODE=trunc_only GPU_WAVE=128" "$STATE" "$KNOWN"
 
   echo ">> [5/5] baseline range over [$START, $((START+N)))"
@@ -202,8 +240,61 @@ test-gpu-knobs)
   compare_variant_range "wave256" "GPU_WAVE=256" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
   compare_variant_range "batch_inv" "GPU_BATCH_INV=1 GPU_WAVE=128" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
   compare_variant_range "comb16" "GPU_COMB_BITS=16 GPU_WAVE=128" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
+  compare_variant_range "batch_wave256" "GPU_BATCH_INV=1 GPU_WAVE=256" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
+  compare_variant_range "batch_comb16" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_WAVE=128" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
+  compare_variant_range "all_exact" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_GCD_MODE=trunc_first GPU_WAVE=256" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
   check_subset "trunc_only" "GPU_GCD_MODE=trunc_only GPU_WAVE=128" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
   echo "PASS: GPU knob correctness smoke passed for known nonce $KNOWN and range [$START, $((START+N)))"
+  ;;
+
+bench-gpu-knobs)
+  CFG="${1:-}"; START="${2:-0}"; N="${3:-16384}"
+  [ -f "$CHALLENGE/src/point_add/mod.rs" ] || die "bad CHALLENGE path: $CHALLENGE"
+  echo ">> benchmarking against CHALLENGE=$CHALLENGE"
+  echo ">> config override file: $CFGF"
+  echo ">> range [$START, $((START+N)))"
+  echo ">> measured runs=${GPU_BENCH_RUNS:-3}, warmups=${GPU_BENCH_WARMUPS:-1}"
+  if [ "${GPU_BENCH_SKIP_INSTALL:-0}" != 1 ]; then
+    echo ">> [1/4] installing/rebuilding Rust helpers"
+    "$0" install >/dev/null
+  else
+    echo ">> [1/4] skipping Rust helper rebuild (GPU_BENCH_SKIP_INSTALL=1)"
+  fi
+  if [ "${GPU_BENCH_SKIP_BUILD:-0}" != 1 ]; then
+    echo ">> [2/4] building CUDA kernel"
+    "$0" build
+  else
+    echo ">> [2/4] skipping CUDA rebuild (GPU_BENCH_SKIP_BUILD=1)"
+  fi
+  STATE="$(mktemp).bin"; SUMMARY="$(mktemp)"
+  RAW_STATE="$STATE"
+  trap 'rm -f "$STATE" "$SUMMARY"' EXIT
+  echo ">> [3/4] dumping GPU state"
+  "$0" dump "$CFG" "$STATE"
+  if [ "$GPU" != local ]; then
+    echo ">> uploading benchmark state once"
+    rcp "$STATE" bench_state.bin
+    RAW_STATE="\$HOME/$RDIR/bench_state.bin"
+  fi
+  echo ">> [4/4] measuring kernel throughput"
+  bench_variant "baseline" "GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128" "$RAW_STATE" "$START" "$N" "$SUMMARY"
+  bench_variant "trunc_first" "GPU_GCD_MODE=trunc_first GPU_WAVE=128" "$RAW_STATE" "$START" "$N" "$SUMMARY"
+  bench_variant "wave64" "GPU_WAVE=64" "$RAW_STATE" "$START" "$N" "$SUMMARY"
+  bench_variant "wave256" "GPU_WAVE=256" "$RAW_STATE" "$START" "$N" "$SUMMARY"
+  bench_variant "batch_inv" "GPU_BATCH_INV=1 GPU_WAVE=128" "$RAW_STATE" "$START" "$N" "$SUMMARY"
+  bench_variant "comb16" "GPU_COMB_BITS=16 GPU_WAVE=128" "$RAW_STATE" "$START" "$N" "$SUMMARY"
+  bench_variant "batch_wave256" "GPU_BATCH_INV=1 GPU_WAVE=256" "$RAW_STATE" "$START" "$N" "$SUMMARY"
+  bench_variant "batch_comb16" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_WAVE=128" "$RAW_STATE" "$START" "$N" "$SUMMARY"
+  bench_variant "all_exact" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_GCD_MODE=trunc_first GPU_WAVE=256" "$RAW_STATE" "$START" "$N" "$SUMMARY"
+  echo
+  echo "variant        avg_nonce_s   min       max       speedup_vs_baseline"
+  awk '
+    NR==1 { base=$2 }
+    {
+      speed = (base > 0) ? $2 / base : 0
+      printf "%-14s %11.0f %9.0f %9.0f %8.3fx\n", $1, $2, $3, $4, speed
+    }
+  ' "$SUMMARY"
   ;;
 
 validate)
