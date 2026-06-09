@@ -237,6 +237,7 @@ island.sh              unified CLI (init-local/init-remote/doctor/install/measur
                                      dump/search/validate/bake/hunt)
 config.env.example     reference config (init-* writes config.env for you)
 SKILL.md               agent/Claude-Code skill manifest
+CHANGELOG.md           decision log for major search changes, rationale, expected impact
 runtime/               scripts that run ON the GPU machine (local or scp'd to the remote):
   build_kernel.sh        auto-detect compute cap -> nvcc (native + PTX-JIT fallback)
   search_driver.sh       multi-GPU parallel chunked search (splits range across all GPUs)
