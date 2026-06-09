@@ -253,6 +253,7 @@ docs/
   how-it-works.md      the dialog-GCD circuit + island search, explained
   levers.md            the lever catalog + measured Toffoli costs
   kernel-notes.md      kernel design / throughput / validation notes
+  theory-knobs.md      theoretical background for the experimental GPU knobs
 examples/
   walkthrough.md       end-to-end example (lower ACTIVE_ITERATIONS, find island, submit)
 ```

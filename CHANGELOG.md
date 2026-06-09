@@ -4,6 +4,39 @@ This file records not only what changed, but also why we made the change, what s
 we expect, and what still needs to be validated. For future work, add an entry whenever a
 change affects search behavior, performance assumptions, correctness risk, or workflow.
 
+## 2026-06-09 - Theory note for GPU search knobs
+
+Branch: `quick_filtering`
+
+### Summary
+
+Added `docs/theory-knobs.md` to explain the mathematical and performance background behind
+the major runtime knobs introduced in the quick-filtering work.
+
+### Rationale
+
+The GPU search knobs are not just code switches; they encode assumptions about field
+arithmetic, elliptic-curve scalar multiplication, GCD rejection modes, and CUDA block
+scheduling. Capturing those assumptions next to the code makes future review easier and
+reduces the chance that we forget why an experimental path exists.
+
+### Main Topics Covered
+
+- why `dx = tx - ox` can be checked before constructing `rx` and `c`;
+- Montgomery batch inversion with prefix/suffix products;
+- how the batch kernel applies that idea to Jacobian `Z` values and affine-add
+  denominators;
+- why a 16-bit comb table reduces scalar-multiplication windows but costs GPU memory and
+  startup time;
+- why `trunc_first` is exact while `trunc_only` is a noisy candidate generator;
+- why `GPU_WAVE` trades off fewer waves, occupancy, shared memory, and early-exit latency.
+
+### Expected Impact
+
+No runtime behavior changes. The value is research memory: future code reviews and
+benchmark sessions should be able to compare measured results against the original theory
+and decide which knobs deserve more engineering effort.
+
 ## 2026-06-09 - Quick filtering and experimental GPU search knobs
 
 Commit: `f473416`
