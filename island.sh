@@ -9,14 +9,16 @@
 #   ./island.sh measure [CFG]                           # Toffoli (CCX) cost of a config
 #   ./island.sh build                                   # compile the CUDA kernel (auto-arch)
 #   ./island.sh dump   CFG OUT.bin                      # gpu_state dump for a config
+#   ./island.sh probe  STATE                            # GPU Keccak probe cross-check
 #   ./island.sh search STATE START N [CHUNK]            # multi-GPU search -> CLEAN nonce=...
+#   ./island.sh test-gpu-knobs [CFG] [START] [N]        # correctness smoke for GPU knobs
 #   ./island.sh validate CFG NONCE...                  # quantum-confirm 0/0/0 + score
 #   ./island.sh bake   KEY VALUE [...]                  # CRLF-safe mod.rs edit + ecdsafail run
 #   ./island.sh hunt   CFG START N                      # measure -> dump -> search -> validate
 #   CFG = a space-free env assignment, e.g. DIALOG_GCD_ACTIVE_ITERATIONS=258
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-CFGF="$HERE/config.env"
+CFGF="${ISLAND_CONFIG:-$HERE/config.env}"
 die(){ echo "ERROR: $*" >&2; exit 1; }
 
 # ---- config helpers (init-* don't require an existing config.env) ----
@@ -61,6 +63,46 @@ rkey(){ local k; k=$(echo "$REMOTE_SSH" | grep -oE '\-i +[^ ]+' | awk '{print $2
 rsh(){ $REMOTE_SSH "$@"; }
 rcp(){ local p k; p="$(rport)"; k="$(rkey)"; scp ${p:+-P "$p"} ${k:+-i "$k"} -o StrictHostKeyChecking=no "$1" "$(rhost):$RDIR/$2" >/dev/null; }
 push_runtime(){ rsh "mkdir -p $RDIR"; rcp "$KSRC" gpu_island2.cu; for s in build_kernel search_driver doctor; do rcp "$HERE/runtime/$s.sh" "$s.sh"; done; }
+tail_nonce(){
+  grep -E 'set_default_env\("DIALOG_TAIL_NONCE", "[0-9]+"\)' "$CHALLENGE/src/point_add/mod.rs" \
+    | tail -1 | grep -oE '"[0-9]+"' | tr -d '"'
+}
+run_variant_search(){ # envs state start n chunk
+  local envs="$1" state="$2" start="$3" n="$4" chunk="${5:-200000}"
+  env $envs "$0" search "$state" "$start" "$n" "$chunk" | sort -u
+}
+require_variant_clean(){ # name envs state nonce
+  local name="$1" envs="$2" state="$3" nonce="$4" out
+  echo ">> known-clean check: $name"
+  out=$(run_variant_search "$envs" "$state" "$nonce" 1 1)
+  echo "$out"
+  echo "$out" | grep -qx "CLEAN nonce=$nonce" || die "$name did not report known clean nonce $nonce"
+}
+compare_variant_range(){ # name envs state start n chunk baseline_file
+  local name="$1" envs="$2" state="$3" start="$4" n="$5" chunk="$6" baseline="$7" got
+  got="$(mktemp)"
+  echo ">> exact range check: $name over [$start, $((start+n)))"
+  run_variant_search "$envs" "$state" "$start" "$n" "$chunk" > "$got"
+  if ! diff -u "$baseline" "$got"; then
+    rm -f "$got"
+    die "$name candidate set differs from baseline"
+  fi
+  rm -f "$got"
+}
+check_subset(){ # name envs state start n chunk baseline_file
+  local name="$1" envs="$2" state="$3" start="$4" n="$5" chunk="$6" baseline="$7" got missing
+  got="$(mktemp)"; missing="$(mktemp)"
+  echo ">> noisy superset check: $name over [$start, $((start+n)))"
+  run_variant_search "$envs" "$state" "$start" "$n" "$chunk" > "$got"
+  comm -23 "$baseline" "$got" > "$missing"
+  if [ -s "$missing" ]; then
+    echo "Missing baseline candidates:" >&2
+    cat "$missing" >&2
+    rm -f "$got" "$missing"
+    die "$name missed baseline candidates"
+  fi
+  rm -f "$got" "$missing"
+}
 
 case "$cmd" in
 
@@ -92,6 +134,17 @@ build)
   fi
   ;;
 
+probe)
+  STATE="${1:?usage: probe STATE}"
+  if [ "$GPU" = local ]; then
+    [ -x "$HERE/gpu_island2" ] || die "run './island.sh build' first"
+    GPU_STATE="$STATE" "$HERE/gpu_island2" 0 1 probe
+  else
+    need_remote; rcp "$STATE" state.bin
+    rsh "GPU_STATE=\$HOME/$RDIR/state.bin \$HOME/$RDIR/gpu_island2 0 1 probe"
+  fi
+  ;;
+
 search)
   STATE="${1:?usage: search STATE START N [CHUNK]}"; START="${2:?}"; N="${3:?}"; CHUNK="${4:-200000}"
   if [ "$GPU" = local ]; then
@@ -106,6 +159,51 @@ search)
          GPU_BATCH_INV=$GPU_BATCH_INV GPU_COMB_BITS=$GPU_COMB_BITS GPU_GCD_MODE=$GPU_GCD_MODE GPU_WAVE=$GPU_WAVE \
          bash \$HOME/$RDIR/search_driver.sh $START $N $CHUNK $GPUS"
   fi
+  ;;
+
+test-gpu-knobs)
+  CFG="${1:-}"; START="${2:-0}"; N="${3:-4096}"; CHUNK="${4:-$N}"
+  [ -f "$CHALLENGE/src/point_add/mod.rs" ] || die "bad CHALLENGE path: $CHALLENGE"
+  KNOWN="$(tail_nonce)"; [ -n "$KNOWN" ] || die "could not extract DIALOG_TAIL_NONCE"
+  echo ">> testing against CHALLENGE=$CHALLENGE"
+  echo ">> config override file: $CFGF"
+  echo ">> known clean DIALOG_TAIL_NONCE=$KNOWN"
+  if [ "${GPU_TEST_SKIP_INSTALL:-0}" != 1 ]; then
+    echo ">> [1/5] installing/rebuilding Rust helpers from current SOTA"
+    "$0" install >/dev/null
+  else
+    echo ">> [1/5] skipping Rust helper rebuild (GPU_TEST_SKIP_INSTALL=1)"
+  fi
+  echo ">> [2/5] building CUDA kernel"
+  "$0" build
+  STATE="$(mktemp).bin"; BASE="$(mktemp)"
+  trap 'rm -f "$STATE" "$BASE"' EXIT
+  echo ">> [3/5] dumping GPU state"
+  "$0" dump "$CFG" "$STATE"
+  echo ">> [4/5] probing GPU Keccak derivation"
+  probe_out=$("$0" probe "$STATE")
+  echo "$probe_out" | grep -E "options:|probe nonce|k1:|k2:"
+  echo "$probe_out" | grep -q "k1:OK k2:OK" || die "GPU probe mismatch"
+
+  base_env="GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128"
+  require_variant_clean "baseline" "$base_env" "$STATE" "$KNOWN"
+  require_variant_clean "trunc_first" "GPU_GCD_MODE=trunc_first GPU_WAVE=128" "$STATE" "$KNOWN"
+  require_variant_clean "wave64" "GPU_WAVE=64" "$STATE" "$KNOWN"
+  require_variant_clean "wave256" "GPU_WAVE=256" "$STATE" "$KNOWN"
+  require_variant_clean "batch_inv" "GPU_BATCH_INV=1 GPU_WAVE=128" "$STATE" "$KNOWN"
+  require_variant_clean "comb16" "GPU_COMB_BITS=16 GPU_WAVE=128" "$STATE" "$KNOWN"
+  require_variant_clean "trunc_only" "GPU_GCD_MODE=trunc_only GPU_WAVE=128" "$STATE" "$KNOWN"
+
+  echo ">> [5/5] baseline range over [$START, $((START+N)))"
+  run_variant_search "$base_env" "$STATE" "$START" "$N" "$CHUNK" > "$BASE"
+  echo "baseline candidates: $(wc -l < "$BASE" | tr -d ' ')"
+  compare_variant_range "trunc_first" "GPU_GCD_MODE=trunc_first GPU_WAVE=128" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
+  compare_variant_range "wave64" "GPU_WAVE=64" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
+  compare_variant_range "wave256" "GPU_WAVE=256" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
+  compare_variant_range "batch_inv" "GPU_BATCH_INV=1 GPU_WAVE=128" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
+  compare_variant_range "comb16" "GPU_COMB_BITS=16 GPU_WAVE=128" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
+  check_subset "trunc_only" "GPU_GCD_MODE=trunc_only GPU_WAVE=128" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
+  echo "PASS: GPU knob correctness smoke passed for known nonce $KNOWN and range [$START, $((START+N)))"
   ;;
 
 validate)

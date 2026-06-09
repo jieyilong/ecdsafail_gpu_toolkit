@@ -164,6 +164,17 @@ GPU_GCD_MODE=trunc_first ./island.sh search s.bin 1 2000000
 | `GPU_GCD_MODE` | `full_first`, `trunc_first`, `trunc_only` | `full_first` is the current exact order. `trunc_first` is exact but checks width overflow before convergence. `trunc_only` is a noisy experimental prefilter that can emit extra false positives, so always validate. |
 | `GPU_WAVE` | `32`..`256` | CUDA block threads per nonce wave. Default `128`; values are rounded up to a warp multiple and capped at `256`. |
 
+Before trusting a new GPU build, run the integrated correctness smoke:
+
+```bash
+./island.sh test-gpu-knobs "" 0 4096
+```
+
+It rebuilds the helper binaries, builds the CUDA kernel, dumps the current state, checks the
+GPU Keccak probe, verifies that every knob still finds the baked `DIALOG_TAIL_NONCE`, and
+compares exact candidate sets over the requested range. Use `ISLAND_CONFIG=/tmp/box.env` to
+point the same repo at a one-off remote GPU without editing the tracked `config.env`.
+
 ### Local vs remote GPU
 `init-local` / `init-remote` set this up for you. In remote mode, `build`/`search`/`doctor`
 automatically `scp` the kernel + runtime scripts + the (tiny, ~515 KB) state dump into a

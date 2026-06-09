@@ -4,6 +4,42 @@ This file records not only what changed, but also why we made the change, what s
 we expect, and what still needs to be validated. For future work, add an entry whenever a
 change affects search behavior, performance assumptions, correctness risk, or workflow.
 
+## 2026-06-09 - GPU knob correctness smoke tests
+
+Branch: `quick_filtering`
+
+### Summary
+
+Added an integrated `./island.sh test-gpu-knobs` command and `./island.sh probe` command
+so the experimental GPU search paths can be checked against the latest promoted SOTA state
+on a real CUDA machine.
+
+### Rationale
+
+The new knobs are meant to preserve the exact candidate set except for the intentionally
+noisy `trunc_only` mode. That makes correctness testing straightforward: every exact knob
+must find the baked clean `DIALOG_TAIL_NONCE`, and every exact knob must match the baseline
+candidate set over a fixed dirty range. The probe check also catches SHAKE-prefix or state
+upload mistakes before any candidate-set comparison.
+
+### Main Changes
+
+- `ISLAND_CONFIG=/path/to/config.env` lets tests target a temporary remote GPU config
+  without committing machine-specific SSH settings into the tracked `config.env`.
+- `./island.sh probe STATE` runs the CUDA binary's built-in first-shot Keccak probe.
+- `./island.sh test-gpu-knobs [CFG] [START] [N] [CHUNK]` rebuilds Rust helpers, builds the
+  CUDA kernel, dumps state, checks the probe, verifies the known clean nonce under each
+  knob, compares exact candidate sets for baseline, `trunc_first`, `wave64`, `wave256`,
+  `batch_inv`, and `comb16`, and checks that `trunc_only` does not miss baseline
+  candidates.
+
+### Expected Impact
+
+No score or search-speed change. The expected benefit is faster failure localization when
+testing on machines like RTX 5090/H100/A100: a broken SHAKE state, comb table, batch
+inversion, GCD ordering, or wave-size path should fail a small deterministic test before a
+long island search wastes time.
+
 ## 2026-06-09 - Theory note for GPU search knobs
 
 Branch: `quick_filtering`
