@@ -363,7 +363,11 @@ fn nonce_is_clean(
                 oa.push((fmul(o.x, zinv2), fmul(o.y, zinv3)));
             }
         }
-        // build denominators for non-skipped shots
+        // Circuit-structure quick filter: the circuit checks two dialog-GCD
+        // factors per point-add input. The first one, dx=tx-ox, is known before
+        // the affine-add slope/result is built. Reject dx-hard shots here, before
+        // spending the denominator batch inversion needed only for the second
+        // factor c=ox-rx.
         dens.clear();
         keep.clear();
         for s in 0..m {
@@ -379,21 +383,22 @@ fn nonce_is_clean(
             if ox.is_zero() && oa[s].1.is_zero() {
                 continue;
             }
+            let dx = fsub(tx, ox);
+            if check_gcd_factor(dx, cfg).is_err() {
+                return false;
+            }
             dens.push(fsub(ox, tx));
             keep.push(s);
         }
         batch_invert(&mut dens, &mut scratch);
-        // check each kept shot
+        // check the second factor for each dx-clean kept shot
         for (di, &s) in keep.iter().enumerate() {
             let (tx, ty) = ta[s];
             let (ox, oy) = oa[s];
             let den_inv = dens[di];
             let lambda = fmul(fsub(oy, ty), den_inv);
             let ex = fsub(fsub(fsqr(lambda), tx), ox); // e.x = lambda^2 - tx - ox
-            let (dx, c) = point_add_gcd_factors(tx, ox, ex);
-            if check_gcd_factor(dx, cfg).is_err() {
-                return false;
-            }
+            let (_dx, c) = point_add_gcd_factors(tx, ox, ex);
             if check_gcd_factor(c, cfg).is_err() {
                 return false;
             }

@@ -40,11 +40,21 @@ width-envelope overflow or non-convergence — the dominant source of "hard" inp
   96-op tail is the only per-nonce hashing; the per-step `active_width`/`compare_bits`/
   `body_w` arrays in f64 so the GPU stays integer-exact; the windowed comb table for `k·G`).
   Its byte-oriented Keccak is asserted equal to the `sha3` crate.
-- `gpu_island2.cu` runs **one CUDA block per nonce**, with `WAVE=128` threads splitting the
+- `gpu_island2.cu` runs **one CUDA block per nonce**, with `GPU_WAVE=128` by default splitting the
   9,024 shots; thread 0 advances the SHAKE squeeze into shared memory per wave, every thread
   runs the per-shot EC + GCD filter, and a shared `hard_flag` gives block-wide early-exit.
   Block-synchronous bail kills warp divergence → **7.3× over a 1-thread-per-nonce kernel**
   (236 → 1,713 nonce/s on an A100) and **77× lower latency** on a clean nonce (74.7s → 0.97s).
+- The per-shot filter is also **factor-ordered**: it checks the first circuit GCD factor
+  `dx = tx - ox` as soon as the two affine x-coordinates are known. If `dx` is hard, the
+  shot is rejected before computing the affine-add slope/result needed for the second
+  factor `c = ox - rx`. This is an exact circuit-structure prefilter, not a heuristic: it
+  preserves the clean nonce set but avoids a costly field inversion on many dirty shots.
+- Experimental knobs can be enabled per run without changing the baseline: `GPU_BATCH_INV=1`
+  uses a cooperative block kernel with batch inversions, `GPU_COMB_BITS=16` builds a larger
+  runtime comb table, `GPU_GCD_MODE=trunc_first` changes exact GCD check order, and
+  `GPU_WAVE` tunes the threads per nonce wave. `GPU_GCD_MODE=trunc_only` is intentionally
+  noisy and must be followed by normal validation.
 
 ## The filter's blind spot (why you still validate)
 The pre-filter models the **GCD** (width + convergence) but **not the apply phase**. So a

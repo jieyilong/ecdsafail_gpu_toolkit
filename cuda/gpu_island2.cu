@@ -9,6 +9,12 @@ typedef uint64_t u64;
 
 struct U256 { u32 v[8]; };
 
+#define DEFAULT_WAVE 128
+#define MAX_WAVE 256
+#define GCD_MODE_FULL_FIRST 0
+#define GCD_MODE_TRUNC_FIRST 1
+#define GCD_MODE_TRUNC_ONLY 2
+
 // p and c=2^256-p=2^32+977
 __device__ __constant__ u32 P[8]  = {0xFFFFFC2F,0xFFFFFFFE,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
 // c = 0x1000003D1
@@ -93,6 +99,8 @@ __device__ __forceinline__ void mulmod(const u32 a[8], const u32 b[8], u32 out[8
 }
 __device__ __forceinline__ void sqrmod(const u32 a[8], u32 out[8]){ mulmod(a,a,out); }
 __device__ __forceinline__ void cpy(u32 d[8], const u32 s[8]){ for(int i=0;i<8;i++) d[i]=s[i]; }
+__device__ __forceinline__ void setOne(u32 a[8]){ a[0]=1; for(int i=1;i<8;i++) a[i]=0; }
+__device__ __forceinline__ void setZero(u32 a[8]){ for(int i=0;i<8;i++) a[i]=0; }
 __device__ __forceinline__ bool isZero(const u32 a[8]){ for(int i=0;i<8;i++) if(a[i]) return false; return true; }
 __device__ __forceinline__ bool eq(const u32 a[8], const u32 b[8]){ for(int i=0;i<8;i++) if(a[i]!=b[i]) return false; return true; }
 
@@ -147,6 +155,34 @@ __device__ void jacToAff(const Jac&p, u32 ax[8], u32 ay[8]){
     if(jacInf(p)){ for(int i=0;i<8;i++){ax[i]=0;ay[i]=0;} return; }
     u32 zi[8],zi2[8],zi3[8]; invmod(p.Z,zi); sqrmod(zi,zi2); mulmod(zi2,zi,zi3);
     mulmod(p.X,zi2,ax); mulmod(p.Y,zi3,ay);
+}
+
+__device__ void jacToAffWithInv(const Jac&p, const u32 zi[8], u32 ax[8], u32 ay[8]){
+    if(jacInf(p)){ setZero(ax); setZero(ay); return; }
+    u32 zi2[8],zi3[8]; sqrmod(zi,zi2); mulmod(zi2,zi,zi3);
+    mulmod(p.X,zi2,ax); mulmod(p.Y,zi3,ay);
+}
+
+__device__ void affineAddAff(const u32 x1[8], const u32 y1[8], const u32 x2[8], const u32 y2[8], u32 ox[8], u32 oy[8]){
+    if(isZero(x1) && isZero(y1)){ cpy(ox,x2); cpy(oy,y2); return; }
+    if(isZero(x2) && isZero(y2)){ cpy(ox,x1); cpy(oy,y1); return; }
+    u32 lambda[8],num[8],den[8],deni[8];
+    if(eq(x1,x2)){
+        u32 ysum[8]; cpy(ysum,y1); addmod(ysum,y2);
+        if(isZero(ysum)){ setZero(ox); setZero(oy); return; }
+        u32 three[8]={3,0,0,0,0,0,0,0};
+        u32 two[8]={2,0,0,0,0,0,0,0};
+        sqrmod(x1,num); mulmod(num,three,num);
+        mulmod(y1,two,den);
+    } else {
+        cpy(num,y2); submod(num,y1);
+        cpy(den,x2); submod(den,x1);
+    }
+    invmod(den,deni);
+    mulmod(num,deni,lambda);
+    sqrmod(lambda,ox);
+    submod(ox,x1); submod(ox,x2);
+    u32 t[8]; cpy(t,x1); submod(t,ox); mulmod(lambda,t,oy); submod(oy,y1);
 }
 
 // double-and-add k*G for validation
@@ -268,6 +304,7 @@ __device__ __forceinline__ void sub_low_window(u32 v[8], const u32 uu[8], int wi
 
 // cfg in constant memory
 __device__ __constant__ int d_odd_u, d_k2, d_k2f0, d_active_iters, d_compare_bits;
+__device__ __constant__ int d_gcd_mode;
 __device__ __constant__ int d_aw[402], d_cb[402], d_bw[402];
 
 __device__ void full_gcd_step(u32 u[8], u32 v[8]){
@@ -301,25 +338,47 @@ __device__ bool truncated_gcd_step(u32 u[8], u32 v[8], int step){
 }
 // returns true if factor is CLEAN (Ok), false if hard
 __device__ __constant__ u32 d_P[8];
-__device__ bool check_gcd_factor(const u32 factor[8]){
-    if(isZero(factor)) return false;
-    int steps=full_gcd_steps_until_zero(d_P, factor, d_active_iters+1);
-    if(steps>d_active_iters) return false;
+__device__ bool check_gcd_factor_truncated(const u32 factor[8]){
     u32 u[8],v[8]; cpy(u,d_P); cpy(v,factor);
     for(int step=0; step<d_active_iters; step++){
         if(truncated_gcd_step(u,v,step)) return false;
     }
     return true;
 }
+__device__ bool check_gcd_factor(const u32 factor[8]){
+    if(isZero(factor)) return false;
+    if(d_gcd_mode==GCD_MODE_TRUNC_FIRST){
+        if(!check_gcd_factor_truncated(factor)) return false;
+        int steps=full_gcd_steps_until_zero(d_P, factor, d_active_iters+1);
+        return steps<=d_active_iters;
+    }
+    if(d_gcd_mode==GCD_MODE_TRUNC_ONLY){
+        return check_gcd_factor_truncated(factor);
+    }
+    int steps=full_gcd_steps_until_zero(d_P, factor, d_active_iters+1);
+    if(steps>d_active_iters) return false;
+    return check_gcd_factor_truncated(factor);
+}
 
 // ================= comb + per-nonce derivation =================
 // comb table in global memory: 32*256 affine points, each 16 u32 (x[8],y[8]).
 __device__ u32* d_comb;  // [32*256*16]
+__device__ u32* d_comb16; // [16*65536*16], optional runtime-built table
+__device__ __constant__ int d_comb_bits;
 __device__ __forceinline__ const u32* comb_x(int j,int d){ return &d_comb[((j*256+d)*16)]; }
 __device__ __forceinline__ const u32* comb_y(int j,int d){ return &d_comb[((j*256+d)*16)+8]; }
+__device__ __forceinline__ const u32* comb16_x(int j,int d){ return &d_comb16[((j*65536+d)*16)]; }
+__device__ __forceinline__ const u32* comb16_y(int j,int d){ return &d_comb16[((j*65536+d)*16)+8]; }
 
 __device__ void comb_mul_jac(const u32 k[8], Jac& acc){
     for(int i=0;i<8;i++){ acc.X[i]=0; acc.Y[i]=0; acc.Z[i]=0; }
+    if(d_comb_bits==16 && d_comb16!=NULL){
+        for(int j=0;j<16;j++){
+            u32 digit=(k[j>>1]>>((j&1)*16))&0xffffu;
+            if(digit){ Jac r; jacAddAff(acc, comb16_x(j,digit), comb16_y(j,digit), r); acc=r; }
+        }
+        return;
+    }
     for(int j=0;j<32;j++){
         u32 byte=(k[j>>2]>>((j&3)*8))&0xffu;
         if(byte){ Jac r; jacAddAff(acc, comb_x(j,byte), comb_y(j,byte), r); acc=r; }
@@ -328,6 +387,71 @@ __device__ void comb_mul_jac(const u32 k[8], Jac& acc){
 // submod a-b mod p (a,b<p) -> out  (== sub_mod_p)
 __device__ __forceinline__ void submod_p(const u32 a[8], const u32 b[8], u32 out[8]){
     cpy(out,a); submod(out,b);
+}
+
+__global__ void build_comb16_kernel(const u32* comb8, u32* comb16){
+    u64 idx = blockIdx.x*(u64)blockDim.x + threadIdx.x;
+    const u64 total = 16ull*65536ull;
+    for(u64 i=idx; i<total; i += gridDim.x*(u64)blockDim.x){
+        int j=(int)(i>>16);
+        int d=(int)(i&0xffffu);
+        int lo=d&0xff, hi=d>>8;
+        const u32* lx=&comb8[(((2*j)*256+lo)*16)];
+        const u32* ly=lx+8;
+        const u32* hx=&comb8[(((2*j+1)*256+hi)*16)];
+        const u32* hy=hx+8;
+        u32 ox[8],oy[8];
+        affineAddAff(lx,ly,hx,hy,ox,oy);
+        u32* out=&comb16[i*16];
+        for(int k=0;k<8;k++){ out[k]=ox[k]; out[8+k]=oy[k]; }
+    }
+}
+
+__device__ __forceinline__ void sh_store(u32* base, int idx, const u32 v[8]){
+    u32* p=&base[idx*8];
+    for(int i=0;i<8;i++) p[i]=v[i];
+}
+__device__ __forceinline__ void sh_load(const u32* base, int idx, u32 v[8]){
+    const u32* p=&base[idx*8];
+    for(int i=0;i<8;i++) v[i]=p[i];
+}
+
+// All block threads must call this together. Each thread contributes one nonzero
+// field element and receives its inverse using one block-wide Fermat inversion.
+__device__ void block_batch_inv_nonzero(const u32 val[8], u32 inv[8], u32* scan, u32* rscan, u32* shared_inv){
+    int t=threadIdx.x, n=blockDim.x;
+    sh_store(scan,t,val);
+    sh_store(rscan,t,val);
+    __syncthreads();
+    for(int off=1; off<n; off<<=1){
+        u32 cur[8],left[8],prod[8];
+        bool has=t>=off;
+        sh_load(scan,t,cur);
+        if(has) sh_load(scan,t-off,left);
+        __syncthreads();
+        if(has){ mulmod(left,cur,prod); sh_store(scan,t,prod); }
+        __syncthreads();
+    }
+    for(int off=1; off<n; off<<=1){
+        u32 cur[8],right[8],prod[8];
+        bool has=(t+off)<n;
+        sh_load(rscan,t,cur);
+        if(has) sh_load(rscan,t+off,right);
+        __syncthreads();
+        if(has){ mulmod(cur,right,prod); sh_store(rscan,t,prod); }
+        __syncthreads();
+    }
+    if(t==0){
+        u32 total[8]; sh_load(scan,n-1,total);
+        invmod(total,shared_inv);
+    }
+    __syncthreads();
+    u32 before[8],after[8],tmp[8];
+    if(t==0) setOne(before); else sh_load(scan,t-1,before);
+    if(t==n-1) setOne(after); else sh_load(rscan,t+1,after);
+    mulmod(before,after,tmp);
+    mulmod(tmp,shared_inv,inv);
+    __syncthreads();
 }
 
 // base keccak state + params
@@ -376,13 +500,14 @@ __device__ bool nonce_is_clean(u64 nonce){
         if(eq(tx,ox)) continue;
         if(isZero(tx)&&isZero(ty)) continue;
         if(isZero(ox)&&isZero(oy)) continue;
+        u32 dx[8]; submod_p(tx,ox,dx);
+        if(!check_gcd_factor(dx)) return false;
         u32 den[8]; submod_p(ox,tx,den);
         u32 deni[8]; invmod(den,deni);
         u32 num[8]; submod_p(oy,ty,num);
         u32 lambda[8]; mulmod(num,deni,lambda);
         u32 ex[8]; sqrmod(lambda,ex); submod(ex,tx); submod(ex,ox);
-        u32 dx[8],c[8]; submod_p(tx,ox,dx); submod_p(ox,ex,c);
-        if(!check_gcd_factor(dx)) return false;
+        u32 c[8]; submod_p(ox,ex,c);
         if(!check_gcd_factor(c)) return false;
     }
     return true;
@@ -407,24 +532,30 @@ __device__ bool shot_is_hard(const u32 k1[8], const u32 k2[8]){
     if(eq(tx,ox)) return false;
     if(isZero(tx)&&isZero(ty)) return false;
     if(isZero(ox)&&isZero(oy)) return false;
+    // Circuit-structure quick filter: point addition feeds two inversion/GCD
+    // factors into the truncated dialog-GCD path. The first factor, dx=tx-ox,
+    // is available as soon as the two x-coordinates are affine. If dx is already
+    // hard, reject this shot before paying the expensive affine-add denominator
+    // inversion and rx/c construction for the second factor.
+    u32 dx[8]; submod_p(tx,ox,dx);
+    if(!check_gcd_factor(dx)) return true;
     u32 den[8]; submod_p(ox,tx,den);
     u32 deni[8]; invmod(den,deni);
     u32 num[8]; submod_p(oy,ty,num);
     u32 lambda[8]; mulmod(num,deni,lambda);
     u32 ex[8]; sqrmod(lambda,ex); submod(ex,tx); submod(ex,ox);
-    u32 dx[8],c[8]; submod_p(tx,ox,dx); submod_p(ox,ex,c);
-    if(!check_gcd_factor(dx)) return true;
+    u32 c[8]; submod_p(ox,ex,c);
     if(!check_gcd_factor(c)) return true;
     return false;
 }
 
-#define WAVE 128
 __global__ void search_kernel2(u64 start, u64 count, u32* out_cnt, u64* out_list, int max_out){
+    extern __shared__ unsigned char wbytes[];
     __shared__ u64 sq_st[25];
     __shared__ int sq_pt;
-    __shared__ unsigned char wbytes[WAVE*64];
     __shared__ int hard_flag;
     int t = threadIdx.x;
+    int wave = blockDim.x;
     for(u64 nidx = blockIdx.x; nidx < count; nidx += gridDim.x){
         u64 nonce = start + nidx;
         if(t==0){
@@ -435,9 +566,9 @@ __global__ void search_kernel2(u64 start, u64 count, u32* out_cnt, u64* out_list
             sq_pt=0; hard_flag=0;
         }
         __syncthreads();
-        for(int base_shot=0; base_shot<9024; base_shot+=WAVE){
+        for(int base_shot=0; base_shot<9024; base_shot+=wave){
             if(hard_flag) break;
-            int n_this = (9024-base_shot < WAVE) ? (9024-base_shot) : WAVE;
+            int n_this = (9024-base_shot < wave) ? (9024-base_shot) : wave;
             if(t==0){
                 unsigned char* sb=(unsigned char*)sq_st;
                 int need=n_this*64;
@@ -450,6 +581,101 @@ __global__ void search_kernel2(u64 start, u64 count, u32* out_cnt, u64* out_list
                 for(int i=0;i<8;i++) k1[i]=rb[4*i]|(rb[4*i+1]<<8)|(rb[4*i+2]<<16)|(rb[4*i+3]<<24);
                 for(int i=0;i<8;i++) k2[i]=rb[32+4*i]|(rb[32+4*i+1]<<8)|(rb[32+4*i+2]<<16)|(rb[32+4*i+3]<<24);
                 if(shot_is_hard(k1,k2)) hard_flag=1;
+            }
+            __syncthreads();
+        }
+        if(t==0 && !hard_flag){
+            u32 pos=atomicAdd(out_cnt,1u);
+            if(pos<(u32)max_out) out_list[pos]=nonce;
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void search_kernel2_batch(u64 start, u64 count, u32* out_cnt, u64* out_list, int max_out){
+    extern __shared__ unsigned char smem[];
+    int t = threadIdx.x;
+    int wave = blockDim.x;
+    unsigned char* wbytes = smem;
+    u32* scan = (u32*)(wbytes + wave*64);
+    u32* rscan = scan + wave*8;
+    u32* shared_inv = rscan + wave*8;
+    __shared__ u64 sq_st[25];
+    __shared__ int sq_pt;
+    __shared__ int hard_flag;
+    for(u64 nidx = blockIdx.x; nidx < count; nidx += gridDim.x){
+        u64 nonce = start + nidx;
+        if(t==0){
+            for(int i=0;i<25;i++) sq_st[i]=d_base_st[i];
+            int pt=d_base_pt;
+            for(int i=0;i<48;i++){ u64 q=((nonce>>i)&1)?d_tx1:d_tx0; feed_x_op_dev(sq_st,pt,q); feed_x_op_dev(sq_st,pt,q); }
+            unsigned char* sb=(unsigned char*)sq_st; sb[pt]^=0x1F; sb[135]^=0x80; keccakf(sq_st);
+            sq_pt=0; hard_flag=0;
+        }
+        __syncthreads();
+        for(int base_shot=0; base_shot<9024; base_shot+=wave){
+            if(hard_flag) break;
+            int n_this = (9024-base_shot < wave) ? (9024-base_shot) : wave;
+            if(t==0){
+                unsigned char* sb=(unsigned char*)sq_st;
+                int need=n_this*64;
+                for(int i=0;i<need;i++){ if(sq_pt==136){ keccakf(sq_st); sq_pt=0; } wbytes[i]=sb[sq_pt++]; }
+            }
+            __syncthreads();
+
+            bool active = t < n_this;
+            u32 k1[8],k2[8];
+            if(active){
+                unsigned char* rb=&wbytes[t*64];
+                for(int i=0;i<8;i++) k1[i]=rb[4*i]|(rb[4*i+1]<<8)|(rb[4*i+2]<<16)|(rb[4*i+3]<<24);
+                for(int i=0;i<8;i++) k2[i]=rb[32+4*i]|(rb[32+4*i+1]<<8)|(rb[32+4*i+2]<<16)|(rb[32+4*i+3]<<24);
+            } else {
+                setZero(k1); setZero(k2);
+            }
+
+            Jac tj,oj;
+            if(active){ comb_mul_jac(k1,tj); comb_mul_jac(k2,oj); }
+            else { setZero(tj.X); setZero(tj.Y); setZero(tj.Z); setZero(oj.X); setZero(oj.Y); setZero(oj.Z); }
+
+            u32 zt[8],zo[8],zprod[8],zprod_inv[8],zt_inv[8],zo_inv[8];
+            if(active && !jacInf(tj)) cpy(zt,tj.Z); else setOne(zt);
+            if(active && !jacInf(oj)) cpy(zo,oj.Z); else setOne(zo);
+            mulmod(zt,zo,zprod);
+            block_batch_inv_nonzero(zprod,zprod_inv,scan,rscan,shared_inv);
+            mulmod(zo,zprod_inv,zt_inv);
+            mulmod(zt,zprod_inv,zo_inv);
+
+            u32 tx[8],ty[8],ox[8],oy[8];
+            if(active){
+                jacToAffWithInv(tj,zt_inv,tx,ty);
+                jacToAffWithInv(oj,zo_inv,ox,oy);
+            } else {
+                setZero(tx); setZero(ty); setZero(ox); setZero(oy);
+            }
+
+            bool valid = false;
+            if(active){
+                if(eq(tx,ox)) valid=false;
+                else if(isZero(tx)&&isZero(ty)) valid=false;
+                else if(isZero(ox)&&isZero(oy)) valid=false;
+                else {
+                    u32 dx[8]; submod_p(tx,ox,dx);
+                    if(!check_gcd_factor(dx)) hard_flag=1;
+                    else valid=true;
+                }
+            }
+            __syncthreads();
+            if(hard_flag) break;
+
+            u32 den[8],deni[8];
+            if(valid) submod_p(ox,tx,den); else setOne(den);
+            block_batch_inv_nonzero(den,deni,scan,rscan,shared_inv);
+            if(valid){
+                u32 num[8]; submod_p(oy,ty,num);
+                u32 lambda[8]; mulmod(num,deni,lambda);
+                u32 ex[8]; sqrmod(lambda,ex); submod(ex,tx); submod(ex,ox);
+                u32 c[8]; submod_p(ox,ex,c);
+                if(!check_gcd_factor(c)) hard_flag=1;
             }
             __syncthreads();
         }
@@ -474,6 +700,36 @@ __global__ void probe_kernel(u64 nonce, u32* out){
 #include <cstring>
 static u64 rd64(FILE*f){ u64 v; fread(&v,8,1,f); return v; }
 static u32 rd32(FILE*f){ u32 v; fread(&v,4,1,f); return v; }
+static bool env_flag(const char* name){
+    const char* s=getenv(name);
+    if(!s || !*s) return false;
+    if(strcmp(s,"0")==0 || strcmp(s,"false")==0 || strcmp(s,"FALSE")==0 || strcmp(s,"off")==0 || strcmp(s,"OFF")==0 || strcmp(s,"no")==0 || strcmp(s,"NO")==0) return false;
+    return true;
+}
+static int env_int(const char* name, int defv){
+    const char* s=getenv(name);
+    return (s && *s) ? atoi(s) : defv;
+}
+static int parse_wave(){
+    int wave=env_int("GPU_WAVE", env_int("WAVE", DEFAULT_WAVE));
+    if(wave<32) wave=32;
+    if(wave>MAX_WAVE) wave=MAX_WAVE;
+    if(wave%32) wave=((wave+31)/32)*32;
+    if(wave>MAX_WAVE) wave=MAX_WAVE;
+    return wave;
+}
+static int parse_gcd_mode(){
+    const char* s=getenv("GPU_GCD_MODE");
+    if(!s || !*s) s=getenv("GCD_MODE");
+    if(!s || !*s) return GCD_MODE_FULL_FIRST;
+    if(strcmp(s,"trunc_first")==0 || strcmp(s,"1")==0) return GCD_MODE_TRUNC_FIRST;
+    if(strcmp(s,"trunc_only")==0 || strcmp(s,"2")==0) return GCD_MODE_TRUNC_ONLY;
+    return GCD_MODE_FULL_FIRST;
+}
+static int parse_comb_bits(){
+    int bits=env_int("GPU_COMB_BITS", env_flag("GPU_LARGE_COMB") ? 16 : 8);
+    return bits==16 ? 16 : 8;
+}
 
 int main(int argc, char** argv){
     const char* dump = getenv("GPU_STATE"); if(!dump) dump="/tmp/gpu_state.bin";
@@ -498,6 +754,13 @@ int main(int argc, char** argv){
     printf("loaded: n_ops=%llu tx0=%llu tx1=%llu base_pt=%u ai=%u cbits=%u odd_u=%u k2=%u\n",
         (unsigned long long)n_ops,(unsigned long long)tx0,(unsigned long long)tx1,base_pt,ai,cbits,odd_u,k2);
 
+    bool batch_inv = env_flag("GPU_BATCH_INV") || env_flag("BATCH_INV");
+    int wave = parse_wave();
+    int gcd_mode = parse_gcd_mode();
+    int comb_bits = parse_comb_bits();
+    printf("options: batch_inv=%u comb_bits=%d gcd_mode=%d wave=%d\n",
+        batch_inv?1u:0u, comb_bits, gcd_mode, wave);
+
     // upload constants
     u32 Phost[8]={0xFFFFFC2F,0xFFFFFFFE,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
     cudaMemcpyToSymbol(d_P,Phost,32);
@@ -505,11 +768,24 @@ int main(int argc, char** argv){
     cudaMemcpyToSymbol(d_odd_u,&iodd,4); cudaMemcpyToSymbol(d_k2,&ik2,4);
     cudaMemcpyToSymbol(d_k2f0,&ik2f0,4); cudaMemcpyToSymbol(d_active_iters,&iai,4);
     cudaMemcpyToSymbol(d_compare_bits,&icb,4);
+    cudaMemcpyToSymbol(d_gcd_mode,&gcd_mode,4);
     cudaMemcpyToSymbol(d_aw,aw,sizeof(aw)); cudaMemcpyToSymbol(d_cb,cb,sizeof(cb)); cudaMemcpyToSymbol(d_bw,bw,sizeof(bw));
     cudaMemcpyToSymbol(d_base_st,base_st,200); cudaMemcpyToSymbol(d_base_pt,&base_pt,4);
     u64 utx0=tx0,utx1=tx1; cudaMemcpyToSymbol(d_tx0,&utx0,8); cudaMemcpyToSymbol(d_tx1,&utx1,8);
     u32* dcomb; cudaMalloc(&dcomb, sizeof(comb)); cudaMemcpy(dcomb,comb,sizeof(comb),cudaMemcpyHostToDevice);
     cudaMemcpyToSymbol(d_comb,&dcomb,sizeof(dcomb));
+    u32* dcomb16=0;
+    if(comb_bits==16){
+        size_t comb16_bytes = (size_t)16*65536*16*sizeof(u32);
+        cudaError_t ce = cudaMalloc(&dcomb16, comb16_bytes);
+        if(ce){ printf("comb16 malloc err %s\n",cudaGetErrorString(ce)); return 1; }
+        build_comb16_kernel<<<4096,256>>>(dcomb,dcomb16);
+        ce = cudaDeviceSynchronize();
+        if(ce){ printf("comb16 build err %s\n",cudaGetErrorString(ce)); return 1; }
+        printf("comb16 table built: %.1f MiB\n", comb16_bytes/1048576.0);
+    }
+    cudaMemcpyToSymbol(d_comb16,&dcomb16,sizeof(dcomb16));
+    cudaMemcpyToSymbol(d_comb_bits,&comb_bits,4);
 
     if(do_probe){
         u32* dout; cudaMalloc(&dout,16*4);
@@ -528,7 +804,13 @@ int main(int argc, char** argv){
     cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1); cudaEventRecord(t0);
     if(k2mode){
         int blocks = getenv("BLOCKS")? atoi(getenv("BLOCKS")) : 512;
-        search_kernel2<<<blocks,WAVE>>>(start,count,dcnt,dlist,MAXOUT);
+        size_t shmem = (size_t)wave*64;
+        if(batch_inv){
+            shmem += (size_t)wave*8*sizeof(u32)*2 + 8*sizeof(u32);
+            search_kernel2_batch<<<blocks,wave,shmem>>>(start,count,dcnt,dlist,MAXOUT);
+        } else {
+            search_kernel2<<<blocks,wave,shmem>>>(start,count,dcnt,dlist,MAXOUT);
+        }
     } else {
         search_kernel<<<256,128>>>(start,count,dcnt,dlist,MAXOUT);
     }

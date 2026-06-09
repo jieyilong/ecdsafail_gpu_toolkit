@@ -39,6 +39,8 @@ width-envelope overflow or non-convergence. This repo:
    → k1,k2 → comb `k·G` → point-add factors) and runs the GCD filter, with **one block per
    nonce and 128 threads splitting the 9,024 shots** (cooperative squeeze in shared memory,
    block-wide early-exit). ~**1,700 nonce/s/GPU** on an A100 (vs ~236/s naive).
+   It now checks the first GCD factor `dx = tx - ox` before constructing the second factor
+   `c = ox - rx`, so many dirty shots avoid the affine-add denominator inversion entirely.
 
 Throughput stacks across GPUs, so a ~1/1M-density island is ~5 minutes on 2×A100.
 
@@ -141,6 +143,26 @@ cd $CHALLENGE && ecdsafail submit --note-file note.md --model "..." --claimed-sc
 | 8. submit | `ecdsafail submit ...` | (in the challenge repo) |
 
 `./island.sh hunt CFG START N` chains steps 2/4/5/6. See `examples/walkthrough.md`.
+
+### Experimental search-kernel knobs
+The default search path remains the original production `gpu_island2` behavior:
+`GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128`.
+
+Set any of these on `./island.sh search` or `./island.sh hunt`; local and remote modes both
+forward them to the GPU binary:
+
+```bash
+GPU_BATCH_INV=1 GPU_WAVE=128 ./island.sh search s.bin 1 2000000
+GPU_COMB_BITS=16 ./island.sh search s.bin 1 2000000
+GPU_GCD_MODE=trunc_first ./island.sh search s.bin 1 2000000
+```
+
+| option | values | effect |
+|---|---|---|
+| `GPU_BATCH_INV` | `0`/`1` | `1` launches the cooperative block kernel that batch-inverts the two Jacobian `Z` values and the affine-add denominator across a wave. Exact candidate set. |
+| `GPU_COMB_BITS` | `8`/`16` | `16` builds a 64 MiB comb16 table on the GPU at process startup and halves scalar-mul table lookups/adds. Exact, but startup-heavy. |
+| `GPU_GCD_MODE` | `full_first`, `trunc_first`, `trunc_only` | `full_first` is the current exact order. `trunc_first` is exact but checks width overflow before convergence. `trunc_only` is a noisy experimental prefilter that can emit extra false positives, so always validate. |
+| `GPU_WAVE` | `32`..`256` | CUDA block threads per nonce wave. Default `128`; values are rounded up to a warp multiple and capped at `256`. |
 
 ### Local vs remote GPU
 `init-local` / `init-remote` set this up for you. In remote mode, `build`/`search`/`doctor`

@@ -13,9 +13,43 @@ Result (validated bit-exact: 431581 → CLEAN, agrees with serial):
   synchronous early-exit eliminating warp divergence (occupancy ~unchanged, registers
   still 162 — the EC+filter is the register hog, not the Squeezer).
 2 GPUs ≈ 3400 nonce/s → a ~1/1M island ≈ 5 min (was 12+ hr).
-Next lever to add if needed: shared-memory block-level batch inversion (removes the
-768-modmul/shot Fermat inverse → ~2x more), now feasible since the wave already has
-128 shots' points co-resident.
+Runtime knobs now keep this path as the baseline while letting experiments A/B against it:
+`GPU_WAVE` changes the block size, `GPU_BATCH_INV=1` launches a cooperative batch-inversion
+kernel, `GPU_COMB_BITS=16` builds a larger runtime comb table, and `GPU_GCD_MODE` controls
+the GCD check order.
+
+## UPDATE: dx-first quick filter
+Point addition gives the dialog-GCD two factors:
+
+1. `dx = tx - ox`
+2. `c = ox - rx`, where `rx` requires the affine-add slope and a denominator inversion.
+
+The kernel now checks `dx` immediately after deriving the two affine x-coordinates. If
+`dx` fails the same `check_gcd_factor` predicate, the shot is hard regardless of `c`, so
+the kernel rejects it before computing `rx`. This is an exact structural prefilter: no
+clean nonce can be lost, but dirty shots whose first factor is already hard skip the most
+expensive part of the second-factor construction.
+
+## UPDATE: experimental runtime knobs
+
+Default settings preserve the existing production behavior:
+
+```text
+GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128
+```
+
+- `GPU_BATCH_INV=1` runs `search_kernel2_batch`, where every block batch-inverts the two
+  Jacobian `Z` values and the affine-add denominator across the current wave. This is exact
+  and shares one Fermat inversion per batch instead of one per lane.
+- `GPU_COMB_BITS=16` builds a 16x65536 comb table from the dumped 32x256 table at process
+  startup. The table is 64 MiB and halves the scalar-mul table-add loop from 32 windows to
+  16 windows. It is exact, but repeated small chunks pay repeated build cost.
+- `GPU_GCD_MODE=trunc_first` is exact and checks the truncated width envelope before the
+  full convergence counter. It should help when width overflows dominate failures.
+  `GPU_GCD_MODE=trunc_only` skips the convergence counter and is intentionally noisy:
+  it can emit extra false positives, so it is for candidate-generation experiments only.
+- `GPU_WAVE` accepts 32..256 and is rounded up to a warp multiple. Batch mode uses more
+  shared memory per block, so large waves can trade fewer waves for lower occupancy.
 
 ## Lever value (exact CCX counts on b55ede3 base, peak 1309, tof 1,503,871):
 active257 −2989 (3.9M score win), active256 −5978 (8.1M), apply20 −516 (675k),
