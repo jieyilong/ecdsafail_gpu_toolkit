@@ -232,6 +232,7 @@ test-gpu-knobs)
   require_variant_clean "baseline" "$base_env" "$STATE" "$KNOWN"
   require_variant_clean "trunc_first" "GPU_GCD_MODE=trunc_first GPU_WAVE=128" "$STATE" "$KNOWN"
   require_variant_clean "single_pass" "GPU_GCD_MODE=single_pass GPU_WAVE=128" "$STATE" "$KNOWN"
+  require_variant_clean "fan${GPU_TEST_FAN_BITS:-20}" "GPU_FAN_BITS=${GPU_TEST_FAN_BITS:-20} GPU_WAVE=128" "$STATE" "$KNOWN"
   require_variant_clean "batch_comb16_single" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_GCD_MODE=single_pass GPU_WAVE=128" "$STATE" "$KNOWN"
   require_variant_clean "wave64" "GPU_WAVE=64" "$STATE" "$KNOWN"
   require_variant_clean "wave256" "GPU_WAVE=256" "$STATE" "$KNOWN"
@@ -253,6 +254,7 @@ test-gpu-knobs)
   echo "baseline candidates: $(wc -l < "$BASE" | tr -d ' ')"
   compare_variant_range "trunc_first" "GPU_GCD_MODE=trunc_first GPU_WAVE=128" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
   compare_variant_range "single_pass" "GPU_GCD_MODE=single_pass GPU_WAVE=128" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
+  compare_variant_range "fan${GPU_TEST_FAN_BITS:-20}" "GPU_FAN_BITS=${GPU_TEST_FAN_BITS:-20} GPU_WAVE=128" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
   compare_variant_range "batch_comb16_single" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_GCD_MODE=single_pass GPU_WAVE=128" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
   compare_variant_range "wave64" "GPU_WAVE=64" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
   compare_variant_range "wave256" "GPU_WAVE=256" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
@@ -309,6 +311,8 @@ bench-gpu-knobs)
   bench_variant "batch_wave256" "GPU_BATCH_INV=1 GPU_WAVE=256" "$RAW_STATE" "$START" "$N" "$SUMMARY"
   bench_variant "batch_comb16" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_WAVE=128" "$RAW_STATE" "$START" "$N" "$SUMMARY"
   bench_variant "batch_comb16_single" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_GCD_MODE=single_pass GPU_WAVE=128" "$RAW_STATE" "$START" "$N" "$SUMMARY"
+  bench_variant "fan${GPU_BENCH_FAN_BITS:-22}" "GPU_FAN_BITS=${GPU_BENCH_FAN_BITS:-22} GPU_WAVE=128" "$RAW_STATE" "$START" "$N" "$SUMMARY"
+  bench_variant "best_combo" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_GCD_MODE=single_pass GPU_FAN_BITS=${GPU_BENCH_FAN_BITS:-22} GPU_WAVE=128" "$RAW_STATE" "$START" "$N" "$SUMMARY"
   bench_variant "all_exact" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_GCD_MODE=trunc_first GPU_WAVE=256" "$RAW_STATE" "$START" "$N" "$SUMMARY"
   BENCH_COMB_BITS="${GPU_BENCH_COMB_BITS:-}"
   if [ -z "$BENCH_COMB_BITS" ] && truthy "${GPU_BENCH_LARGE_COMB:-0}"; then BENCH_COMB_BITS="20 22"; fi
@@ -335,7 +339,7 @@ validate)
     out=$( cd "$d" && env ${CFG:+$CFG} EVAL_FAST_REJECT="${EVAL_FAST_REJECT:-1}" DIALOG_TAIL_NONCE="$nonce" "$BIN/eval_circuit" --note "isl-$nonce" 2>&1 ); rm -rf "$d"
     cls=$(echo "$out"|grep "classical mismatches"|grep -oE '[0-9]+$'); pha=$(echo "$out"|grep "phase-garbage"|grep -oE '[0-9]+$')
     anc=$(echo "$out"|grep "ancilla-garbage"|grep -oE '[0-9]+$'); tof=$(echo "$out"|grep "avg executed Toffoli"|grep -oE '[0-9.]+'|head -1)
-    q=$(echo "$out"|grep -E '^  qubits '|grep -oE '[0-9]+$')
+    q=$(echo "$out"|grep -E '^  qubits '|grep -oE '[0-9]+$'|head -1)
     if [ "${cls:-x}" = 0 ] && [ "${pha:-x}" = 0 ] && [ "${anc:-x}" = 0 ]; then
       echo "CLEAN nonce=$nonce tof=$tof qubits=$q score=$(python3 -c "print(int(round(float('$tof')))*int('$q'))")"
     else echo "dirty nonce=$nonce cls=${cls:-?} pha=${pha:-?} anc=${anc:-?}"; fi
@@ -353,11 +357,12 @@ bake)
   ;;
 
 hunt)
-  CFG="${1:?usage: hunt CFG START N}"; START="${2:?}"; N="${3:?}"
+  CFG="${1:?usage: hunt CFG START N [CHUNK]}"; START="${2:?}"; N="${3:?}"; CHUNK="${4:-$N}"
   echo ">> [1/3] Toffoli cost:"; bash "$SELF" measure "$CFG"
-  echo ">> [2/3] dump + multi-GPU search ($N nonces from $START):"
+  echo ">> [2/3] dump + multi-GPU search ($N nonces from $START, chunk $CHUNK):"
   STATE="$(mktemp).bin"; bash "$SELF" dump "$CFG" "$STATE" >/dev/null
-  cands=$(bash "$SELF" search "$STATE" "$START" "$N" | grep -oE '[0-9]+' | sort -un)
+  # CHUNK defaults to the whole range so large comb/fan tables build once, not per chunk.
+  cands=$(bash "$SELF" search "$STATE" "$START" "$N" "$CHUNK" | grep -oE '[0-9]+' | sort -un)
   echo "GCD-clean candidates: $(echo "$cands" | grep -c . || true)"
   echo ">> [3/3] validating (looking for 0/0/0):"; found=0
   for n in $cands; do line=$(bash "$SELF" validate "$CFG" "$n"); echo "$line"; case "$line" in CLEAN*) found=1;; esac; done

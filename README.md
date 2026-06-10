@@ -171,6 +171,8 @@ GPU_GCD_MODE=trunc_first ./island.sh search s.bin 1 2000000
 
 **Overall speedup:** scan and eval are *sequential* stages, so the scan knobs (≤1.65×) and the eval lazy fast-reject (~8.5×) **don't multiply** — combined end-to-end is **up to ~8.5×** where candidate validation dominates (apply-bound configs) and **~1.6×** where the GPU scan dominates (the current frontier base). See [`docs/measured-speedups.md`](docs/measured-speedups.md) for the full breakdown.
 
+**Chunking caveat (`GPU_COMB_BITS`≥16 / `GPU_FAN_BITS`):** the large comb/fan tables are built once **per kernel process**. `search` splits the range into `CHUNK`-sized launches (default 200k), each a fresh process that rebuilds the tables — so for these knobs pass a **large `CHUNK`** (`./island.sh search STATE START N N`). `hunt` now defaults `CHUNK` to the whole range, so the tables build once.
+
 Before trusting a new GPU build, run the integrated correctness smoke:
 
 ```bash
