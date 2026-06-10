@@ -17,6 +17,32 @@ filter, which is set by the challenge config (the truncation schedule baked into
 
 Always re-measure with `bench-gpu-knobs` on the *actual* base before assuming a number.
 
+## Matching the previous release baseline
+
+The previous release hard-coded the shot-parallel `gpu_island2` path with `WAVE=128` and no
+runtime performance knobs. To make this branch behave like that search path, use:
+
+```bash
+unset BATCH_INV GPU_LARGE_COMB GCD_MODE WAVE
+GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128 GPU_FAN_BITS=0
+```
+
+For validation parity with the previous release, also use `EVAL_FAST_REJECT=0`. The search
+knobs above match the candidate set; `EVAL_FAST_REJECT=1` only changes how quickly dirty
+candidates are rejected during CPU eval.
+
+Same RTX 5090, same dumped state, 32,768-nonce dirty range:
+
+| binary / knob set | measured throughput |
+|---|---:|
+| previous-release binary | ~10,057 nonce/s |
+| this branch with previous-release-compatible knobs | ~10,062 nonce/s |
+| `speculative-and-fan` recommended exact stack | ~12,505 nonce/s |
+
+So the previous release baseline on this machine is about 10k nonce/s. The earlier 7k-ish
+number corresponds to slower wave settings such as `GPU_WAVE=64`, not to the previous
+release.
+
 ## Scan kernel (exact knobs — candidate set unchanged)
 
 | knob | current SOTA base *(fast-reject)* | earlier base *(slow-reject)* | notes |
@@ -99,6 +125,19 @@ The lesson: the scan kernel is near its wall on the current SOTA base, and predi
 multipliers from crude profiles overshot repeatedly. The genuine remaining headroom is a
 **speculative apply pre-scan** between the GCD scan and the full eval (the apply-bound
 regime), not further scan-kernel micro-optimization.
+
+## Recommended settings
+
+For normal exact GPU search on a large NVIDIA GPU:
+
+```bash
+GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_WAVE=128 GPU_FAN_BITS=0
+```
+
+Add `EVAL_FAST_REJECT=1` for candidate validation unless you intentionally need byte-for-byte
+previous-release diagnostics/counts. For large single-process chunks (roughly 500k nonces or
+more), `GPU_FAN_BITS=20` can be tested as a small extra exact scan win; on 200k chunks it was
+a wash after the 208 MiB table build.
 
 ## Methodology
 

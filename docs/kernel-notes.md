@@ -32,11 +32,25 @@ expensive part of the second-factor construction.
 
 ## UPDATE: experimental runtime knobs
 
-Default settings preserve the existing production behavior:
+Default settings preserve the previous release's search behavior:
 
 ```text
-GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128
+GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128 GPU_FAN_BITS=0
 ```
+
+Clear compatibility aliases when doing a strict baseline comparison:
+
+```bash
+unset BATCH_INV GPU_LARGE_COMB GCD_MODE WAVE
+```
+
+For CPU validation parity with the previous release, set `EVAL_FAST_REJECT=0`; the branch's
+`island.sh validate` command defaults to `EVAL_FAST_REJECT=1` because dirty candidates reject
+much faster and clean candidates still read `0/0/0`.
+
+Same-machine RTX 5090 check: the previous-release binary and this branch with the baseline
+knobs both measured about 10k nonce/s on the same dumped state and both found the baked clean
+nonce.
 
 - `GPU_BATCH_INV=1` runs `search_kernel2_batch`, where every block batch-inverts the two
   Jacobian `Z` values and the affine-add denominator across the current wave. This is exact
@@ -64,6 +78,14 @@ GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128
   ~8.5× avg on dirty candidates; exact (the full eval already checks apply-cleanliness, so
   this *is* the apply pre-scan). Default off keeps scoring byte-identical. Patch:
   `patches/eval_fast_reject.diff`.
+
+Recommended exact search settings on the RTX 5090:
+
+```text
+GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_WAVE=128 GPU_FAN_BITS=0
+```
+
+Use `GPU_FAN_BITS=20` only for larger chunks where its table-build cost is amortized.
 
 ## Lever value (exact CCX counts on b55ede3 base, peak 1309, tof 1,503,871):
 active257 −2989 (3.9M score win), active256 −5978 (8.1M), apply20 −516 (675k),

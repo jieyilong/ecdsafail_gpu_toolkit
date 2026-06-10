@@ -145,8 +145,23 @@ cd $CHALLENGE && ecdsafail submit --note-file note.md --model "..." --claimed-sc
 `./island.sh hunt CFG START N` chains steps 2/4/5/6. See `examples/walkthrough.md`.
 
 ### Experimental search-kernel knobs
-The default search path remains the original production `gpu_island2` behavior:
-`GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128`.
+The default search path preserves the previous release's `gpu_island2` behavior:
+`GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128 GPU_FAN_BITS=0`.
+
+To force this branch to match the previous release's search behavior, set the knobs explicitly
+and clear older aliases that can override them:
+
+```bash
+unset BATCH_INV GPU_LARGE_COMB GCD_MODE WAVE
+GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128 GPU_FAN_BITS=0 \
+  ./island.sh search s.bin <START> <N>
+```
+
+This matches the previous release's candidate behavior; on the RTX 5090 comparison run, a
+previous-release binary measured ~10,057 nonce/s and this branch with these knobs measured
+~10,062 nonce/s on the same dumped state. If you also want validation to behave like the
+previous release, set `EVAL_FAST_REJECT=0`; `island.sh validate` otherwise defaults it to
+`1` for faster dirty-candidate rejection.
 
 Set any of these on `./island.sh search` or `./island.sh hunt`; local and remote modes both
 forward them to the GPU binary:
@@ -168,6 +183,18 @@ GPU_GCD_MODE=trunc_first ./island.sh search s.bin 1 2000000
 | `EVAL_FAST_REJECT` | `0`/`1` | Eval phase (challenge `eval_circuit`): `1` defers the per-shot EC-muls into the batch loop and stops at the first failing batch (clean/dirty verdict only). **~8.5× avg** on dirty candidates (16.1s → ~1.9s); exact — clean islands still read `0/0/0`. This is the exact "apply pre-scan". Default `0` so scoring runs are complete/byte-identical. `island.sh validate` sets it to `1`. **Note:** lives in the challenge repo (reset by `ecdsafail sync`) — re-apply from `patches/eval_fast_reject.diff`. |
 
 **Every improvement is an independent on/off knob** (all default to the conservative/exact baseline): `GPU_BATCH_INV`, `GPU_COMB_BITS`, `GPU_GCD_MODE` (`single_pass`), `GPU_WAVE`, `GPU_FAN_BITS`, and `EVAL_FAST_REJECT`. They compose; benchmark combinations with `bench-gpu-knobs`.
+
+Recommended exact scan settings on the RTX 5090:
+
+```bash
+GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_WAVE=128 GPU_FAN_BITS=0 \
+  ./island.sh search s.bin <START> <N>
+```
+
+This is the best default for normal chunk sizes. For larger chunks (about 500k nonces or
+more per kernel process), `GPU_FAN_BITS=20` can add a small extra gain after its 208 MiB
+table-build cost is amortized. Avoid `GPU_FAN_BITS=22/24` by default; the larger startup
+cost usually eats the kernel-only win.
 
 **Overall speedup:** scan and eval are *sequential* stages, so the scan knobs (≤1.65×) and the eval lazy fast-reject (~8.5×) **don't multiply** — combined end-to-end is **up to ~8.5×** where candidate validation dominates (apply-bound configs) and **~1.6×** where the GPU scan dominates (the current frontier base). See [`docs/measured-speedups.md`](docs/measured-speedups.md) for the full breakdown.
 

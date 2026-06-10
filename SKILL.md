@@ -46,6 +46,19 @@ baseline (`GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128 
 for the scan, `EVAL_FAST_REJECT=0` for the eval). They compose; benchmark combinations with
 `bench-gpu-knobs`. Two are new:
 
+To compare against the previous release's search behavior, explicitly set the scan baseline
+and clear compatibility aliases:
+
+```bash
+unset BATCH_INV GPU_LARGE_COMB GCD_MODE WAVE
+GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128 GPU_FAN_BITS=0 ./island.sh search s.bin <START> <N>
+```
+
+For strict previous-release validation behavior, add `EVAL_FAST_REJECT=0`; `island.sh
+validate` sets it to `1` by default for faster dirty-candidate rejection. On the RTX 5090,
+the previous-release binary and this branch with the scan baseline both measured about
+10k nonce/s on the same dumped state.
+
 - `GPU_FAN_BITS=K` — **nonce-fan**: precompute the SHAKE sponge for the low `K` tail bits so
   each nonce only absorbs its high bits. Exact. Table is `2^K * 208 B`. Measured ~+1.5% on the
   current SOTA base (`squeeze_init` is not the bottleneck there).
@@ -67,6 +80,8 @@ GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_WAVE=128 ./island.
 `GPU_GCD_MODE=single_pass` is exact (validated identical candidate set) and adds a free ~0-4%.
 The `comb22` table is ~3.0 GiB and was only ~2.8% over `comb16`; if VRAM is constrained or
 process startup dominates, use `GPU_COMB_BITS=16`.
+For large chunks (roughly 500k nonces or more per process), test `GPU_FAN_BITS=20`; for normal
+200k chunks leave `GPU_FAN_BITS=0` because table build usually eats the small kernel win.
 
 Calibrate expectations: the absolute speedup of these exact knobs is **strongly
 base-dependent** (e.g. `GPU_BATCH_INV` is ~1.42x on slow-reject bases but only +1.2% on the

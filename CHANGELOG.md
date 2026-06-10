@@ -4,6 +4,37 @@ This file records not only what changed, but also why we made the change, what s
 we expect, and what still needs to be validated. For future work, add an entry whenever a
 change affects search behavior, performance assumptions, correctness risk, or workflow.
 
+## 2026-06-10 - Document previous-release-compatible baseline knobs
+
+Branch: `speculative-and-fan`
+
+### Summary
+
+Clarified how to run the latest branch as a strict previous-release search baseline and how
+to switch from that baseline to the recommended exact-performance stack.
+
+### Main Changes
+
+- Added explicit previous-release-compatible search recipe:
+  `GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128 GPU_FAN_BITS=0`,
+  plus `unset BATCH_INV GPU_LARGE_COMB GCD_MODE WAVE` for clean comparisons.
+- Documented that validation parity with the previous release requires `EVAL_FAST_REJECT=0`;
+  the branch's `island.sh validate` defaults it to `1` for faster dirty-candidate rejection.
+- Recorded same-machine RTX 5090 comparison: the previous-release binary measured
+  ~10,057 nonce/s, and this branch with baseline knobs measured ~10,062 nonce/s on the same
+  dumped state. This confirms the previous release baseline is about 10k nonce/s on this
+  machine, while the 7k-ish number corresponds to slower wave settings such as `GPU_WAVE=64`.
+- Added recommended exact scan settings:
+  `GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_WAVE=128 GPU_FAN_BITS=0`,
+  with `GPU_FAN_BITS=20` only as a large-chunk option.
+
+### Rationale
+
+The branch now contains several exact on/off knobs, so "baseline" was ambiguous. These notes
+separate three cases: the previous release, this branch with previous-release-compatible
+knobs, and the recommended fast exact stack. That makes future speedup claims auditable and
+avoids comparing against the wrong baseline.
+
 ## 2026-06-10 - Nonce-fan, eval early-exit, and a measured-speedups record
 
 Branch: `speculative-and-fan` (not yet merged)
