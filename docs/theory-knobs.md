@@ -18,40 +18,6 @@ hash-derived point-add inputs. Each shot roughly does:
 The knobs below try to reduce the cost of steps 2 to 5 without changing which exact inputs
 the benchmark tests.
 
-## `dx`-First Quick Filter
-
-Point addition needs the slope
-
-```text
-lambda = (oy - ty) / (ox - tx)
-rx = lambda^2 - tx - ox
-```
-
-The circuit's dialog-GCD path checks two relevant factors:
-
-```text
-dx = tx - ox
-c  = ox - rx
-```
-
-The important ordering fact is that `dx` is known as soon as `tx` and `ox` are affine.
-The second factor `c` requires `rx`, and `rx` requires the affine-add denominator inverse.
-
-So the exact short-circuit is:
-
-```text
-if dx is hard:
-    reject the shot immediately
-else:
-    compute lambda, rx, c
-    check c
-```
-
-This cannot reject a clean nonce incorrectly, because a hard `dx` is already sufficient for
-the shot to fail the same GCD predicate. The expected speedup is small on the production
-GPU path because first-factor failures are rare among all evaluated shots, but each saved
-case skips a relatively expensive denominator inversion and second-factor construction.
-
 ## `GPU_BATCH_INV=1`: Batch Inversion
 
 Field inversion is expensive. In this toolkit the CUDA field inverse is Fermat-style:
@@ -335,6 +301,45 @@ This is the **exact "apply pre-scan"**: the full eval already checks apply-clean
 fast-rejecting eval *is* the apply pre-scan — with zero false negatives and no GPU
 re-implementation of the apply phase. The change lives in the challenge repo (reset by
 `ecdsafail sync`); re-apply `patches/eval_fast_reject.diff`.
+
+## `dx`-First Quick Filter
+
+Point addition needs the slope
+
+```text
+lambda = (oy - ty) / (ox - tx)
+rx = lambda^2 - tx - ox
+```
+
+The circuit's dialog-GCD path checks two relevant factors:
+
+```text
+dx = tx - ox
+c  = ox - rx
+```
+
+The important ordering fact is that `dx` is known as soon as `tx` and `ox` are affine.
+The second factor `c` requires `rx`, and `rx` requires the affine-add denominator inverse.
+
+We define `dx` is hard iff either:
+
+1. the full classical GCD walk for (p, dx) does not reach v = 0 within active_iters, or
+2. the truncated circuit-style GCD replay for (p, dx) exceeds its allowed width envelope
+
+So the exact short-circuit is:
+
+```text
+if dx is hard:
+    reject the shot immediately
+else:
+    compute lambda, rx, c
+    check c
+```
+
+This cannot reject a clean nonce incorrectly, because a hard `dx` is already sufficient for
+the shot to fail the same GCD predicate. The expected speedup is small on the production
+GPU path because first-factor failures are rare among all evaluated shots, but each saved
+case skips a relatively expensive denominator inversion and second-factor construction.
 
 ## Recommended Evaluation Order
 
