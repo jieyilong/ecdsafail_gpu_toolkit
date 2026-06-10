@@ -37,6 +37,40 @@ and builds the kernel. Then:
    MUST print `CLEAN`. If not, STOP — the filter/dump doesn't match this base; do not trust results.
 
 To switch GPUs later (e.g. the user gives a new box), just re-run `init-remote`/`init-local`.
+The script can be invoked as `./island.sh ...` or `bash island.sh ...`; recursive self-calls
+resolve through the script directory.
+
+## GPU search knobs
+The default search path is exact and conservative:
+`GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128`.
+
+For production island searches on a large NVIDIA GPU, prefer the fastest exact mode that has
+passed `test-gpu-knobs` on the current base. As of the RTX 5090 measurements, the best
+measured exact mode is:
+
+```bash
+GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_WAVE=128 ./island.sh search s.bin <START> <N>
+```
+
+This uses a ~3.0 GiB runtime fixed-base comb table and was only a small improvement over
+`GPU_BATCH_INV=1 GPU_COMB_BITS=16` (~2.8% on a 32,768-nonce slice), so treat it as a tuning
+knob rather than a breakthrough. If VRAM is constrained or process startup dominates, fall
+back to `GPU_COMB_BITS=16`.
+
+Before trusting new GPU knob combinations on a fresh base or GPU, run:
+
+```bash
+GPU_TEST_COMB_BITS="20 22" ./island.sh test-gpu-knobs "" <START> <N>
+```
+
+To compare throughput fairly, run:
+
+```bash
+GPU_BENCH_COMB_BITS="20 22" GPU_BENCH_RUNS=2 ./island.sh bench-gpu-knobs "" <START> <N>
+```
+
+Always correctness-test first, then benchmark. `GPU_GCD_MODE=trunc_only` is intentionally
+noisy and should only be used as a candidate generator followed by normal validation.
 
 ## The optimization loop
 1. **Measure levers, don't guess.** For each candidate tightening, run
