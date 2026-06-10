@@ -316,11 +316,16 @@ search/validate path only needs a clean/dirty verdict, not the full mismatch cou
 `0` keeps scoring/submission runs complete and byte-identical; a clean island still runs all
 batches and reads `0/0/0`.
 
-Measured ~1.5× on dirty candidates today. The ceiling is that the eval derives **all 9024
-inputs upfront** (~9 s of CPU EC scalar-mults) before the batch loop, and early-exit only
-shortcuts the batch loop. Deferring those muls into the batch loop (lazy derivation) would
-reach ~10×, but that is a rewrite of the trusted scoring binary and is mostly worth it for
-apply-bound configs where eval dominates. The change lives in the challenge repo (reset by
+It also **defers the per-shot EC scalar-mults into the batch loop**, so an early exit skips
+the muls for batches it never reaches. That is the key: a simple batch-only early-exit was
+capped at ~1.5× by the ~9 s upfront derivation of all 9024 inputs; deferring it gives
+**~8.5× average** on dirty candidates (16.1 s → ~1.9 s). The `FAST=0` scoring path is
+byte-identical to the original (same full mismatch counts), and a clean island still derives
+and simulates all 9024 shots and reads `0/0/0`.
+
+This is the **exact "apply pre-scan"**: the full eval already checks apply-cleanliness, so a
+fast-rejecting eval *is* the apply pre-scan — with zero false negatives and no GPU
+re-implementation of the apply phase. The change lives in the challenge repo (reset by
 `ecdsafail sync`); re-apply `patches/eval_fast_reject.diff`.
 
 ## Recommended Evaluation Order

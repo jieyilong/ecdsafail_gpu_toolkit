@@ -60,8 +60,10 @@ GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128
   `2^K * 208 B` table so each nonce only absorbs its high bits. Exact. `0` = off. Measured
   ~+1.5% on the current SOTA base. See `docs/theory-knobs.md` and `docs/measured-speedups.md`.
 - `EVAL_FAST_REJECT=1` is an *eval-phase* knob (challenge `eval_circuit`), not a kernel knob:
-  it stops the validation eval at the first failing batch. ~1.5×; default off keeps scoring
-  complete. Patch: `patches/eval_fast_reject.diff`.
+  it defers the per-shot EC-muls into the batch loop and stops at the first failing batch.
+  ~8.5× avg on dirty candidates; exact (the full eval already checks apply-cleanliness, so
+  this *is* the apply pre-scan). Default off keeps scoring byte-identical. Patch:
+  `patches/eval_fast_reject.diff`.
 
 ## Lever value (exact CCX counts on b55ede3 base, peak 1309, tof 1,503,871):
 active257 −2989 (3.9M score win), active256 −5978 (8.1M), apply20 −516 (675k),

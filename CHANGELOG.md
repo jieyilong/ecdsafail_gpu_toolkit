@@ -28,10 +28,19 @@ Two new exact, independently-toggleable knobs plus an honest measured-speedups d
 
 - nonce-fan: **~+1.5%** (squeeze_init is not the bottleneck here; predicted ~1.4x, did not
   pan out).
-- eval early-exit: **~1.5×** on dirty candidates (16.3s -> ~10.5s), capped by the eval's ~9s
-  upfront input derivation; a lazy-derivation rewrite would reach ~10x.
+- eval early-exit: now **lazy** (defers the per-shot EC-muls into the batch loop +
+  early-exit) -> **~8.5x average** on dirty candidates (16.1s -> ~1.9s), exact. This is the
+  exact realization of the "apply pre-scan" (#3/4): the full eval already checks
+  apply-cleanliness, so a fast-rejecting eval *is* the apply pre-scan, with zero false
+  negatives and no GPU re-implementation of the apply phase. `FAST=0` scoring path is
+  byte-identical to the original.
 - Every improvement is now an independent on/off knob: `GPU_BATCH_INV`, `GPU_COMB_BITS`,
   `GPU_GCD_MODE`, `GPU_WAVE`, `GPU_FAN_BITS`, `EVAL_FAST_REJECT`.
+- Overall end-to-end: scan and eval are sequential stages, so the scan (<=1.65x) and eval
+  (~8.5x) speedups do NOT multiply. Combined is **up to ~8.5x** where candidate validation
+  dominates (apply-bound) and **~1.6x** where the GPU scan dominates (current frontier base);
+  never ~14x. Documented in the new "Overall pipeline speedup" section of
+  `docs/measured-speedups.md`.
 
 ### Validation Status
 

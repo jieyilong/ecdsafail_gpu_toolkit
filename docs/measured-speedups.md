@@ -35,19 +35,53 @@ Combination caveat: `GPU_WAVE=256` *hurts* in batch mode (lower occupancy), so t
 combo uses `GPU_WAVE=128` — e.g. `all_exact` (which forces wave256) measured slower than
 `batch_comb16`.
 
-## Eval phase (challenge `eval_circuit`, exact)
+## Eval phase (challenge `eval_circuit`, exact) — the one big exact win
 
 | knob | effect | status |
 |---|---:|---|
-| `EVAL_FAST_REJECT=1` (simple early-exit) | **~1.5×** on dirty candidates (16.3s → ~10.5s) | built |
-| lazy-derivation upgrade | ~10× projected | not built |
+| `EVAL_FAST_REJECT=1` (lazy derivation + early-exit) | **~8.5× avg** on dirty candidates (16.1s → ~1.9s) | built |
 | clean island under fast-reject | unchanged: `0/0/0`, all 9024 shots OK | exact |
+| `FAST=0` scoring path | byte-identical to original (same full counts) | exact |
 
-`EVAL_FAST_REJECT` stops at the first failing batch. The ~1.5× ceiling is because the eval
-derives **all 9024 test inputs upfront** (~9 s of CPU EC scalar-mults) before the batch loop
-starts, and early-exit only shortcuts the batch loop. Deferring those muls into the batch
-loop (lazy derivation) would reach ~10× but requires a careful rewrite of the *trusted
-scoring* binary — worth it mainly for apply-bound configs where eval dominates the search.
+`EVAL_FAST_REJECT` **defers the per-shot EC scalar-mults into the batch loop** and stops at
+the first failing batch, so a dirty candidate exits after ~the first bad batch (~1–3.6 s)
+instead of paying the full ~9 s upfront derivation + 141-batch sim. The earlier
+simple-early-exit version was capped at ~1.5× by that upfront derivation; deferring it is
+what unlocks the ~10×.
+
+This is the **exact realization of the "apply pre-scan"**: the full eval already checks
+apply-cleanliness, so a fast-rejecting eval *is* the apply pre-scan — with **zero false
+negatives** and no GPU re-implementation of the apply phase. A clean island still derives and
+simulates all 9024 shots and reads `0/0/0`.
+
+Measured dirty-candidate eval times: 1.13, 1.24, 1.75, 1.75, 1.85, 3.57 s (vs 16.1 s full) →
+**~8.5× average**. Spread is because the exit time depends on where the first bad shot falls.
+
+## Overall pipeline speedup (scan and eval do NOT multiply)
+
+The scan (GPU) and the eval (CPU) are **sequential** stages: total time = `scan + eval`. So
+their speedups **do not multiply** — you sum the *reduced* times, and the stage that's still
+slower after speedup caps the result. The two levers are:
+
+- scan, all knobs: **1.65×** (slow-reject base) ... **1.18×** (current fast-reject base)
+- eval, lazy fast-reject: **~8.5×** per dirty candidate
+
+If the baseline spent fraction `f` of its time scanning and `1-f` evaling, the combined
+speedup is `1 / (f/1.65 + (1-f)/8.5)`:
+
+| where the baseline's time went | combined end-to-end |
+|---|---:|
+| ~all eval (apply-bound configs) | **~8.5×** |
+| 50/50 scan/eval | **~2.8×** |
+| ~all scan (scan-bound frontier base) | **~1.6×** |
+
+So **combining all improvements gives up to ~8.5× end-to-end** where validating candidates is
+the bottleneck (apply-bound — the regime these tools target), and **~1.6×** where the GPU scan
+dominates (the current frontier base, where the island density is the structural wall). It is
+**never** `1.65 × 8.5 ≈ 14×` — that product would require the two stages to run in parallel,
+but they are sequential. The single biggest contributor by far is the lazy eval (the exact
+apply pre-scan); the scan knobs add a modest `1.2–1.65×` only when scanning is a meaningful
+share of the time.
 
 ## What did NOT pan out (and why)
 

@@ -49,10 +49,12 @@ for the scan, `EVAL_FAST_REJECT=0` for the eval). They compose; benchmark combin
 - `GPU_FAN_BITS=K` — **nonce-fan**: precompute the SHAKE sponge for the low `K` tail bits so
   each nonce only absorbs its high bits. Exact. Table is `2^K * 208 B`. Measured ~+1.5% on the
   current SOTA base (`squeeze_init` is not the bottleneck there).
-- `EVAL_FAST_REJECT=1` — **eval early-exit**: stop the validation eval at the first failing
-  batch (clean/dirty verdict only). ~1.5× on dirty candidates. Lives in the challenge
-  `eval_circuit`; re-apply `patches/eval_fast_reject.diff` after `ecdsafail sync`.
-  `island.sh validate` sets it to `1` by default.
+- `EVAL_FAST_REJECT=1` — **eval early-exit / exact apply pre-scan**: defers the per-shot
+  EC-muls into the batch loop and stops at the first failing batch. **~8.5× avg** on dirty
+  candidates (16.1s → ~1.9s), exact (clean islands still read `0/0/0`; the full eval already
+  checks apply-cleanliness, so a fast-rejecting eval *is* the apply pre-scan with no false
+  negatives). Lives in the challenge `eval_circuit`; re-apply `patches/eval_fast_reject.diff`
+  after `ecdsafail sync`. `island.sh validate` sets it to `1` by default.
 
 For production island searches on a large NVIDIA GPU, prefer the fastest exact mode that has
 passed `test-gpu-knobs` on the current base. As of the RTX 5090 measurements, the best
@@ -72,6 +74,12 @@ current fast-reject frontier base). Native `sm_120` compilation was measured to 
 benefit over PTX-JIT on a 581-series driver. See `docs/measured-speedups.md` for the full
 measured table, and always re-measure with `bench-gpu-knobs` on the actual base before
 assuming a number.
+
+Overall end-to-end speedup: scan and eval are **sequential** stages, so the scan (≤1.65x) and
+eval (~8.5x) speedups **do not multiply** — combined is **up to ~8.5x** where candidate
+validation is the bottleneck (apply-bound configs) and **~1.6x** where the GPU scan dominates
+(the current frontier base). The lazy eval (`EVAL_FAST_REJECT`) is the dominant lever. See the
+"Overall pipeline speedup" section of `docs/measured-speedups.md`.
 
 Before trusting new GPU knob combinations on a fresh base or GPU, run:
 
