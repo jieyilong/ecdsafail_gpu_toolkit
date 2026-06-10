@@ -1,0 +1,139 @@
+diff --git a/src/bin/eval_circuit.rs b/src/bin/eval_circuit.rs
+index ab15ba9..3fe9567 100644
+--- a/src/bin/eval_circuit.rs
++++ b/src/bin/eval_circuit.rs
+@@ -221,32 +221,52 @@ fn run_tests(
+ ) -> SeedReport {
+     let curve = secp256k1();
+ 
+-    let mut targets = Vec::with_capacity(target_shots);
+-    let mut offsets = Vec::with_capacity(target_shots);
+-    let mut expected = Vec::with_capacity(target_shots);
++    // EVAL_FAST_REJECT=1: stop at the first failing batch AND defer the expensive scalar-
++    // mults into the batch loop, so a dirty candidate bails after ~the first bad batch
++    // instead of simulating all 9024 shots and (more importantly) instead of paying the
++    // full ~9 s upfront derivation. Default off so scoring/submission runs stay complete
++    // and byte-identical.
++    let fast_reject = std::env::var("EVAL_FAST_REJECT").ok().as_deref() == Some("1");
++
++    // Read all (k1,k2) byte pairs first so the xof consumption order -- and thus the
++    // simulator's phase seeding below -- is identical in both paths.
++    let mut ks = Vec::with_capacity(target_shots);
+     for _ in 0..target_shots {
+         let mut rb = [[0u8; 32]; 2];
+         xof.read(&mut rb[0]);
+         xof.read(&mut rb[1]);
+-        let k1 = U256::from_le_bytes(rb[0]);
+-        let k2 = U256::from_le_bytes(rb[1]);
+-        let t = curve.mul(curve.gx, curve.gy, k1);
+-        let o = curve.mul(curve.gx, curve.gy, k2);
+-        if t.0 == o.0 {
+-            continue;
+-        }
+-        if t.0.is_zero() && t.1.is_zero() {
+-            continue;
+-        }
+-        if o.0.is_zero() && o.1.is_zero() {
+-            continue;
++        ks.push((U256::from_le_bytes(rb[0]), U256::from_le_bytes(rb[1])));
++    }
++
++    // Full path derives every point up front and filters degenerate inputs. Fast path
++    // defers all muls into the batch loop; degenerate inputs are astronomically unlikely
++    // (~2^-255) and are simply tested rather than filtered there.
++    let mut targets = Vec::new();
++    let mut offsets = Vec::new();
++    let mut expected = Vec::new();
++    if !fast_reject {
++        targets.reserve(target_shots);
++        offsets.reserve(target_shots);
++        expected.reserve(target_shots);
++        for &(k1, k2) in &ks {
++            let t = curve.mul(curve.gx, curve.gy, k1);
++            let o = curve.mul(curve.gx, curve.gy, k2);
++            if t.0 == o.0 {
++                continue;
++            }
++            if t.0.is_zero() && t.1.is_zero() {
++                continue;
++            }
++            if o.0.is_zero() && o.1.is_zero() {
++                continue;
++            }
++            let e = curve.add(t.0, t.1, o.0, o.1);
++            targets.push(t);
++            offsets.push(o);
++            expected.push(e);
+         }
+-        let e = curve.add(t.0, t.1, o.0, o.1);
+-        targets.push(t);
+-        offsets.push(o);
+-        expected.push(e);
+     }
+-    let n = targets.len();
++    let n = if fast_reject { ks.len() } else { targets.len() };
+ 
+     let mut sim = Simulator::new(total_qubits as usize, num_bits as usize, &mut xof);
+     let mut ok = true;
+@@ -261,27 +281,44 @@ fn run_tests(
+         let bs = BATCH.min(n - batch * BATCH);
+         let cond_mask: u64 = if bs == 64 { u64::MAX } else { (1u64 << bs) - 1 };
+ 
+-        sim.clear_for_shot();
++        // Batch inputs: precomputed (full path) or derived lazily here (fast path), so an
++        // early exit never pays for muls of batches it doesn't reach.
++        let mut bin: Vec<((U256, U256), (U256, U256), (U256, U256))> = Vec::with_capacity(bs);
+         for shot in 0..bs {
+             let i = batch * BATCH + shot;
+-            sim.set_register(&layout_regs[0], targets[i].0, shot);
+-            sim.set_register(&layout_regs[1], targets[i].1, shot);
+-            sim.set_register(&layout_regs[2], offsets[i].0, shot);
+-            sim.set_register(&layout_regs[3], offsets[i].1, shot);
++            if fast_reject {
++                let (k1, k2) = ks[i];
++                let t = curve.mul(curve.gx, curve.gy, k1);
++                let o = curve.mul(curve.gx, curve.gy, k2);
++                let e = curve.add(t.0, t.1, o.0, o.1);
++                bin.push((t, o, e));
++            } else {
++                bin.push((targets[i], offsets[i], expected[i]));
++            }
++        }
++
++        sim.clear_for_shot();
++        for shot in 0..bs {
++            let (t, o, _) = bin[shot];
++            sim.set_register(&layout_regs[0], t.0, shot);
++            sim.set_register(&layout_regs[1], t.1, shot);
++            sim.set_register(&layout_regs[2], o.0, shot);
++            sim.set_register(&layout_regs[3], o.1, shot);
+         }
+ 
+         sim.apply_iter(ops.iter());
+ 
+         for shot in 0..bs {
+             let i = batch * BATCH + shot;
++            let (_, _, e) = bin[shot];
+             let gx = sim.get_register(&layout_regs[0], shot);
+             let gy = sim.get_register(&layout_regs[1], shot);
+-            if gx != expected[i].0 || gy != expected[i].1 {
++            if gx != e.0 || gy != e.1 {
+                 classical_failures += 1;
+                 if fail_reason.is_none() {
+                     fail_reason = Some(format!(
+                         "CLASSICAL MISMATCH shot {i}: got ({:#x},{:#x}) exp ({:#x},{:#x})",
+-                        gx, gy, expected[i].0, expected[i].1
++                        gx, gy, e.0, e.1
+                     ));
+                 }
+                 ok = false;
+@@ -329,6 +366,9 @@ fn run_tests(
+             }
+             ok = false;
+         }
++        if fast_reject && !ok {
++            break;
++        }
+     }
+ 
+     let _ = num_bits;

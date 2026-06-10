@@ -39,6 +39,8 @@ width-envelope overflow or non-convergence. This repo:
    → k1,k2 → comb `k·G` → point-add factors) and runs the GCD filter, with **one block per
    nonce and 128 threads splitting the 9,024 shots** (cooperative squeeze in shared memory,
    block-wide early-exit). ~**1,700 nonce/s/GPU** on an A100 (vs ~236/s naive).
+   It now checks the first GCD factor `dx = tx - ox` before constructing the second factor
+   `c = ox - rx`, so many dirty shots avoid the affine-add denominator inversion entirely.
 
 Throughput stacks across GPUs, so a ~1/1M-density island is ~5 minutes on 2×A100.
 
@@ -142,6 +144,120 @@ cd $CHALLENGE && ecdsafail submit --note-file note.md --model "..." --claimed-sc
 
 `./island.sh hunt CFG START N` chains steps 2/4/5/6. See `examples/walkthrough.md`.
 
+### Experimental search-kernel knobs
+The default search path preserves the previous release's `gpu_island2` behavior:
+`GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128 GPU_FAN_BITS=0`.
+
+To force this branch to match the previous release's search behavior, set the knobs explicitly
+and clear older aliases that can override them:
+
+```bash
+unset BATCH_INV GPU_LARGE_COMB GCD_MODE WAVE
+GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128 GPU_FAN_BITS=0 \
+  ./island.sh search s.bin <START> <N>
+```
+
+This matches the previous release's candidate behavior; on the RTX 5090 comparison run, a
+previous-release binary measured ~10,057 nonce/s and this branch with these knobs measured
+~10,062 nonce/s on the same dumped state. If you also want validation to behave like the
+previous release, set `EVAL_FAST_REJECT=0`; `island.sh validate` otherwise defaults it to
+`1` for faster dirty-candidate rejection.
+
+Set any of these on `./island.sh search` or `./island.sh hunt`; local and remote modes both
+forward them to the GPU binary:
+
+```bash
+GPU_BATCH_INV=1 GPU_WAVE=128 ./island.sh search s.bin 1 2000000
+GPU_COMB_BITS=16 ./island.sh search s.bin 1 2000000
+GPU_BATCH_INV=1 GPU_COMB_BITS=22 ./island.sh search s.bin 1 2000000
+GPU_GCD_MODE=trunc_first ./island.sh search s.bin 1 2000000
+```
+
+| option | values | effect |
+|---|---|---|
+| `GPU_BATCH_INV` | `0`/`1` | `1` launches the cooperative block kernel that batch-inverts the two Jacobian `Z` values and the affine-add denominator across a wave. Exact candidate set. |
+| `GPU_COMB_BITS` | `8`/`16`/`20`/`22` | Larger values build runtime fixed-base comb tables from the dumped 8-bit table. `16` is ~64 MiB, `20` is ~832 MiB, and `22` is ~3.0 GiB. Exact candidate set; larger tables trade VRAM and startup time for fewer scalar-mul additions. |
+| `GPU_GCD_MODE` | `full_first`, `trunc_first`, `single_pass`, `trunc_only` | `full_first` is the default. `trunc_first` is exact-identical, just reordered. `single_pass` folds the two GCD passes into one truncated walk + convergence check — a valid necessary filter (won't miss islands) but **not** identical to `full_first` (it uses *truncated* convergence, the circuit's actual behavior; measured it is *looser* — a superset that passes a few more eval-dirty false-positives, e.g. `{46719,644403}` vs `full_first`'s `{644403}`; see the note below). `trunc_only` is a noisy prefilter that can emit extra false positives, so always validate. |
+| `GPU_WAVE` | `32`..`256` | CUDA block threads per nonce wave. Default `128`; values are rounded up to a warp multiple and capped at `256`. |
+| `GPU_FAN_BITS` | `0`..`26` | Nonce-fan: precompute the SHAKE sponge for the low `K` tail bits so each nonce only absorbs its high bits. `0` = off. Exact candidate set. Table is `2^K * 208 B` (`K=20`≈208 MiB, `K=24`≈3.5 GiB). Measured gain is small (~+1.5% on the current SOTA base — `squeeze_init` is not the bottleneck there); may help more on init-bound bases. |
+| `EVAL_FAST_REJECT` | `0`/`1` | Eval phase (challenge `eval_circuit`): `1` defers the per-shot EC-muls into the batch loop and stops at the first failing batch (clean/dirty verdict only). **~8.5× avg** on dirty candidates (16.1s → ~1.9s); exact — clean islands still read `0/0/0`. This is the exact "apply pre-scan". Default `0` so scoring runs are complete/byte-identical. `island.sh validate` sets it to `1`. **Note:** lives in the challenge repo (reset by `ecdsafail sync`) — re-apply from `patches/eval_fast_reject.diff`. |
+
+**Every improvement is an independent on/off knob** (all default to the conservative/exact baseline): `GPU_BATCH_INV`, `GPU_COMB_BITS`, `GPU_GCD_MODE` (`single_pass`), `GPU_WAVE`, `GPU_FAN_BITS`, and `EVAL_FAST_REJECT`. They compose; benchmark combinations with `bench-gpu-knobs`.
+
+Recommended exact scan settings on the RTX 5090:
+
+```bash
+GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_WAVE=128 GPU_FAN_BITS=22 \
+  ./island.sh search s.bin <START> <N>
+```
+
+This is the fastest measured exact scanner (~13,676 n/s ≈ **1.42×** the comb8 baseline).
+Contrary to an earlier note, `fan22`'s ~872 MiB table builds in only ~0.3s (measured), so at
+the default 500k chunk it amortizes cleanly and adds ~3% over the no-fan combo. Drop to
+`GPU_FAN_BITS=0` only for tiny chunks (≪200k). For long/billion-scale runs raise `CHUNK` to
+~1M (startup overhead drops to ~1.3%).
+
+**Overall speedup:** scan and eval are *sequential* stages, so the scan knobs (≤1.65×) and the eval lazy fast-reject (~8.5×) **don't multiply** — combined end-to-end is **up to ~8.5×** where candidate validation dominates (apply-bound configs) and **~1.6×** where the GPU scan dominates (the current frontier base). See [`docs/measured-speedups.md`](docs/measured-speedups.md) for the full breakdown.
+
+**Chunk size is a throughput knob, not a correctness one.** An earlier note here claimed the `GPU_BATCH_INV=1` + `GPU_COMB_BITS=22` + `GPU_FAN_BITS` combo "corrupts its output over a very large single launch." **That was a misdiagnosis — re-verified, the combo is deterministic and scale-invariant** (identical candidates at 200k / 1M / 6M; a 6M run reproduces bit-for-bit; no mutable global state is read per-nonce, so a verdict *cannot* depend on launch size). The startup/table-build cost is only ~1s even for the 3 GiB comb22 + fan22, so `CHUNK` is chosen purely to amortize that (~6% at 200k, ~1.3% at 1M) and to fit GPU memory — **for long runs use `CHUNK≈1000000`.** The only real large-*single*-launch caveat is benign: the `MAXOUT=4096` output buffer silently truncates (guarded — not corruption) a launch that finds >4096 candidates, which chunked search never approaches. See `docs/measured-speedups.md` → "Per-process startup cost & chunk sizing".
+
+**`single_pass` is a different (looser) filter than `full_first`, not a drop-in replacement.** It models the *truncated* GCD the circuit runs; `full_first` uses untruncated convergence. They disagree on borderline eval-dirty nonces — measured, `single_pass` found `{46719, 644403}` where `full_first` found only `{644403}` (a superset; `46719` is `single_pass`-specific and eval-dirty). Both are *necessary* filters (neither misses a true island), but `single_pass` passes a few more eval-dirty false-positives for ~3% faster scan. Use `full_first` for the strictest pre-filter; `single_pass` to shave scan time when scan-bound.
+
+Before trusting a new GPU build, run the integrated correctness smoke:
+
+```bash
+./island.sh test-gpu-knobs "" 0 4096
+```
+
+It rebuilds the helper binaries, builds the CUDA kernel, dumps the current state, checks the
+GPU Keccak probe, verifies that every knob still finds the baked `DIALOG_TAIL_NONCE`, and
+compares exact candidate sets over the requested range, including the combined exact paths
+used by the benchmark. Use `ISLAND_CONFIG=/tmp/box.env` to point the same repo at a one-off
+remote GPU without editing the tracked `config.env`.
+
+Large comb tables are opt-in for the smoke test so normal runs do not allocate GiB of VRAM:
+
+```bash
+GPU_TEST_COMB_BITS="20 22" ./island.sh test-gpu-knobs "" 0 1024
+```
+
+To validate speedups after correctness passes, run the fixed-range throughput benchmark:
+
+```bash
+GPU_BENCH_RUNS=3 GPU_BENCH_WARMUPS=1 ./island.sh bench-gpu-knobs "" 0 16384
+```
+
+This dumps the current SOTA state once, uploads it once in remote mode, warms up each
+variant, then runs the raw `gpu_island2` binary over the same nonce interval and prints
+average/min/max `nonce/s` plus speedup relative to the default baseline. The default
+benchmark variants include isolated knobs (`trunc_first`, `single_pass`, `wave64`, `wave256`,
+`batch_inv`, `comb16`) and combined exact paths (`batch_wave256`, `batch_comb16`,
+`batch_comb16_single`, `all_exact`). Use `GPU_BENCH_SKIP_INSTALL=1` or `GPU_BENCH_SKIP_BUILD=1` when the Rust
+helpers or CUDA binary are already fresh.
+
+Benchmark large comb tables explicitly:
+
+```bash
+GPU_BENCH_COMB_BITS="20 22" GPU_BENCH_RUNS=2 ./island.sh bench-gpu-knobs "" 0 32768
+```
+
+On the RTX 5090 current SOTA base, the best measured exact mode was
+`GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_WAVE=128`: about `13,622 nonce/s` over `[0, 32768)`,
+roughly `2.8%` faster than `batch_comb16` on the same run. Treat this as a small tuning
+gain, not a new order-of-magnitude path.
+
+Interpretation caveats:
+
+- Run `test-gpu-knobs` first; speed is only meaningful for variants that preserve the
+  expected candidate set, except intentionally noisy modes.
+- Use a fixed challenge commit, config, start nonce, and range size for every comparison.
+- Warmups matter on new cards or old toolkits because PTX may be JIT-compiled on the first
+  run.
+- The benchmark measures single-process kernel throughput. Multi-GPU scheduling speed is
+  still best checked with `./island.sh search`.
+- For `GPU_COMB_BITS>8`, the one-time table construction cost is outside the timed CUDA
+  event, so also check wall-clock behavior for very small chunks.
+
 ### Local vs remote GPU
 `init-local` / `init-remote` set this up for you. In remote mode, `build`/`search`/`doctor`
 automatically `scp` the kernel + runtime scripts + the (tiny, ~515 KB) state dump into a
@@ -149,6 +265,8 @@ working dir under the remote home (`~/.ecdsafail_island`, so it works for `ubunt
 any user) and run over SSH; the Rust steps (`dump`/`validate`, which need the challenge repo)
 stay on your laptop. You keep the repo + `ecdsafail` CLI local and rent GPUs only for the
 search. Arch is auto-detected on the remote, so you don't need to know the card's `sm_XX`.
+The script can be invoked as either `./island.sh ...` or `bash island.sh ...`; internal
+self-calls resolve through the script directory.
 
 **Long unattended searches:** an `init`+`search` over millions of nonces holds the SSH
 connection open for the duration. For multi-hour runs, wrap the node-side search in `tmux`/
@@ -215,6 +333,7 @@ island.sh              unified CLI (init-local/init-remote/doctor/install/measur
                                      dump/search/validate/bake/hunt)
 config.env.example     reference config (init-* writes config.env for you)
 SKILL.md               agent/Claude-Code skill manifest
+CHANGELOG.md           decision log for major search changes, rationale, expected impact
 runtime/               scripts that run ON the GPU machine (local or scp'd to the remote):
   build_kernel.sh        auto-detect compute cap -> nvcc (native + PTX-JIT fallback)
   search_driver.sh       multi-GPU parallel chunked search (splits range across all GPUs)
@@ -230,6 +349,7 @@ docs/
   how-it-works.md      the dialog-GCD circuit + island search, explained
   levers.md            the lever catalog + measured Toffoli costs
   kernel-notes.md      kernel design / throughput / validation notes
+  theory-knobs.md      theoretical background for the experimental GPU knobs
 examples/
   walkthrough.md       end-to-end example (lower ACTIVE_ITERATIONS, find island, submit)
 ```

@@ -376,13 +376,14 @@ __device__ bool nonce_is_clean(u64 nonce){
         if(eq(tx,ox)) continue;
         if(isZero(tx)&&isZero(ty)) continue;
         if(isZero(ox)&&isZero(oy)) continue;
+        u32 dx[8]; submod_p(tx,ox,dx);
+        if(!check_gcd_factor(dx)) return false;
         u32 den[8]; submod_p(ox,tx,den);
         u32 deni[8]; invmod(den,deni);
         u32 num[8]; submod_p(oy,ty,num);
         u32 lambda[8]; mulmod(num,deni,lambda);
         u32 ex[8]; sqrmod(lambda,ex); submod(ex,tx); submod(ex,ox);
-        u32 dx[8],c[8]; submod_p(tx,ox,dx); submod_p(ox,ex,c);
-        if(!check_gcd_factor(dx)) return false;
+        u32 c[8]; submod_p(ox,ex,c);
         if(!check_gcd_factor(c)) return false;
     }
     return true;
