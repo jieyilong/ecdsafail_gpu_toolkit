@@ -224,8 +224,8 @@ exact replacement for the full filter. It can emit extra candidates that later f
 validation, so it should be treated as a noisy candidate generator, not as proof of
 cleanliness.
 
-`GPU_GCD_MODE=single_pass` is the *exact* version of `trunc_only`. The full filter rejects a
-factor for either of two reasons: (1) the untruncated GCD does not converge within
+`GPU_GCD_MODE=single_pass` is an experimental fused version of these checks. The full filter
+rejects a factor for either of two reasons: (1) the untruncated GCD does not converge within
 `active_iters`, or (2) the truncated circuit-style walk overflows the width envelope. The
 baseline runs these as two separate passes (a full untruncated convergence walk plus the
 truncated overflow walk). `single_pass` folds them into one truncated walk that also tests
@@ -238,30 +238,28 @@ for step in 0..active_iters:
 reject (ran out of steps without converging)
 ```
 
-**Correctness (corrected after a large-range A/B).** The original rationale was that within
-the width envelope the truncated step equals the full step, so single-pass convergence would
-equal `full_first`'s untruncated convergence. That is **not** generally true: a body-carry or
-comparator truncation can alter the GCD trajectory *without* triggering width overflow, so the
-*truncated* convergence (single_pass) and the *untruncated* convergence (`full_first`) diverge
-on some factors. A 6M-nonce A/B confirmed they diverge — and measured the divergence makes
-single_pass **looser**: e.g. `5000046719` is `full_first`-hard (untruncated non-convergence)
-but `single_pass`-clean (truncated *does* converge), and it is eval-dirty (`cls=1`). (Both
-filters accept `5000644403`, a separate GCD-clean-but-eval-dirty false-positive.) So on this
-range single_pass accepts a superset of `full_first` — a few more eval-dirty false-positives,
-never fewer, and it still never misses a true island.
+**Correctness (corrected after the 1221-qubit SOTA test).** The original rationale was that
+within the width envelope the truncated step equals the full step, so single-pass convergence
+would equal `full_first`'s untruncated convergence. That is **not** generally true: a body-carry
+or comparator truncation can alter the GCD trajectory *without* triggering width overflow, so
+the *truncated* convergence (`single_pass`) and the *untruncated* convergence (`full_first`)
+can diverge.
 
-So `single_pass` is **not** candidate-set-identical to `full_first` (the earlier sparse test
-just never hit a divergent nonce). It *is* still a valid necessary filter — a true island is
-truncated-GCD-clean on every shot, so single_pass accepts it (no missed islands). Measured,
-the disagreement makes `single_pass` **looser**, not stricter: on `[0,1M)` it found
+The latest 1221-qubit SOTA exposed the dangerous direction of that divergence:
+`batch_inv+comb22+single_pass+fan22` missed the baked clean nonce `165002130437`, while
+previous-release default, latest `full_first` baseline, and `batch_inv+comb22+trunc_first+fan22`
+all found it. CPU validation confirmed the nonce is genuinely clean (`0/0/0`, score
+`1743798012`). Therefore `single_pass` is **not a safe necessary filter** on current bases.
+
+Earlier A/Bs saw only the other direction: on `[0,1M)`, `single_pass` found
 `{46719,644403}` vs `full_first`'s `{644403}` (a superset; `46719` is `single_pass`-specific
-and eval-dirty). It is arguably *more* circuit-faithful (the circuit runs the truncated GCD),
-but the practical effect is a few extra eval-dirty false-positives to validate. Treat it as a
-different filter, and validate against the eval on a candidate-dense range.
+and eval-dirty). That range was insufficient to prove no false negatives. Treat
+`single_pass` as an experimental speed knob only; production scans should use `trunc_first`
+if they want the faster GCD ordering.
 
-Performance note (measured, RTX 5090): the saving is **small** — about `+4%` stacked on
-`batch_inv`+`comb` and ~`0%` on its own (the convergence pass it removes already early-exits
-cheaply). See `docs/measured-speedups.md` for the full A/B and the startup/chunk-sizing notes.
+Performance note (measured, RTX 5090): the unsafe saving is modest. On the 1221-qubit SOTA,
+the invalid `single_pass` stack measured ~12.6k nonce/s versus ~12.3k nonce/s for the safer
+`trunc_first` stack. See `docs/measured-speedups.md` for the full A/B and startup notes.
 
 ## `GPU_WAVE`: Threads Per Nonce Wave
 
@@ -343,12 +341,12 @@ re-implementation of the apply phase. The change lives in the challenge repo (re
 Test exact knobs before noisy knobs:
 
 1. default baseline;
-2. `GPU_GCD_MODE=trunc_first` and `GPU_GCD_MODE=single_pass` (both exact);
+2. `GPU_GCD_MODE=trunc_first` (safe reorder);
 3. `GPU_WAVE=64`, `128`, `256`;
 4. `GPU_BATCH_INV=1` with wave sweeps;
 5. `GPU_COMB_BITS=16` on sufficiently large chunks;
-6. combinations of the winners (e.g. `GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_GCD_MODE=single_pass`);
-7. `GPU_GCD_MODE=trunc_only` only as an aggressive candidate-generation experiment.
+6. combinations of the winners (e.g. `GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=trunc_first GPU_FAN_BITS=22`);
+7. `GPU_GCD_MODE=single_pass` and `GPU_GCD_MODE=trunc_only` only as aggressive experiments.
 
 For every setting, first check a known-clean nonce, then benchmark a dirty range and compare
 both nonce/s and candidate count.
@@ -360,7 +358,8 @@ After A/B'ing all of the above on an RTX 5090, the practical takeaways are:
 - `GPU_BATCH_INV=1` is the only large exact lever, but its size is **base-dependent**: ~1.5x
   on bases where nonces reject slowly (many per-shot inversions run) and only a few percent on
   bases where nonces reject fast (the per-nonce SHAKE `squeeze_init`, ~35 Keccak-f, dominates
-  instead). `GPU_COMB_BITS` adds ~10%; `single_pass` adds ~0-4%.
+  instead). `GPU_COMB_BITS` adds ~10%; `trunc_first` is the safer GCD-ordering knob, while
+  `single_pass` is currently unsafe on the 1221-qubit SOTA despite its small speed gain.
 - Native `sm_120` compilation (CUDA 12.8) was measured to give **no** speedup over the
   driver's PTX-JIT from `compute_80` on a 581-series driver — sometimes slightly slower. Keep
   the PTX path; don't carry a second toolchain for it.

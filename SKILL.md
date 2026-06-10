@@ -45,7 +45,7 @@ The loop has two stages with **different knobs**:
 
 ```bash
 # Phase 1 — GPU SCAN (the GPU_* knobs): finds GCD-clean candidates
-GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_FAN_BITS=22 GPU_WAVE=128 \
+GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=trunc_first GPU_FAN_BITS=22 GPU_WAVE=128 \
   ./island.sh search s.bin <START> <N>
 # Phase 2 — CPU VALIDATE (EVAL_FAST_REJECT lives here): confirms 0/0/0 + score
 EVAL_FAST_REJECT=1 ./island.sh validate "<CFG>" <nonce> [<nonce>...]
@@ -60,7 +60,8 @@ all eval; `EVAL_FAST_REJECT` is the lever for it (see below).
 ## GPU search knobs
 Every improvement is an independent on/off knob, all defaulting to the exact/conservative
 baseline (`GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128 GPU_FAN_BITS=0`
-for the scan, `EVAL_FAST_REJECT=0` for the eval). They compose; benchmark combinations with
+for the scan, `EVAL_FAST_REJECT=0` for the eval). The safe knobs compose; `single_pass` and
+`trunc_only` are experimental filters. Benchmark combinations with
 `bench-gpu-knobs`. Two are new:
 
 To compare against the previous release's search behavior, explicitly set the scan baseline
@@ -90,35 +91,32 @@ the previous-release binary and this branch with the scan baseline both measured
   (reset by `ecdsafail sync`; `eval_circuit.rs` is a local tool, not a submitted file, so this
   never touches the grader). `island.sh validate` sets `EVAL_FAST_REJECT=1` by default.
 
-For production island searches on a large NVIDIA GPU, prefer the fastest exact mode that has
-passed `test-gpu-knobs` on the current base. As of the RTX 5090 measurements, the best
-measured exact scan mode is:
+For production island searches on a large NVIDIA GPU, prefer the safer fast mode that has
+passed a known-clean nonce check on the current base. As of the RTX 5090 measurements on the
+1221-qubit SOTA, the recommended scan mode is:
 
 ```bash
-GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_FAN_BITS=22 GPU_WAVE=128 ./island.sh search s.bin <START> <N>
+GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=trunc_first GPU_FAN_BITS=22 GPU_WAVE=128 ./island.sh search s.bin <START> <N>
 ```
 
-(`GPU_FAN_BITS=22` is the fastest measured exact scan, ~13,676 n/s ≈ 1.42× baseline; its
-~872 MiB table builds in ~0.3s and amortizes at the default 500k chunk. Drop it only for
-tiny chunks ≪200k.)
+This found the baked clean nonce `165002130437` and measured ~12.3k nonce/s, about 1.2× the
+previous-release baseline. `GPU_FAN_BITS=22` uses an ~872 MiB table that builds in ~0.3s and
+amortizes at the default 500k chunk. Drop it only for tiny chunks ≪200k.
 
-`GPU_GCD_MODE=single_pass` is a valid necessary filter (won't miss true islands) and adds a
-free ~0-4% scan, but it is **not** candidate-set-identical to `full_first` -- it checks
-*truncated* GCD convergence (what the circuit runs), `full_first` checks untruncated. They
-disagree on borderline eval-dirty nonces: measured, `single_pass` is **looser** (it found
-`{46719, 644403}` where `full_first` found only `{644403}` -- a superset -- with `46719`
-`single_pass`-specific and eval-dirty). So `single_pass` passes a few more eval-dirty
-false-positives for the faster scan; use `full_first` for the strictest pre-filter. Validate
-against the eval, not a sparse candidate range. See `docs/measured-speedups.md`.
+`GPU_GCD_MODE=single_pass` is now **experimental only**. It folds the full convergence check
+into one truncated GCD walk and is a little faster, but on the 1221-qubit SOTA it missed the
+baked clean nonce `165002130437`. Use `trunc_first` for production scans; use `single_pass`
+only when you are deliberately experimenting and have rechecked a known-clean nonce plus a
+candidate-dense range. See `docs/measured-speedups.md`.
 The `comb22` table is ~3.0 GiB and was only ~2.8% over `comb16`, but its build is only ~0.33s
 (measured), so process startup does **not** dominate even at 200k chunks -- prefer `comb22`
 unless VRAM is constrained, then `GPU_COMB_BITS=16`.
-`GPU_FAN_BITS=22` (with the comb22 combo) is the fastest measured exact scan; its ~872 MiB
+`GPU_FAN_BITS=22` (with the comb22 + `trunc_first` combo) is the recommended safer scan; its ~872 MiB
 table also builds in ~0.3s. For long/billion-scale runs use `CHUNK≈1000000` to amortize the
-~1s startup to ~1.3% (vs ~6% at 200k). The combo is exact and scale-invariant at any size, so
-chunk size is a throughput/memory knob only -- see "Per-process startup cost & chunk sizing".
+~1s startup to ~1.3% (vs ~6% at 200k). Chunk size is a throughput/memory knob only -- see
+"Per-process startup cost & chunk sizing".
 
-Calibrate expectations: the absolute speedup of these exact knobs is **strongly
+Calibrate expectations: the absolute speedup of these safe knobs is **strongly
 base-dependent** (e.g. `GPU_BATCH_INV` is ~1.42x on slow-reject bases but only +1.2% on the
 current fast-reject frontier base). Native `sm_120` compilation was measured to give no
 benefit over PTX-JIT on a 581-series driver. See `docs/measured-speedups.md` for the full

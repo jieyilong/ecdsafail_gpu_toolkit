@@ -52,13 +52,13 @@ width-envelope overflow or non-convergence — the dominant source of "hard" inp
   preserves the clean nonce set but avoids a costly field inversion on many dirty shots.
 - Experimental knobs can be enabled per run without changing the baseline: `GPU_BATCH_INV=1`
   uses a cooperative block kernel with batch inversions, `GPU_COMB_BITS=16/20/22` builds
-  larger runtime comb tables, `GPU_GCD_MODE=trunc_first` and `GPU_GCD_MODE=single_pass` are
-  exact GCD-check variants (single_pass folds the two passes into one), and
-  `GPU_WAVE` tunes the threads per nonce wave, and `GPU_FAN_BITS=K` (nonce-fan) precomputes
-  the SHAKE prefix for the low `K` tail bits. `GPU_GCD_MODE=trunc_only` is intentionally
-  noisy and must be followed by normal validation. Separately, `EVAL_FAST_REJECT=1` speeds
-  the *eval* phase by stopping at the first failing batch. All are exact and individually
-  toggleable; see `docs/measured-speedups.md` for the measured gains.
+  larger runtime comb tables, `GPU_GCD_MODE=trunc_first` safely reorders the GCD checks
+  (truncated width first, then full convergence), `GPU_WAVE` tunes the threads per nonce wave,
+  and `GPU_FAN_BITS=K` (nonce-fan) precomputes the SHAKE prefix for the low `K` tail bits.
+  `GPU_GCD_MODE=single_pass` and `GPU_GCD_MODE=trunc_only` are experimental filters and must
+  not be used for production without a known-clean nonce check; `single_pass` missed the baked
+  clean nonce on the 1221-qubit SOTA. Separately, `EVAL_FAST_REJECT=1` speeds the *eval* phase
+  by stopping at the first failing batch. See `docs/measured-speedups.md` for measured gains.
 
 ## The filter's blind spot (why you still validate)
 The pre-filter models the **GCD** (width + convergence) but **not the apply phase**. So a

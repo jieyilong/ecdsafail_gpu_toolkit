@@ -63,13 +63,12 @@ nonce.
 - `GPU_GCD_MODE=trunc_first` is exact and checks the truncated width envelope before the
   full convergence counter. It should help when width overflows dominate failures.
   `GPU_GCD_MODE=single_pass` folds the two GCD passes into one truncated walk that also
-  detects `v==0` convergence (never runs the separate untruncated pass). It is a valid
-  necessary filter (won't miss true islands) but is **not** candidate-set-identical to
-  `full_first`: it uses *truncated* convergence (the circuit's actual behavior), `full_first`
-  uses untruncated. Measured, `single_pass` is **looser** — on `[0,1M)` it found
-  `{46719,644403}` vs `full_first`'s `{644403}` (a superset; `46719` is `single_pass`-specific
-  and eval-dirty), i.e. it passes a few more eval-dirty false-positives for ~0-4% faster scan.
-  See measured-speedups.md "`single_pass` is a different (looser) necessary filter".
+  detects `v==0` convergence (never runs the separate untruncated pass). It is **experimental,
+  not production-safe** on the latest 1221-qubit SOTA: the requested
+  `batch_inv+comb22+single_pass+fan22` stack missed the baked clean nonce `165002130437`.
+  The failure is specific to the fused truncated-convergence check; `trunc_first` still found
+  the nonce because it keeps the full convergence pass after the truncated width check.
+  See measured-speedups.md "`single_pass` false-negative on the 1221-qubit SOTA".
   `GPU_GCD_MODE=trunc_only` skips the convergence counter and is intentionally noisy:
   it can emit extra false positives, so it is for candidate-generation experiments only.
 - `GPU_WAVE` accepts 32..256 and is rounded up to a warp multiple. Batch mode uses more
@@ -83,17 +82,17 @@ nonce.
   this *is* the apply pre-scan). Default off keeps scoring byte-identical. Patch:
   `patches/eval_fast_reject.diff`.
 
-Recommended exact search settings on the RTX 5090:
+Recommended safer search settings on the RTX 5090:
 
 ```text
-GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_WAVE=128 GPU_FAN_BITS=22
+GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=trunc_first GPU_WAVE=128 GPU_FAN_BITS=22
 ```
 
-`GPU_FAN_BITS=22` is the fastest measured exact scan (~13,676 n/s, ~1.42× baseline); its
-~872 MiB table builds in ~0.3s and amortizes at the default 500k chunk. Drop it to `0` only
-for tiny chunks (≪200k). For long/billion-scale runs raise `CHUNK` to ~1M (~1.3% startup
-overhead). The combo is exact and scale-invariant at any size — chunk for throughput, not
-correctness.
+On the 2026-06-10 1221-qubit SOTA this found the known clean nonce and measured about
+12.3k nonce/s on the RTX 5090, roughly 1.2x the previous-release baseline. `GPU_FAN_BITS=22`
+builds an ~872 MiB table in ~0.3s and amortizes at the default 500k chunk. Drop it to `0`
+only for tiny chunks (≪200k). For long/billion-scale runs raise `CHUNK` to ~1M (~1.3%
+startup overhead). Chunk for throughput and memory, not correctness.
 
 ## Lever value (exact CCX counts on b55ede3 base, peak 1309, tof 1,503,871):
 active257 −2989 (3.9M score win), active256 −5978 (8.1M), apply20 −516 (675k),

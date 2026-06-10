@@ -177,31 +177,36 @@ GPU_GCD_MODE=trunc_first ./island.sh search s.bin 1 2000000
 |---|---|---|
 | `GPU_BATCH_INV` | `0`/`1` | `1` launches the cooperative block kernel that batch-inverts the two Jacobian `Z` values and the affine-add denominator across a wave. Exact candidate set. |
 | `GPU_COMB_BITS` | `8`/`16`/`20`/`22` | Larger values build runtime fixed-base comb tables from the dumped 8-bit table. `16` is ~64 MiB, `20` is ~832 MiB, and `22` is ~3.0 GiB. Exact candidate set; larger tables trade VRAM and startup time for fewer scalar-mul additions. |
-| `GPU_GCD_MODE` | `full_first`, `trunc_first`, `single_pass`, `trunc_only` | `full_first` is the default. `trunc_first` is exact-identical, just reordered. `single_pass` folds the two GCD passes into one truncated walk + convergence check — a valid necessary filter (won't miss islands) but **not** identical to `full_first` (it uses *truncated* convergence, the circuit's actual behavior; measured it is *looser* — a superset that passes a few more eval-dirty false-positives, e.g. `{46719,644403}` vs `full_first`'s `{644403}`; see the note below). `trunc_only` is a noisy prefilter that can emit extra false positives, so always validate. |
+| `GPU_GCD_MODE` | `full_first`, `trunc_first`, `single_pass`, `trunc_only` | `full_first` is the default. `trunc_first` is the safer fast mode: it runs the truncated width-envelope check first, then still runs the full untruncated convergence check, so it preserves the baseline GCD filter while sometimes rejecting hard factors earlier. `single_pass` folds those checks into one truncated walk; after the 1221-qubit SOTA update it is **experimental only** because it missed the baked clean nonce `165002130437`. `trunc_only` is a noisy prefilter that can emit extra false positives, so always validate. |
 | `GPU_WAVE` | `32`..`256` | CUDA block threads per nonce wave. Default `128`; values are rounded up to a warp multiple and capped at `256`. |
 | `GPU_FAN_BITS` | `0`..`26` | Nonce-fan: precompute the SHAKE sponge for the low `K` tail bits so each nonce only absorbs its high bits. `0` = off. Exact candidate set. Table is `2^K * 208 B` (`K=20`≈208 MiB, `K=24`≈3.5 GiB). Measured gain is small (~+1.5% on the current SOTA base — `squeeze_init` is not the bottleneck there); may help more on init-bound bases. |
 | `EVAL_FAST_REJECT` | `0`/`1` | **Phase-2 (CPU validate) knob, not a scan knob** — no-op on a `search` line. `1` defers the per-shot EC-muls into the batch loop and stops at the **first failing shot**. Speedup is candidate-dependent: early-failing dirty candidates ~1.9s, but GCD-clean-but-eval-dirty ones (what the GPU hunt feeds the validator) fail later → ~6s; vs ~17s stock (~2.6–8.5×). Exact — clean islands still read `0/0/0` and take the full ~17s; with the var unset the eval is byte-identical, so `ecdsafail run` scoring is unaffected (default `0`). `island.sh validate` sets it to `1`. **Setup:** apply `patches/eval_fast_reject.diff` + `cargo build --release --bin eval_circuit` (reset by `ecdsafail sync`; `eval_circuit.rs` is a local tool, not submitted). Per-candidate context: `build_circuit` is only ~1.2s, so the whole per-candidate cost is this eval. |
 
-**Every improvement is an independent on/off knob** (all default to the conservative/exact baseline): `GPU_BATCH_INV`, `GPU_COMB_BITS`, `GPU_GCD_MODE` (`single_pass`), `GPU_WAVE`, `GPU_FAN_BITS`, and `EVAL_FAST_REJECT`. They compose; benchmark combinations with `bench-gpu-knobs`.
+**Every improvement is an independent on/off knob** (all default to the conservative/exact baseline): `GPU_BATCH_INV`, `GPU_COMB_BITS`, `GPU_GCD_MODE` (`trunc_first` is the safer fast choice; `single_pass` is experimental), `GPU_WAVE`, `GPU_FAN_BITS`, and `EVAL_FAST_REJECT`. They compose; benchmark combinations with `bench-gpu-knobs`.
 
-Recommended exact scan settings on the RTX 5090:
+Recommended safer scan settings on the RTX 5090:
 
 ```bash
-GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_WAVE=128 GPU_FAN_BITS=22 \
+GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=trunc_first GPU_WAVE=128 GPU_FAN_BITS=22 \
   ./island.sh search s.bin <START> <N>
 ```
 
-This is the fastest measured exact scanner (~13,676 n/s ≈ **1.42×** the comb8 baseline).
-Contrary to an earlier note, `fan22`'s ~872 MiB table builds in only ~0.3s (measured), so at
-the default 500k chunk it amortizes cleanly and adds ~3% over the no-fan combo. Drop to
-`GPU_FAN_BITS=0` only for tiny chunks (≪200k). For long/billion-scale runs raise `CHUNK` to
-~1M (startup overhead drops to ~1.3%).
+On the 2026-06-10 1221-qubit SOTA (`155ebc5` / local commit `572bba4`), this found the baked
+clean nonce and measured about **12.3k nonce/s** on the RTX 5090 (`~1.2x` the previous-release
+baseline). `fan22`'s ~872 MiB table builds in only ~0.3s (measured), so at the default 500k
+chunk it amortizes cleanly. Drop to `GPU_FAN_BITS=0` only for tiny chunks (≪200k). For
+long/billion-scale runs raise `CHUNK` to ~1M (startup overhead drops to ~1.3%).
 
 **Overall speedup:** scan and eval are *sequential* stages, so the scan knobs (≤1.65×) and the eval lazy fast-reject (~8.5×) **don't multiply** — combined end-to-end is **up to ~8.5×** where candidate validation dominates (apply-bound configs) and **~1.6×** where the GPU scan dominates (the current frontier base). See [`docs/measured-speedups.md`](docs/measured-speedups.md) for the full breakdown.
 
 **Chunk size is a throughput knob, not a correctness one.** An earlier note here claimed the `GPU_BATCH_INV=1` + `GPU_COMB_BITS=22` + `GPU_FAN_BITS` combo "corrupts its output over a very large single launch." **That was a misdiagnosis — re-verified, the combo is deterministic and scale-invariant** (identical candidates at 200k / 1M / 6M; a 6M run reproduces bit-for-bit; no mutable global state is read per-nonce, so a verdict *cannot* depend on launch size). The startup/table-build cost is only ~1s even for the 3 GiB comb22 + fan22, so `CHUNK` is chosen purely to amortize that (~6% at 200k, ~1.3% at 1M) and to fit GPU memory — **for long runs use `CHUNK≈1000000`.** The only real large-*single*-launch caveat is benign: the `MAXOUT=4096` output buffer silently truncates (guarded — not corruption) a launch that finds >4096 candidates, which chunked search never approaches. See `docs/measured-speedups.md` → "Per-process startup cost & chunk sizing".
 
-**`single_pass` is a different (looser) filter than `full_first`, not a drop-in replacement.** It models the *truncated* GCD the circuit runs; `full_first` uses untruncated convergence. They disagree on borderline eval-dirty nonces — measured, `single_pass` found `{46719, 644403}` where `full_first` found only `{644403}` (a superset; `46719` is `single_pass`-specific and eval-dirty). Both are *necessary* filters (neither misses a true island), but `single_pass` passes a few more eval-dirty false-positives for ~3% faster scan. Use `full_first` for the strictest pre-filter; `single_pass` to shave scan time when scan-bound.
+**`single_pass` is not a production-safe drop-in replacement for `full_first` or `trunc_first`.**
+It models convergence on the *truncated* GCD walk, while the baseline convergence check is
+untruncated. Older ranges only showed extra eval-dirty false positives, but the 1221-qubit SOTA
+exposed a false negative: `single_pass` missed the baked clean nonce `165002130437`. Use
+`trunc_first` for the fast production scan, and keep `single_pass` for experiments that are
+separately validated against a known-clean nonce and a candidate-dense range.
 
 Before trusting a new GPU build, run the integrated correctness smoke:
 
@@ -231,8 +236,9 @@ This dumps the current SOTA state once, uploads it once in remote mode, warms up
 variant, then runs the raw `gpu_island2` binary over the same nonce interval and prints
 average/min/max `nonce/s` plus speedup relative to the default baseline. The default
 benchmark variants include isolated knobs (`trunc_first`, `single_pass`, `wave64`, `wave256`,
-`batch_inv`, `comb16`) and combined exact paths (`batch_wave256`, `batch_comb16`,
-`batch_comb16_single`, `all_exact`). Use `GPU_BENCH_SKIP_INSTALL=1` or `GPU_BENCH_SKIP_BUILD=1` when the Rust
+`batch_inv`, `comb16`) and combined paths (`batch_wave256`, `batch_comb16`,
+`batch_comb16_single`, `all_exact`). Treat any `single_pass` variant as experimental until it
+passes a known-clean nonce check on the current base. Use `GPU_BENCH_SKIP_INSTALL=1` or `GPU_BENCH_SKIP_BUILD=1` when the Rust
 helpers or CUDA binary are already fresh.
 
 Benchmark large comb tables explicitly:

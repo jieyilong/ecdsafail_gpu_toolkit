@@ -4,9 +4,59 @@ This file records not only what changed, but also why we made the change, what s
 we expect, and what still needs to be validated. For future work, add an entry whenever a
 change affects search behavior, performance assumptions, correctness risk, or workflow.
 
+## 2026-06-10 - Safer 1221-SOTA scan recipe; demote `single_pass`
+
+Branch: `main`
+
+### Summary
+
+Updated the documentation after testing the latest promoted 1221-qubit SOTA
+(`155ebc5`, local challenge commit `572bba4`) on the RTX 5090. The previously recommended
+`GPU_GCD_MODE=single_pass` stack is not correctness-safe on this base: it missed the baked
+clean nonce `165002130437`, which CPU validation confirmed as `0/0/0` with score
+`1743798012`.
+
+### What we verified (RTX 5090)
+
+- Previous-release `v1.0.0` default search found `165002130437`.
+- Latest `main` baseline (`GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first
+  GPU_FAN_BITS=0 GPU_WAVE=128`) found `165002130437`.
+- Requested aggressive stack
+  `GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_FAN_BITS=22 GPU_WAVE=128`
+  **missed** `165002130437`.
+- Safer stack
+  `GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=trunc_first GPU_FAN_BITS=22 GPU_WAVE=128`
+  found `165002130437`.
+
+### Measured throughput
+
+Same dumped 1221-SOTA state, 131,072-nonce dirty range, two measured runs:
+
+- `v1.0.0` default: ~10,174 nonce/s.
+- latest `main` previous-release-compatible baseline: ~10,053 nonce/s.
+- requested `single_pass` stack: ~12,576 nonce/s, **invalid** due to false negative.
+- safer `trunc_first+comb22+fan22` stack: ~12,267 nonce/s, about 1.2x baseline.
+
+### Main Changes
+
+- Updated `README.md`, `docs/kernel-notes.md`, `docs/measured-speedups.md`,
+  `docs/theory-knobs.md`, and `SKILL.md` to recommend the safer production scan:
+  `GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=trunc_first GPU_FAN_BITS=22 GPU_WAVE=128`.
+- Demoted `GPU_GCD_MODE=single_pass` to experimental-only. The root distinction is that
+  `single_pass` replaces the full untruncated convergence check with truncated convergence,
+  while `trunc_first` keeps the full convergence check after the truncated width-envelope
+  pass.
+- Recorded the invalid-but-faster `single_pass` measurement explicitly so future speedup
+  comparisons do not accidentally count a false-negative configuration as a win.
+
 ## 2026-06-10 - Retract the "combo corruption" bug; measure startup & chunk sizing
 
 Branch: `speculative-and-fan`
+
+> **PARTIALLY RETRACTED by the "Safer 1221-SOTA scan recipe" entry above.** The no-corruption
+> and chunk-sizing findings still stand, but the claim that `single_pass` is a necessary
+> no-false-negative filter is false on the 1221-qubit SOTA. Use `trunc_first`, not
+> `single_pass`, for production scans.
 
 ### Summary
 
@@ -28,10 +78,10 @@ not the heavy per-chunk tax previously assumed), and set a billion-scale chunk r
   mismatch). `compute-sanitizer` 11.5 and 12.8 both refuse to run on this 5090+581 driver
   ("device not supported"), but no race exists to find.
 - **`single_pass` direction corrected:** it is *looser* than `full_first`, not stricter.
-  Measured on `[0,1M)`: `single_pass`={46719,644403}, `full_first`={644403}. Both are
-  necessary filters (neither misses a true island); `single_pass` passes a few more eval-dirty
-  false-positives for ~3% faster scan. (Earlier note claimed `single_pass` *rejects* 644403 —
-  backwards; both accept it.)
+  Measured on `[0,1M)`: `single_pass`={46719,644403}, `full_first`={644403}. Later testing on
+  the 1221-qubit SOTA showed this was not enough to prove safety: `single_pass` can also miss
+  a true clean nonce. Keep the direction note for this range, but do not use it as a
+  production recommendation.
 
 ### Measured startup (N=2000 wall, 3 reps, <0.03s spread)
 
@@ -46,8 +96,8 @@ The 3 GiB comb22 build is ~0.33s; fan22 (~872 MiB) adds ~0.30s. Scan rate climbs
   sizing" section (startup table, amortization table, billion-scale throughput table).
 - Corrected the `single_pass` vs `full_first` direction in `docs/measured-speedups.md`,
   `README.md`, and `SKILL.md` (looser, superset, not stricter).
-- Updated the recommended exact scanner to include `GPU_FAN_BITS=22` (fastest measured) for
-  the now-default larger chunks.
+- Updated the then-recommended scanner to include `GPU_FAN_BITS=22` for the now-default larger
+  chunks. This has since been superseded by the safer `trunc_first+comb22+fan22` recipe.
 - **Bumped default `CHUNK` 200000 → 500000** in `island.sh` (search + hunt) and
   `runtime/search_driver.sh` — the 200k cap only existed for the now-retracted corruption
   fear; 500k cuts startup overhead from ~6% to ~2.7% with finer output granularity than 1M.
@@ -73,7 +123,7 @@ to switch from that baseline to the recommended exact-performance stack.
   ~10,057 nonce/s, and this branch with baseline knobs measured ~10,062 nonce/s on the same
   dumped state. This confirms the previous release baseline is about 10k nonce/s on this
   machine, while the 7k-ish number corresponds to slower wave settings such as `GPU_WAVE=64`.
-- Added recommended exact scan settings:
+- Added then-recommended exact scan settings, now superseded by the safer `trunc_first` stack:
   `GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_WAVE=128 GPU_FAN_BITS=0`,
   with `GPU_FAN_BITS=20` only as a large-chunk option.
 
@@ -164,19 +214,24 @@ Two new exact, independently-toggleable knobs plus an honest measured-speedups d
 
 Branch: `exact-speedups` (not yet merged)
 
+> **RETRACTED by the 1221-SOTA test above.** This entry records the original implementation
+> and measurements, but its "exact" and "safe to enable" claims for `single_pass` are no
+> longer valid. On the latest 1221-qubit SOTA, `single_pass` missed the baked clean nonce;
+> use `trunc_first` for production scans.
+
 ### Summary
 
-Added `GPU_GCD_MODE=single_pass`, an exact one-walk GCD filter, and — more importantly —
+Added `GPU_GCD_MODE=single_pass`, originally believed to be an exact one-walk GCD filter, and — more importantly —
 ran a careful A/B pass on the RTX 5090 that establishes the *realistic* ceiling for further
 exact-mode speedups. The headline result is sobering: beyond the existing `batch_inv`, the
 remaining exact levers are single-digit-percent, and several proposed ones give ~0.
 
 ### Main Changes
 
-- New exact GCD mode `GPU_GCD_MODE=single_pass` (kernel + `parse_gcd_mode` + harness). It
+- New experimental GCD mode `GPU_GCD_MODE=single_pass` (kernel + `parse_gcd_mode` + harness). It
   folds the two baseline GCD passes (untruncated convergence walk + truncated overflow walk)
-  into one truncated walk that also tests `v==0` convergence. Exact by the same
-  within-envelope argument the two-pass filter already relies on; see `docs/theory-knobs.md`.
+  into one truncated walk that also tests `v==0` convergence. The original within-envelope
+  exactness argument was later disproved on the 1221-qubit SOTA; see `docs/theory-knobs.md`.
 - Wired `single_pass` and `batch_comb16_single` into `test-gpu-knobs` and `bench-gpu-knobs`.
 
 ### Correctness (validated on RTX 5090, SOTA base f6f9536, island 1000005782829)
@@ -225,10 +280,9 @@ depending on the config.
 
 ### Expected Impact
 
-`single_pass` is exact and never hurts, so it is safe to enable, but it is a ~0-4% lever, not
-a multiplier. The practical recommendation is unchanged: `batch_inv` + `comb16` remains the
-default-good exact mode; add `single_pass` for a free few-percent; expect the absolute win to
-vary with the base's reject dynamics.
+`single_pass` is a ~0-4% lever, not a multiplier, and later testing showed it is not
+production-safe. The practical recommendation has changed: use `trunc_first` for the safer
+GCD-ordering speedup and reserve `single_pass` for explicitly unsafe experiments.
 
 ### Validation Status
 

@@ -31,31 +31,34 @@ For validation parity with the previous release, also use `EVAL_FAST_REJECT=0`. 
 knobs above match the candidate set; `EVAL_FAST_REJECT=1` only changes how quickly dirty
 candidates are rejected during CPU eval.
 
-Same RTX 5090, same dumped state, 32,768-nonce dirty range:
+Same RTX 5090, same 1221-qubit SOTA dumped state (`155ebc5`, local commit `572bba4`),
+131,072-nonce dirty range, two measured runs:
 
 | binary / knob set | measured throughput |
 |---|---:|
-| previous-release binary | ~10,057 nonce/s |
-| this branch with previous-release-compatible knobs | ~10,062 nonce/s |
-| `speculative-and-fan` recommended exact stack | ~12,505 nonce/s |
+| previous-release binary | ~10,174 nonce/s |
+| this branch with previous-release-compatible knobs | ~10,053 nonce/s |
+| safer stack: `batch_inv+comb22+trunc_first+fan22` | ~12,267 nonce/s |
+| requested `batch_inv+comb22+single_pass+fan22` | ~12,576 nonce/s, **invalid** (missed known clean nonce) |
 
 So the previous release baseline on this machine is about 10k nonce/s. The earlier 7k-ish
 number corresponds to slower wave settings such as `GPU_WAVE=64`, not to the previous
 release.
 
-## Scan kernel (exact knobs — candidate set unchanged)
+## Scan kernel (safe knobs — candidate set preserved)
 
 | knob | current SOTA base *(fast-reject)* | earlier base *(slow-reject)* | notes |
 |---|---:|---:|---|
 | **baseline** | 1.00× (10,209 n/s) | 1.00× (8,400 n/s) | default exact path |
-| `GPU_GCD_MODE=single_pass` | ~1.00× | +2–4% (in stack) | folds the two GCD passes into one |
+| `GPU_GCD_MODE=trunc_first` | known-clean pass | +1–2% when width rejects dominate | safe reorder: truncated width check, then full convergence check |
+| `GPU_GCD_MODE=single_pass` | **unsafe on 1221-SOTA** | +2–4% (historical stack) | fused truncated convergence; missed known clean nonce `165002130437` |
 | `GPU_BATCH_INV=1` | **1.01×** (+1.2%) | **1.42×** | the only large lever; only on slow-reject |
 | `GPU_COMB_BITS=16` | 1.11× | 1.10× | ~64 MiB table |
 | `GPU_COMB_BITS=22` | +3% over comb16 | +3% over comb16 | ~3.0 GiB table; diminishing returns |
 | `GPU_FAN_BITS` (nonce-fan) | **1.015×** (+1.5%) | not measured | `squeeze_init` is not the bottleneck here |
 | native `sm_120` build (CUDA 12.8) | **1.00×** (no gain) | — | PTX-JIT matches/beats native codegen |
 | `GPU_WAVE=64` | 0.78× *(slower)* | 0.84× *(slower)* | smaller waves = more overhead |
-| **best exact combo** | **1.18×** (`batch_comb16` + `single_pass`) | **1.65×** (`batch_comb22`) | |
+| **best safer combo** | **~1.2×** (`batch_comb22` + `trunc_first` + `fan22`) | **1.65×** (`batch_comb22`) | revalidate per base |
 
 Combination caveat: `GPU_WAVE=256` *hurts* in batch mode (lower occupancy), so the best
 combo uses `GPU_WAVE=128` — e.g. `all_exact` (which forces wave256) measured slower than
@@ -131,7 +134,8 @@ Three predicted multipliers came in at low single digits — recorded so they ar
 on the same reasoning:
 
 - **`single_pass` GCD** (predicted ~1.2×): the convergence pass it removes already
-  early-exits cheaply, so removing it barely helps.
+  early-exits cheaply, so removing it barely helps; it is also unsafe on the 1221-qubit SOTA
+  because it missed the baked clean nonce.
 - **native `sm_120`** (predicted ~1.2×): the 581-series driver's PTX-JIT from `compute_80`
   matches/beats nvcc-12.8 native Blackwell codegen — measured *slightly slower* native.
 - **nonce-fan** (predicted ~1.4×): `squeeze_init` is only ~3% of per-nonce time on the
@@ -144,19 +148,20 @@ regime), not further scan-kernel micro-optimization.
 
 ## Recommended settings
 
-For long / billion-scale exact GPU search on a large NVIDIA GPU (the default `CHUNK` is now
+For long / billion-scale safer GPU search on a large NVIDIA GPU (the default `CHUNK` is now
 500k, so the fan table amortizes — see "Per-process startup cost & chunk sizing"):
 
 ```bash
-GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_WAVE=128 GPU_FAN_BITS=22  # CHUNK≈1000000
+GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=trunc_first GPU_WAVE=128 GPU_FAN_BITS=22  # CHUNK≈1000000
 ```
 
-This is the fastest measured exact scanner (~13,676 n/s, ~1.42× over the comb8 baseline);
-`fan22`'s ~872 MiB table builds in ~0.3s, a clear win at ≥500k chunks (it added ~3% scan over
-the no-fan combo). Drop to `GPU_FAN_BITS=0` only for small chunks (≪200k) where its build
-isn't amortized, or `GPU_GCD_MODE=full_first` for the strictest pre-filter (fewest
-eval-dirty false-positives, ~3% slower scan). Add `EVAL_FAST_REJECT=1` for candidate
-validation unless you intentionally need byte-for-byte previous-release diagnostics/counts.
+On the 1221-qubit SOTA, this found the baked clean nonce and measured ~12,267 n/s on the
+RTX 5090, about 1.2x the previous-release baseline. `fan22`'s ~872 MiB table builds in ~0.3s,
+a clear win at >=500k chunks. Drop to `GPU_FAN_BITS=0` only for small chunks (≪200k) where
+its build is not amortized, or `GPU_GCD_MODE=full_first` for the strictest pre-filter. Add
+`EVAL_FAST_REJECT=1` for candidate validation unless you intentionally need byte-for-byte
+previous-release diagnostics/counts.
+
 ## Resolved: the batch+large-comb combo is exact and scale-invariant
 
 An earlier draft of this file claimed the `batch_inv+comb22+single_pass+fan` combo
@@ -188,12 +193,32 @@ candidate density of real bases this needs billions of nonces in one launch to a
 any chunked search (≤~1M) never comes close. Chunk for throughput/memory and table-build
 amortization, **not** for correctness.
 
-## `single_pass` is a different (looser) necessary filter than `full_first`
+## `single_pass` false-negative on the 1221-qubit SOTA
 
 `single_pass` checks *truncated*-GCD convergence (what the circuit's GCD actually runs);
-`full_first` checks *untruncated* convergence. They are both **necessary** filters — a true
-`0/0/0` island is clean under both, so neither misses islands — but they disagree on
-borderline eval-dirty nonces. Measured on offset `[0, 1M)` of the fan base:
+`full_first` checks *untruncated* convergence. Earlier ranges only showed `single_pass`
+passing extra eval-dirty false positives. On the 2026-06-10 1221-qubit SOTA, it also missed a
+real clean island:
+
+| filter / stack | known-clean range `[165002130430, 165002130446)` |
+|---|---|
+| previous-release default | found `165002130437` |
+| latest main baseline (`full_first`) | found `165002130437` |
+| `batch_inv+comb22+trunc_first+fan22` | found `165002130437` |
+| `batch_inv+comb22+single_pass+fan22` | **missed** `165002130437` |
+
+CPU validation confirmed the missed nonce is clean:
+
+```text
+CLEAN nonce=165002130437 tof=1428172.241 qubits=1221 score=1743798012
+```
+
+So `single_pass` is **not** a safe necessary filter on all current bases. The failure is the
+fused truncated-convergence check: `trunc_first` still runs the full convergence check after
+the truncated width-envelope check, and that safer order found the clean nonce.
+
+Historical note: on an earlier offset `[0, 1M)` of the fan base, `single_pass` looked merely
+looser:
 
 | filter | candidates found | note |
 |---|---|---|
@@ -201,13 +226,9 @@ borderline eval-dirty nonces. Measured on offset `[0, 1M)` of the fan base:
 | `single_pass` (comb8) | `{46719, 644403}` | truncated convergence — a **superset** here |
 
 Both `46719` and `644403` are eval-dirty (`cls=1`); `46719` is `single_pass`-specific
-(truncated converges, untruncated does not). So on this range `single_pass` is **looser** —
-it passes one extra eval-dirty false-positive. (This corrects an earlier note that had the
-direction backwards, claiming `single_pass` *rejects* `644403`; in fact both filters accept
-it.) Practical tradeoff: `single_pass` scans ~3% faster but hands the eval a few more dirty
-candidates to reject. It never misses a true island. Use `full_first` for the strictest GPU
-pre-filter (fewest false-positives), `single_pass` to shave scan time when the search is
-scan-bound and the extra eval cost is negligible.
+(truncated converges, untruncated does not). That range was not enough to prove safety. Use
+`trunc_first` for production scans; treat `single_pass` as an experiment that must pass a
+known-clean nonce check and candidate-dense A/B on the exact base.
 
 Lesson: validate exactness on a **candidate-dense** range (or against the eval), and compare
 *identical* configs across sizes — not a range with 0–1 candidates, and never across
@@ -224,35 +245,37 @@ RTX 5090 as wall-clock of an N=2000 run (essentially pure startup), 3 reps, <0.0
 | `comb8` / `full_first` (baseline) | 0.47s | 9,655 n/s | none |
 | `comb16` +batch | 0.44s | 12,490 n/s | ~64 MiB |
 | `comb22` +batch | 0.80s | 12,680 n/s | ~3.0 GiB |
-| `comb22` +batch +`single_pass` +`fan22` | 1.10s | **13,676 n/s** | ~3.0 GiB + ~872 MiB |
+| `comb22` +batch +`single_pass` +`fan22` | 1.10s | **13,676 n/s** | ~3.0 GiB + ~872 MiB; historical, now unsafe on 1221-SOTA |
+| `comb22` +batch +`trunc_first` +`fan22` | ~1.1s | **12,267 n/s** | ~3.0 GiB + ~872 MiB; safer 1221-SOTA recipe |
 
 **The 3 GiB comb22 table builds in only ~0.33s, and fan22 adds ~0.30s — startup is ~1s even
 for the heaviest config.** (An earlier worry that the 3 GiB rebuild would be a heavy
 per-chunk tax was wrong: the GPU builds it in a fraction of a second.)
 
-Startup as a fraction of a chunk (heaviest config, ~1.0s fixed + scan at 13,676 n/s):
+Startup as a fraction of a chunk (heaviest config, ~1.0s fixed; use the measured scan rate
+for the recipe you choose):
 
 | CHUNK | scan time | startup overhead |
 |---|---:|---:|
-| 200k | ~14.6s | ~6.4% |
-| 500k | ~36.6s | ~2.7% |
-| 1M | ~73s | ~1.3% |
+| 200k | ~16s at the safer 12.3k n/s recipe | ~6% |
+| 500k | ~41s at the safer 12.3k n/s recipe | ~2.4% |
+| 1M | ~81s at the safer 12.3k n/s recipe | ~1.2% |
 
-Since the combo is exact at any size (no corruption ceiling), the only reason to bound CHUNK
-is this startup amortization (and GPU memory for the table, which is fixed by `comb_bits`,
-not by CHUNK). **Recommendation for long/billion-scale runs: `GPU_BATCH_INV=1
-GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_FAN_BITS=22` with `CHUNK≈1000000`** — fastest
-scanner, startup amortized to ~1.3%, ~**1.42×** the comb8 baseline. (Drop `single_pass` for
-`full_first` if you prefer the strictest pre-filter; the scan cost is ~3% higher.)
+The batch+comb+fan tables are deterministic and scale-invariant; the reason to bound CHUNK is
+startup amortization plus output-buffer headroom, not a corruption ceiling. **Recommendation
+for long/billion-scale runs: `GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=trunc_first
+GPU_FAN_BITS=22` with `CHUNK≈1000000`**. Use `full_first` for the strictest pre-filter, and
+reserve `single_pass` for explicitly unsafe experiments.
 
-Effective throughput and wall-clock at ~13,500 n/s (after startup):
+Effective throughput and wall-clock at ~12,300 n/s (after startup, safer recipe):
 
 | nonces | 1 GPU | 8 GPUs |
 |---|---:|---:|
-| 1 billion | ~20.6 GPU-h | ~2.6 h |
-| 10 billion | ~206 GPU-h | ~26 h |
+| 1 billion | ~22.6 GPU-h | ~2.8 h |
+| 10 billion | ~226 GPU-h | ~28 h |
 
-(The comb8 baseline at 9,655 n/s would take ~28.8 GPU-h per billion — the combo saves ~30%.)
+(The comb8 baseline around 10k n/s takes ~27.8 GPU-h per billion — the safer combo saves
+roughly 19%.)
 
 ## Methodology
 
