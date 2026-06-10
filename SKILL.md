@@ -40,6 +40,23 @@ To switch GPUs later (e.g. the user gives a new box), just re-run `init-remote`/
 The script can be invoked as `./island.sh ...` or `bash island.sh ...`; recursive self-calls
 resolve through the script directory.
 
+## Two phases, two knob sets — don't mix them
+The loop has two stages with **different knobs**:
+
+```bash
+# Phase 1 — GPU SCAN (the GPU_* knobs): finds GCD-clean candidates
+GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_FAN_BITS=22 GPU_WAVE=128 \
+  ./island.sh search s.bin <START> <N>
+# Phase 2 — CPU VALIDATE (EVAL_FAST_REJECT lives here): confirms 0/0/0 + score
+EVAL_FAST_REJECT=1 ./island.sh validate "<CFG>" <nonce> [<nonce>...]
+```
+
+`EVAL_FAST_REJECT` is a **Phase-2 (eval) knob, not a scan knob** — putting it on a `search`
+line is a no-op. Per-candidate cost (measured, RTX-5090 base): `build_circuit` ≈ **1.2s**
+(emit 0.43s + write 550 MB 0.76s), `eval_circuit` ≈ **17s** for clean *and* stock-dirty (the
+stock eval does **not** fail-fast — it simulates all 9024 shots). So the per-candidate time is
+all eval; `EVAL_FAST_REJECT` is the lever for it (see below).
+
 ## GPU search knobs
 Every improvement is an independent on/off knob, all defaulting to the exact/conservative
 baseline (`GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128 GPU_FAN_BITS=0`
@@ -62,12 +79,16 @@ the previous-release binary and this branch with the scan baseline both measured
 - `GPU_FAN_BITS=K` — **nonce-fan**: precompute the SHAKE sponge for the low `K` tail bits so
   each nonce only absorbs its high bits. Exact. Table is `2^K * 208 B`. Measured ~+1.5% on the
   current SOTA base (`squeeze_init` is not the bottleneck there).
-- `EVAL_FAST_REJECT=1` — **eval early-exit / exact apply pre-scan**: defers the per-shot
-  EC-muls into the batch loop and stops at the first failing batch. **~8.5× avg** on dirty
-  candidates (16.1s → ~1.9s), exact (clean islands still read `0/0/0`; the full eval already
-  checks apply-cleanliness, so a fast-rejecting eval *is* the apply pre-scan with no false
-  negatives). Lives in the challenge `eval_circuit`; re-apply `patches/eval_fast_reject.diff`
-  after `ecdsafail sync`. `island.sh validate` sets it to `1` by default.
+- `EVAL_FAST_REJECT=1` — **eval early-exit (Phase-2 / validate only)**: defers the per-shot
+  EC-muls into the batch loop and stops at the **first failing shot**. Exact: a clean island
+  still reads `0/0/0` (verified), and with the var unset the eval is byte-identical, so
+  `ecdsafail run` scoring is unaffected. Realized speedup is **candidate-dependent** (it stops
+  at the first bad shot): early-failing dirty candidates hit ~1.9s, but GCD-clean-but-eval-dirty
+  ones — exactly what a GPU hunt feeds the validator — fail *later*, ~6s; vs ~17s stock
+  (~2.6–8.5×). Clean islands still take the full ~17s (they must check all 9024 shots).
+  **Needs `patches/eval_fast_reject.diff` applied + `cargo build --release --bin eval_circuit`**
+  (reset by `ecdsafail sync`; `eval_circuit.rs` is a local tool, not a submitted file, so this
+  never touches the grader). `island.sh validate` sets `EVAL_FAST_REJECT=1` by default.
 
 For production island searches on a large NVIDIA GPU, prefer the fastest exact mode that has
 passed `test-gpu-knobs` on the current base. As of the RTX 5090 measurements, the best

@@ -61,27 +61,43 @@ Combination caveat: `GPU_WAVE=256` *hurts* in batch mode (lower occupancy), so t
 combo uses `GPU_WAVE=128` — e.g. `all_exact` (which forces wave256) measured slower than
 `batch_comb16`.
 
-## Eval phase (challenge `eval_circuit`, exact) — the one big exact win
+## Per-candidate validation cost: it's all eval, not build
 
-| knob | effect | status |
+A common misconception is that `build_circuit` is the slow part. Profiled on the RTX-5090
+SOTA base:
+
+| step | time | breakdown |
 |---|---:|---|
-| `EVAL_FAST_REJECT=1` (lazy derivation + early-exit) | **~8.5× avg** on dirty candidates (16.1s → ~1.9s) | built |
-| clean island under fast-reject | unchanged: `0/0/0`, all 9024 shots OK | exact |
-| `FAST=0` scoring path | byte-identical to original (same full counts) | exact |
+| `build_circuit` | **~1.2 s** | `point_add::build()` 0.43 s + serialize/write 550 MB 0.76 s |
+| `eval_circuit` (stock, clean) | **~16.9 s** | full 9024-shot simulation |
+| `eval_circuit` (stock, **dirty**) | **~16.9 s** | ⚠️ stock eval does **not** fail-fast — it simulates all shots and *counts* mismatches |
 
-`EVAL_FAST_REJECT` **defers the per-shot EC scalar-mults into the batch loop** and stops at
-the first failing batch, so a dirty candidate exits after ~the first bad batch (~1–3.6 s)
-instead of paying the full ~9 s upfront derivation + 141-batch sim. The earlier
-simple-early-exit version was capped at ~1.5× by that upfront derivation; deferring it is
-what unlocks the ~10×.
+So per-candidate time is dominated by `eval_circuit` (~17 s), and the stock eval is ~17 s even
+for *dirty* candidates. `build_circuit` (~1.2 s) is not worth optimizing; trimming the 550 MB
+disk round-trip (in-memory pipe) would save <1 s.
+
+## Eval phase (`EVAL_FAST_REJECT`, exact) — the one big exact win
+
+`EVAL_FAST_REJECT=1` defers the per-shot EC scalar-mults into the batch loop and stops at the
+**first failing shot**. It is exact: a clean island still simulates all 9024 shots and reads
+`0/0/0` (re-verified on the current base), and with the var unset the path is byte-identical
+(`ecdsafail run` still scores 1766121990).
+
+| candidate type | stock eval | `EVAL_FAST_REJECT=1` | speedup |
+|---|---:|---:|---:|
+| early-failing dirty | ~17 s | ~1.9 s | ~8.5× |
+| **GCD-clean but eval-dirty** (what a GPU hunt feeds the validator) | ~17 s | **~6 s** | **~2.6×** |
+| clean island | ~17 s | ~17 s (must check all shots) | 1× |
+
+The realized speedup is **candidate-dependent** — it exits at the *first* bad shot, so it
+helps most when failures are early. GCD-clean candidates already passed the GCD filter, so
+they fail *later* (in the apply/phase tail), landing around ~6 s rather than the ~1.9 s of
+arbitrary dirty nonces. Still a real win on the dominant cost: per-candidate validation drops
+from ~18 s to ~7 s.
 
 This is the **exact realization of the "apply pre-scan"**: the full eval already checks
 apply-cleanliness, so a fast-rejecting eval *is* the apply pre-scan — with **zero false
-negatives** and no GPU re-implementation of the apply phase. A clean island still derives and
-simulates all 9024 shots and reads `0/0/0`.
-
-Measured dirty-candidate eval times: 1.13, 1.24, 1.75, 1.75, 1.85, 3.57 s (vs 16.1 s full) →
-**~8.5× average**. Spread is because the exit time depends on where the first bad shot falls.
+negatives** and no GPU re-implementation of the apply phase.
 
 ## Overall pipeline speedup (scan and eval do NOT multiply)
 
