@@ -34,6 +34,30 @@ The branch now contains several exact on/off knobs, so "baseline" was ambiguous.
 separate three cases: the previous release, this branch with previous-release-compatible
 knobs, and the recommended fast exact stack. That makes future speedup claims auditable and
 avoids comparing against the wrong baseline.
+## 2026-06-10 - Large-range A/B: correctness findings + corrections
+
+Branch: `speculative-and-fan`
+
+A 6M-nonce A/B (baseline vs `batch_inv+comb22+single_pass+fan22`) measured **1.40x** scan
+throughput (9,794 -> 13,719 n/s) but also exposed two correctness issues the sparse
+`test-gpu-knobs` ranges missed. See `docs/measured-speedups.md` -> "Known issues".
+
+- **Combo corrupts output over a very large single kernel launch (>~2-6M).** It emits
+  false-positive candidates whose verdict depends on scan size (non-deterministic). Baseline
+  and individual knobs over <=200k are exact; the production path chunks into 200k so it is
+  safe. Ground truth: observed false-positives are all eval-dirty (no island missed in this
+  run). Suspected: batch-inversion kernel + 3 GiB comb22 / 832 MiB fan tables over a long
+  grid-stride scan. Needs `compute-sanitizer`.
+- **Reverted the earlier `hunt` "whole-range chunk" change** (it removed the protective
+  chunking and would trigger the above). `hunt` CHUNK defaults back to 200k, override allowed.
+- **Corrected the `single_pass` docs:** it is NOT candidate-set-identical to `full_first`.
+  It checks *truncated* GCD convergence (the circuit's actual behavior), so it rejects GCD
+  false-positives `full_first` accepts (e.g. `5000644403`: `full_first`-clean but eval-dirty).
+  It remains a valid necessary filter (won't miss true islands) and is arguably more
+  circuit-faithful. The old "validated identical candidate set" claim relied on a test range
+  with no divergent nonce.
+- The 1.40x figure is a valid *throughput* number but came from a non-exact combo run; do not
+  use the combo as one huge launch until the corruption is root-caused.
 
 ## 2026-06-10 - Nonce-fan, eval early-exit, and a measured-speedups record
 

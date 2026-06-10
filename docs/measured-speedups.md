@@ -138,6 +138,34 @@ Add `EVAL_FAST_REJECT=1` for candidate validation unless you intentionally need 
 previous-release diagnostics/counts. For large single-process chunks (roughly 500k nonces or
 more), `GPU_FAN_BITS=20` can be tested as a small extra exact scan win; on 200k chunks it was
 a wash after the 208 MiB table build.
+## Known issues (found by a large-range A/B; small-range tests missed them)
+
+A 6M-nonce A/B (baseline vs `batch_inv+comb22+single_pass+fan22`) surfaced two things that
+the sparse `test-gpu-knobs` ranges (0–8192 + the island window) never hit:
+
+1. **The batch+large-comb combo corrupts its output over a very large *single* kernel
+   launch (≳2–6M nonces).** It emits false-positive candidates whose verdict depends on the
+   total scan size (e.g. nonce `5000046719` appears clean at 6M but dirty at 200k/1M/2M and
+   in a 1-nonce scan). Baseline-6M and the individual knobs over ≤200k are exact, so the
+   production path (which chunks into 200k) is safe — but a single multi-million launch is
+   not. Ground truth: every observed false-positive is eval-dirty, so no *island was missed*
+   in this run, but corrupted output could drop a real island too. **Mitigation:** keep
+   `CHUNK` bounded (≤~200k–1M); do not run the combo as one huge launch until this is
+   root-caused (`compute-sanitizer`). Suspected cause: the batch-inversion kernel + the 3 GiB
+   comb22 / 832 MiB fan tables over a long grid-stride scan.
+
+2. **`single_pass` is NOT candidate-set-identical to `full_first`** (correcting the earlier
+   "exact identical candidate set" claim). `single_pass` checks *truncated*-GCD convergence —
+   what the circuit actually runs — whereas `full_first` checks *untruncated* convergence. So
+   `single_pass` correctly rejects GCD false-positives that `full_first` accepts (verified:
+   `5000644403` is `full_first`-clean but eval-dirty `cls=1`, and `single_pass` rejects it).
+   It is a *different, arguably more circuit-faithful* necessary filter (a true island is
+   truncated-GCD-clean on all shots, so `single_pass` still accepts true islands), not a
+   drop-in exact replacement for `full_first`. The "identical candidate set" check passed only
+   because the test ranges contained no divergent nonce.
+
+Lesson: validate exactness on a **candidate-dense** range (or against the eval), not just a
+range that happens to contain 0–1 candidates.
 
 ## Methodology
 

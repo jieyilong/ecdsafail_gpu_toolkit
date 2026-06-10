@@ -357,11 +357,13 @@ bake)
   ;;
 
 hunt)
-  CFG="${1:?usage: hunt CFG START N [CHUNK]}"; START="${2:?}"; N="${3:?}"; CHUNK="${4:-$N}"
+  CFG="${1:?usage: hunt CFG START N [CHUNK]}"; START="${2:?}"; N="${3:?}"; CHUNK="${4:-200000}"
   echo ">> [1/3] Toffoli cost:"; bash "$SELF" measure "$CFG"
   echo ">> [2/3] dump + multi-GPU search ($N nonces from $START, chunk $CHUNK):"
   STATE="$(mktemp).bin"; bash "$SELF" dump "$CFG" "$STATE" >/dev/null
-  # CHUNK defaults to the whole range so large comb/fan tables build once, not per chunk.
+  # CHUNK is bounded (default 200k) on purpose: the batch+large-comb combo corrupts its
+  # output over very large single kernel launches (>~2M). Chunking keeps results exact.
+  # You can raise CHUNK to amortize comb/fan table builds, but verify exactness first.
   cands=$(bash "$SELF" search "$STATE" "$START" "$N" "$CHUNK" | grep -oE '[0-9]+' | sort -un)
   echo "GCD-clean candidates: $(echo "$cands" | grep -c . || true)"
   echo ">> [3/3] validating (looking for 0/0/0):"; found=0

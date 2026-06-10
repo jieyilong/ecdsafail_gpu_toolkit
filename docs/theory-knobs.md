@@ -238,20 +238,23 @@ for step in 0..active_iters:
 reject (ran out of steps without converging)
 ```
 
-Why it is exact: inside the width envelope the truncated step is identical to the full step
-(truncation only drops bits that are zero on the support / the truncated comparator resolves
-the same branch) — which is precisely the support condition under which the two-pass filter
-is itself exact. So when the truncated walk reaches `v==0` with no overflow at step `k`, the
-full GCD also converges at `k`; when it runs all `active_iters` with neither, the full GCD
-also failed to converge in time. The candidate-set equality test vs the `full_first` baseline
-confirms this empirically.
+**Correctness (corrected after a large-range A/B).** The original rationale was that within
+the width envelope the truncated step equals the full step, so single-pass convergence would
+equal `full_first`'s untruncated convergence. That is **not** generally true: a body-carry or
+comparator truncation can alter the GCD trajectory *without* triggering width overflow, so the
+*truncated* convergence (single_pass) and the *untruncated* convergence (`full_first`) diverge
+on some factors. A 6M-nonce A/B confirmed it — e.g. `5000644403` is `full_first`-clean but
+eval-dirty (`cls=1`), and `single_pass` correctly rejects it.
+
+So `single_pass` is **not** candidate-set-identical to `full_first` (the earlier sparse test
+just never hit a divergent nonce). It *is* still a valid necessary filter — a true island is
+truncated-GCD-clean on every shot, so single_pass accepts it (no missed islands) — and it is
+arguably *more* circuit-faithful than `full_first`, since the circuit runs the truncated GCD.
+Treat it as a different filter, and validate against the eval on a candidate-dense range.
 
 Performance note (measured, RTX 5090): the saving is **small** — about `+4%` stacked on
-`batch_inv`+`comb` and ~`0%` on its own. The reason is that the full convergence walk it
-removes is already nearly free: it early-exits as soon as `v==0`, and for the common hard
-factors the dominant cost is elsewhere (per-shot field arithmetic + SHAKE), not the second
-GCD pass. So `single_pass` is worth enabling (it is exact and never hurts), but it is not a
-large lever. See the changelog for the full A/B table.
+`batch_inv`+`comb` and ~`0%` on its own (the convergence pass it removes already early-exits
+cheaply). See `docs/measured-speedups.md` for the full A/B and the "Known issues".
 
 ## `GPU_WAVE`: Threads Per Nonce Wave
 

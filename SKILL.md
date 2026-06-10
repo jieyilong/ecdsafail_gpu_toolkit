@@ -77,7 +77,11 @@ measured exact scan mode is:
 GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_WAVE=128 ./island.sh search s.bin <START> <N>
 ```
 
-`GPU_GCD_MODE=single_pass` is exact (validated identical candidate set) and adds a free ~0-4%.
+`GPU_GCD_MODE=single_pass` is a valid necessary filter (won't miss true islands) and adds a
+free ~0-4%, but it is **not** candidate-set-identical to `full_first` -- it checks *truncated*
+GCD convergence (what the circuit runs) and correctly rejects GCD false-positives `full_first`
+accepts. Validate it against the eval, not just a sparse candidate range. See
+`docs/measured-speedups.md` -> "Known issues".
 The `comb22` table is ~3.0 GiB and was only ~2.8% over `comb16`; if VRAM is constrained or
 process startup dominates, use `GPU_COMB_BITS=16`.
 For large chunks (roughly 500k nonces or more per process), test `GPU_FAN_BITS=20`; for normal

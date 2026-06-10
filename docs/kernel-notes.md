@@ -62,10 +62,12 @@ nonce.
   2.8% faster than `batch_comb16` over a 32,768-nonce slice on the current SOTA base.
 - `GPU_GCD_MODE=trunc_first` is exact and checks the truncated width envelope before the
   full convergence counter. It should help when width overflows dominate failures.
-  `GPU_GCD_MODE=single_pass` is exact and folds the two GCD passes into one truncated walk
-  that also detects `v==0` convergence (so it never runs the separate untruncated pass).
-  Validated identical candidate set vs `full_first`; measured gain is small (~0-4%, since the
-  pass it removes already early-exits cheaply).
+  `GPU_GCD_MODE=single_pass` folds the two GCD passes into one truncated walk that also
+  detects `v==0` convergence (never runs the separate untruncated pass). It is a valid
+  necessary filter (won't miss true islands) but is **not** candidate-set-identical to
+  `full_first`: it uses *truncated* convergence (the circuit's actual behavior), so it rejects
+  GCD false-positives `full_first` accepts. Measured gain ~0-4%. See measured-speedups.md
+  "Known issues".
   `GPU_GCD_MODE=trunc_only` skips the convergence counter and is intentionally noisy:
   it can emit extra false positives, so it is for candidate-generation experiments only.
 - `GPU_WAVE` accepts 32..256 and is rounded up to a warp multiple. Batch mode uses more
