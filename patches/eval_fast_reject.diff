@@ -1,0 +1,26 @@
+diff --git a/src/bin/eval_circuit.rs b/src/bin/eval_circuit.rs
+index ab15ba9..9cee873 100644
+--- a/src/bin/eval_circuit.rs
++++ b/src/bin/eval_circuit.rs
+@@ -254,6 +254,11 @@ fn run_tests(
+     let mut classical_failures = 0usize;
+     let mut phase_garbage_batches = 0usize;
+     let mut ancilla_garbage_batches = 0usize;
++    // EVAL_FAST_REJECT=1: stop at the first failing batch. The search/validate path only
++    // needs a clean/dirty verdict, not the full mismatch count, so a dirty candidate can
++    // bail after ~the first bad batch instead of simulating all 9024 shots. Default off so
++    // scoring/submission runs remain complete and byte-identical.
++    let fast_reject = std::env::var("EVAL_FAST_REJECT").ok().as_deref() == Some("1");
+ 
+     const BATCH: usize = 64;
+     let num_batches = (n + BATCH - 1) / BATCH;
+@@ -329,6 +334,9 @@ fn run_tests(
+             }
+             ok = false;
+         }
++        if fast_reject && !ok {
++            break;
++        }
+     }
+ 
+     let _ = num_bits;

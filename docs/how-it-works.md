@@ -54,8 +54,11 @@ width-envelope overflow or non-convergence — the dominant source of "hard" inp
   uses a cooperative block kernel with batch inversions, `GPU_COMB_BITS=16/20/22` builds
   larger runtime comb tables, `GPU_GCD_MODE=trunc_first` and `GPU_GCD_MODE=single_pass` are
   exact GCD-check variants (single_pass folds the two passes into one), and
-  `GPU_WAVE` tunes the threads per nonce wave. `GPU_GCD_MODE=trunc_only` is intentionally
-  noisy and must be followed by normal validation.
+  `GPU_WAVE` tunes the threads per nonce wave, and `GPU_FAN_BITS=K` (nonce-fan) precomputes
+  the SHAKE prefix for the low `K` tail bits. `GPU_GCD_MODE=trunc_only` is intentionally
+  noisy and must be followed by normal validation. Separately, `EVAL_FAST_REJECT=1` speeds
+  the *eval* phase by stopping at the first failing batch. All are exact and individually
+  toggleable; see `docs/measured-speedups.md` for the measured gains.
 
 ## The filter's blind spot (why you still validate)
 The pre-filter models the **GCD** (width + convergence) but **not the apply phase**. So a

@@ -285,6 +285,44 @@ parallelism on clean or late-failing nonces.
 So `GPU_WAVE` is a real tuning knob, not a monotonic "bigger is better" setting. It should
 be benchmarked separately for baseline mode and batch-inversion mode.
 
+## `GPU_FAN_BITS`: Nonce-Fan (shared SHAKE prefix)
+
+Each nonce reseeds SHAKE by absorbing a 96-op identity tail whose ops are selected by the
+nonce's 48 bits (bit `i` -> two ops, fed low bit first). That `squeeze_init` is ~39 Keccak-f
+permutations per nonce. The nonce-fan exploits that the *low* tail bits are absorbed
+*first*: precompute the sponge state after absorbing the low `K` bits for all `2^K` prefixes,
+then each nonce loads its prefix (a 208-byte table read) and only absorbs the high `48-K`
+bits.
+
+```text
+2^K prefix states, each = 25 sponge words + pt   (208 B/entry)
+K=20 -> 208 MiB, K=22 -> 856 MiB, K=24 -> 3.5 GiB
+```
+
+This is **exact** — identical total absorption, just cached prefix — and the table builds
+once (amortized over the whole scan). It cuts the per-nonce tail absorption by `K/48`.
+
+Performance note (measured, RTX 5090): only **~+1.5%** on the current SOTA base. The
+hypothesis that `squeeze_init` dominates was wrong here — cutting it in half moved the needle
+1.5%, i.e. it is only ~3% of per-nonce time in this fast-reject regime (the per-wave squeeze
+and shot work dominate). May help more on init-bound bases; re-measure with `bench-gpu-knobs`.
+
+## `EVAL_FAST_REJECT`: Eval Early-Exit (eval phase, not scan)
+
+This knob is in the challenge's `eval_circuit`, the slow trusted stage that validates a
+GCD-clean candidate by simulating the whole circuit over 9024 shots in batches of 64. With
+`EVAL_FAST_REJECT=1`, the eval stops at the first batch that records any failure (the
+search/validate path only needs a clean/dirty verdict, not the full mismatch count). Default
+`0` keeps scoring/submission runs complete and byte-identical; a clean island still runs all
+batches and reads `0/0/0`.
+
+Measured ~1.5× on dirty candidates today. The ceiling is that the eval derives **all 9024
+inputs upfront** (~9 s of CPU EC scalar-mults) before the batch loop, and early-exit only
+shortcuts the batch loop. Deferring those muls into the batch loop (lazy derivation) would
+reach ~10×, but that is a rewrite of the trusted scoring binary and is mostly worth it for
+apply-bound configs where eval dominates. The change lives in the challenge repo (reset by
+`ecdsafail sync`); re-apply `patches/eval_fast_reject.diff`.
+
 ## Recommended Evaluation Order
 
 Test exact knobs before noisy knobs:

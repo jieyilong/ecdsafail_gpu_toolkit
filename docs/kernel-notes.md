@@ -56,6 +56,12 @@ GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128
   it can emit extra false positives, so it is for candidate-generation experiments only.
 - `GPU_WAVE` accepts 32..256 and is rounded up to a warp multiple. Batch mode uses more
   shared memory per block, so large waves can trade fewer waves for lower occupancy.
+- `GPU_FAN_BITS=K` (nonce-fan) precomputes the SHAKE sponge for the low `K` tail bits into a
+  `2^K * 208 B` table so each nonce only absorbs its high bits. Exact. `0` = off. Measured
+  ~+1.5% on the current SOTA base. See `docs/theory-knobs.md` and `docs/measured-speedups.md`.
+- `EVAL_FAST_REJECT=1` is an *eval-phase* knob (challenge `eval_circuit`), not a kernel knob:
+  it stops the validation eval at the first failing batch. ~1.5×; default off keeps scoring
+  complete. Patch: `patches/eval_fast_reject.diff`.
 
 ## Lever value (exact CCX counts on b55ede3 base, peak 1309, tof 1,503,871):
 active257 −2989 (3.9M score win), active256 −5978 (8.1M), apply20 −516 (675k),

@@ -4,6 +4,41 @@ This file records not only what changed, but also why we made the change, what s
 we expect, and what still needs to be validated. For future work, add an entry whenever a
 change affects search behavior, performance assumptions, correctness risk, or workflow.
 
+## 2026-06-10 - Nonce-fan, eval early-exit, and a measured-speedups record
+
+Branch: `speculative-and-fan` (not yet merged)
+
+### Summary
+
+Two new exact, independently-toggleable knobs plus an honest measured-speedups doc.
+
+### Main Changes
+
+- `GPU_FAN_BITS=K` (**nonce-fan**, kernel): precompute the SHAKE sponge for the low `K` tail
+  bits (`2^K * 208 B` table) so each nonce only absorbs its high bits. Exact (validated:
+  finds the island, candidate set unchanged). Wired through `island.sh` + `search_driver.sh`.
+- `EVAL_FAST_REJECT=1` (**eval early-exit**, challenge `eval_circuit`): stop the validation
+  eval at the first failing batch. Default off so scoring runs stay complete; `island.sh
+  validate` sets it to `1`. Saved as `patches/eval_fast_reject.diff` (the challenge repo is
+  reset by `ecdsafail sync`).
+- Added `docs/measured-speedups.md` with the full measured table, and updated `README.md`,
+  `SKILL.md`, `docs/theory-knobs.md`, `docs/kernel-notes.md`, `docs/how-it-works.md`.
+
+### Measured Impact (RTX 5090, current SOTA base)
+
+- nonce-fan: **~+1.5%** (squeeze_init is not the bottleneck here; predicted ~1.4x, did not
+  pan out).
+- eval early-exit: **~1.5×** on dirty candidates (16.3s -> ~10.5s), capped by the eval's ~9s
+  upfront input derivation; a lazy-derivation rewrite would reach ~10x.
+- Every improvement is now an independent on/off knob: `GPU_BATCH_INV`, `GPU_COMB_BITS`,
+  `GPU_GCD_MODE`, `GPU_WAVE`, `GPU_FAN_BITS`, `EVAL_FAST_REJECT`.
+
+### Validation Status
+
+- Kernel compiles (PTX compute_80 JIT to sm_120); `bash -n` passes for `island.sh` and
+  `search_driver.sh`. nonce-fan verified exact on the live SOTA base; eval early-exit
+  verified to preserve the island's `0/0/0`. Not committed/pushed.
+
 ## 2026-06-10 - Single-pass exact GCD + measured limits of further exact speedups
 
 Branch: `exact-speedups` (not yet merged)

@@ -513,6 +513,11 @@ __device__ void block_batch_inv_nonzero(const u32 val[8], u32 inv[8], u32* scan,
 __device__ __constant__ u64 d_base_st[25];
 __device__ __constant__ int d_base_pt;
 __device__ __constant__ u64 d_tx0, d_tx1;
+// nonce-fan (exact): precompute the SHAKE sponge state after absorbing the low
+// d_fan_bits tail bits for all 2^d_fan_bits prefixes, so each nonce only absorbs
+// its high (48-d_fan_bits) tail bits. Table entry = 25 state words + pt (26 u64).
+__device__ u64* d_prefix_table;
+__device__ __constant__ int d_fan_bits;
 
 __device__ void feed_x_op_dev(u64 st[25], int& pt, u64 q){
     uint8_t* sb=(uint8_t*)st; const int rate=136;
@@ -527,12 +532,40 @@ __device__ void feed_x_op_dev(u64 st[25], int& pt, u64 q){
     for(int r=0;r<3;r++) for(int b=0;b<8;b++){ sb[pt]^=(uint8_t)(NO>>(b*8)); if(++pt==rate){keccakf(st);pt=0;} }
 }
 
+// Absorb the 96-op nonce tail into the sponge (pre-finalize). With nonce-fan on,
+// load the precomputed prefix for the low d_fan_bits bits, then absorb only the
+// high bits. Byte-identical to the full absorb -- the candidate set is unchanged.
+__device__ __forceinline__ void nonce_absorb(u64 st[25], int& pt, u64 nonce){
+    int K = d_fan_bits;
+    if(K > 0 && d_prefix_table){
+        const u64* e = &d_prefix_table[(nonce & ((1ull<<K)-1)) * 26];
+        for(int i=0;i<25;i++) st[i]=e[i];
+        pt = (int)e[25];
+        for(int i=K;i<48;i++){ u64 q=((nonce>>i)&1)?d_tx1:d_tx0; feed_x_op_dev(st,pt,q); feed_x_op_dev(st,pt,q); }
+    } else {
+        for(int i=0;i<25;i++) st[i]=d_base_st[i];
+        pt = d_base_pt;
+        for(int i=0;i<48;i++){ u64 q=((nonce>>i)&1)?d_tx1:d_tx0; feed_x_op_dev(st,pt,q); feed_x_op_dev(st,pt,q); }
+    }
+}
+
+// Precompute the 2^K prefix states (one per low-K-bit value of the nonce).
+__global__ void build_prefix_table_kernel(u64* table, int K){
+    u64 total = 1ull << K;
+    for(u64 L = blockIdx.x*(u64)blockDim.x + threadIdx.x; L < total; L += gridDim.x*(u64)blockDim.x){
+        u64 st[25]; for(int i=0;i<25;i++) st[i]=d_base_st[i];
+        int pt = d_base_pt;
+        for(int i=0;i<K;i++){ u64 q=((L>>i)&1)?d_tx1:d_tx0; feed_x_op_dev(st,pt,q); feed_x_op_dev(st,pt,q); }
+        u64* e=&table[L*26];
+        for(int i=0;i<25;i++) e[i]=st[i];
+        e[25]=(u64)pt;
+    }
+}
+
 // squeeze state: reads bytes on demand
 struct Squeezer { u64 st[25]; int pt; };
 __device__ void squeeze_init(Squeezer& s, const u64 base[25], int base_pt, u64 nonce, u64 tx0, u64 tx1){
-    for(int i=0;i<25;i++) s.st[i]=base[i];
-    int pt=base_pt;
-    for(int i=0;i<48;i++){ u64 q=((nonce>>i)&1)?tx1:tx0; feed_x_op_dev(s.st,pt,q); feed_x_op_dev(s.st,pt,q); }
+    int pt; nonce_absorb(s.st, pt, nonce);
     uint8_t* sb=(uint8_t*)s.st; sb[pt]^=0x1F; sb[135]^=0x80; keccakf(s.st);
     s.pt=0;
 }
@@ -614,9 +647,7 @@ __global__ void search_kernel2(u64 start, u64 count, u32* out_cnt, u64* out_list
     for(u64 nidx = blockIdx.x; nidx < count; nidx += gridDim.x){
         u64 nonce = start + nidx;
         if(t==0){
-            for(int i=0;i<25;i++) sq_st[i]=d_base_st[i];
-            int pt=d_base_pt;
-            for(int i=0;i<48;i++){ u64 q=((nonce>>i)&1)?d_tx1:d_tx0; feed_x_op_dev(sq_st,pt,q); feed_x_op_dev(sq_st,pt,q); }
+            int pt; nonce_absorb(sq_st, pt, nonce);
             unsigned char* sb=(unsigned char*)sq_st; sb[pt]^=0x1F; sb[135]^=0x80; keccakf(sq_st);
             sq_pt=0; hard_flag=0;
         }
@@ -661,9 +692,7 @@ __global__ void search_kernel2_batch(u64 start, u64 count, u32* out_cnt, u64* ou
     for(u64 nidx = blockIdx.x; nidx < count; nidx += gridDim.x){
         u64 nonce = start + nidx;
         if(t==0){
-            for(int i=0;i<25;i++) sq_st[i]=d_base_st[i];
-            int pt=d_base_pt;
-            for(int i=0;i<48;i++){ u64 q=((nonce>>i)&1)?d_tx1:d_tx0; feed_x_op_dev(sq_st,pt,q); feed_x_op_dev(sq_st,pt,q); }
+            int pt; nonce_absorb(sq_st, pt, nonce);
             unsigned char* sb=(unsigned char*)sq_st; sb[pt]^=0x1F; sb[135]^=0x80; keccakf(sq_st);
             sq_pt=0; hard_flag=0;
         }
@@ -851,6 +880,29 @@ int main(int argc, char** argv){
     }
     cudaMemcpyToSymbol(d_comb_large,&dcomb_large,sizeof(dcomb_large));
     cudaMemcpyToSymbol(d_comb_bits,&comb_bits,4);
+
+    // nonce-fan (exact): precompute prefix states for the low GPU_FAN_BITS tail bits.
+    int fan_bits = env_int("GPU_FAN_BITS", 0);
+    if(fan_bits < 0) fan_bits = 0;
+    if(fan_bits > 26) fan_bits = 26; // cap table size
+    u64* dprefix = 0;
+    if(fan_bits > 0){
+        size_t entries = (size_t)1 << fan_bits;
+        size_t fan_bytes = entries * 26 * sizeof(u64);
+        size_t free_b=0,total_b=0; cudaMemGetInfo(&free_b,&total_b);
+        printf("nonce-fan: K=%d table %.1f MiB, device free %.1f MiB\n",
+            fan_bits, fan_bytes/1048576.0, free_b/1048576.0);
+        cudaError_t ce = cudaMalloc(&dprefix, fan_bytes);
+        if(ce){ printf("fan malloc err %s\n",cudaGetErrorString(ce)); return 1; }
+        cudaEvent_t f0,f1; cudaEventCreate(&f0); cudaEventCreate(&f1); cudaEventRecord(f0);
+        build_prefix_table_kernel<<<4096,256>>>(dprefix, fan_bits);
+        ce = cudaDeviceSynchronize();
+        cudaEventRecord(f1); cudaEventSynchronize(f1); float fan_ms=0; cudaEventElapsedTime(&fan_ms,f0,f1);
+        if(ce){ printf("fan build err %s\n",cudaGetErrorString(ce)); return 1; }
+        printf("nonce-fan table built in %.2fs\n", fan_ms/1000.0);
+    }
+    cudaMemcpyToSymbol(d_prefix_table,&dprefix,sizeof(dprefix));
+    cudaMemcpyToSymbol(d_fan_bits,&fan_bits,4);
 
     if(do_probe){
         u32* dout; cudaMalloc(&dout,16*4);

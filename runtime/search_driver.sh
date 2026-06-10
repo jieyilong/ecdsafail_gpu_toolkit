@@ -13,6 +13,7 @@ GPU_COMB_BITS="${GPU_COMB_BITS:-8}"
 case "${GPU_LARGE_COMB:-0}" in 1|true|TRUE|yes|YES|on|ON) GPU_COMB_BITS=16;; esac
 GPU_GCD_MODE="${GPU_GCD_MODE:-${GCD_MODE:-full_first}}"
 GPU_WAVE="${GPU_WAVE:-${WAVE:-128}}"
+GPU_FAN_BITS="${GPU_FAN_BITS:-0}"
 [ -x "$BIN" ] || { echo "ERROR: kernel binary not found/executable: $BIN (run build)" >&2; exit 1; }
 [ -f "$STATE" ] || { echo "ERROR: state file not found: $STATE" >&2; exit 1; }
 if [ "$NGPU" = auto ] || [ -z "$NGPU" ]; then
@@ -31,7 +32,7 @@ for (( g=0; g<NGPU; g++ )); do
       c=$(( gcount-d < CHUNK ? gcount-d : CHUNK )); s=$(( gstart+d )); d=$(( d+CHUNK ))
       CUDA_VISIBLE_DEVICES="$g" GPU_STATE="$STATE" KERNEL2=1 BLOCKS="$BLOCKS" \
         GPU_BATCH_INV="$GPU_BATCH_INV" GPU_COMB_BITS="$GPU_COMB_BITS" \
-        GPU_GCD_MODE="$GPU_GCD_MODE" GPU_WAVE="$GPU_WAVE" \
+        GPU_GCD_MODE="$GPU_GCD_MODE" GPU_WAVE="$GPU_WAVE" GPU_FAN_BITS="$GPU_FAN_BITS" \
         "$BIN" "$s" "$c" 2>/dev/null | grep -oE "CLEAN nonce=[0-9]+" >> "$TMP/g$g"
     done
   ) &

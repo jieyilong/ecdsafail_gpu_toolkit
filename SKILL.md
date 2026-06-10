@@ -41,12 +41,22 @@ The script can be invoked as `./island.sh ...` or `bash island.sh ...`; recursiv
 resolve through the script directory.
 
 ## GPU search knobs
-The default search path is exact and conservative:
-`GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128`.
+Every improvement is an independent on/off knob, all defaulting to the exact/conservative
+baseline (`GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128 GPU_FAN_BITS=0`
+for the scan, `EVAL_FAST_REJECT=0` for the eval). They compose; benchmark combinations with
+`bench-gpu-knobs`. Two are new:
+
+- `GPU_FAN_BITS=K` — **nonce-fan**: precompute the SHAKE sponge for the low `K` tail bits so
+  each nonce only absorbs its high bits. Exact. Table is `2^K * 208 B`. Measured ~+1.5% on the
+  current SOTA base (`squeeze_init` is not the bottleneck there).
+- `EVAL_FAST_REJECT=1` — **eval early-exit**: stop the validation eval at the first failing
+  batch (clean/dirty verdict only). ~1.5× on dirty candidates. Lives in the challenge
+  `eval_circuit`; re-apply `patches/eval_fast_reject.diff` after `ecdsafail sync`.
+  `island.sh validate` sets it to `1` by default.
 
 For production island searches on a large NVIDIA GPU, prefer the fastest exact mode that has
 passed `test-gpu-knobs` on the current base. As of the RTX 5090 measurements, the best
-measured exact mode is:
+measured exact scan mode is:
 
 ```bash
 GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_WAVE=128 ./island.sh search s.bin <START> <N>
@@ -56,12 +66,12 @@ GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_WAVE=128 ./island.
 The `comb22` table is ~3.0 GiB and was only ~2.8% over `comb16`; if VRAM is constrained or
 process startup dominates, use `GPU_COMB_BITS=16`.
 
-Calibrate expectations: the absolute speedup of these exact knobs is **base-dependent**.
-`batch_inv` is ~1.5x on bases where nonces reject slowly (per-shot inversions dominate) but
-only a few percent on bases where nonces reject fast (the per-nonce SHAKE `squeeze_init`
-dominates). Native `sm_120` compilation was measured to give no benefit over PTX-JIT on a
-581-series driver. Always re-measure with `bench-gpu-knobs` on the actual base before assuming
-a number.
+Calibrate expectations: the absolute speedup of these exact knobs is **strongly
+base-dependent** (e.g. `GPU_BATCH_INV` is ~1.42x on slow-reject bases but only +1.2% on the
+current fast-reject frontier base). Native `sm_120` compilation was measured to give no
+benefit over PTX-JIT on a 581-series driver. See `docs/measured-speedups.md` for the full
+measured table, and always re-measure with `bench-gpu-knobs` on the actual base before
+assuming a number.
 
 Before trusting new GPU knob combinations on a fresh base or GPU, run:
 
