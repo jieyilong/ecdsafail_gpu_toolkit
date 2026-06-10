@@ -154,13 +154,14 @@ forward them to the GPU binary:
 ```bash
 GPU_BATCH_INV=1 GPU_WAVE=128 ./island.sh search s.bin 1 2000000
 GPU_COMB_BITS=16 ./island.sh search s.bin 1 2000000
+GPU_BATCH_INV=1 GPU_COMB_BITS=22 ./island.sh search s.bin 1 2000000
 GPU_GCD_MODE=trunc_first ./island.sh search s.bin 1 2000000
 ```
 
 | option | values | effect |
 |---|---|---|
 | `GPU_BATCH_INV` | `0`/`1` | `1` launches the cooperative block kernel that batch-inverts the two Jacobian `Z` values and the affine-add denominator across a wave. Exact candidate set. |
-| `GPU_COMB_BITS` | `8`/`16` | `16` builds a 64 MiB comb16 table on the GPU at process startup and halves scalar-mul table lookups/adds. Exact, but startup-heavy. |
+| `GPU_COMB_BITS` | `8`/`16`/`20`/`22` | Larger values build runtime fixed-base comb tables from the dumped 8-bit table. `16` is ~64 MiB, `20` is ~832 MiB, and `22` is ~3.0 GiB. Exact candidate set; larger tables trade VRAM and startup time for fewer scalar-mul additions. |
 | `GPU_GCD_MODE` | `full_first`, `trunc_first`, `trunc_only` | `full_first` is the current exact order. `trunc_first` is exact but checks width overflow before convergence. `trunc_only` is a noisy experimental prefilter that can emit extra false positives, so always validate. |
 | `GPU_WAVE` | `32`..`256` | CUDA block threads per nonce wave. Default `128`; values are rounded up to a warp multiple and capped at `256`. |
 
@@ -176,6 +177,12 @@ compares exact candidate sets over the requested range, including the combined e
 used by the benchmark. Use `ISLAND_CONFIG=/tmp/box.env` to point the same repo at a one-off
 remote GPU without editing the tracked `config.env`.
 
+Large comb tables are opt-in for the smoke test so normal runs do not allocate GiB of VRAM:
+
+```bash
+GPU_TEST_COMB_BITS="20 22" ./island.sh test-gpu-knobs "" 0 1024
+```
+
 To validate speedups after correctness passes, run the fixed-range throughput benchmark:
 
 ```bash
@@ -190,6 +197,17 @@ benchmark variants include isolated knobs (`trunc_first`, `wave64`, `wave256`,
 `all_exact`). Use `GPU_BENCH_SKIP_INSTALL=1` or `GPU_BENCH_SKIP_BUILD=1` when the Rust
 helpers or CUDA binary are already fresh.
 
+Benchmark large comb tables explicitly:
+
+```bash
+GPU_BENCH_COMB_BITS="20 22" GPU_BENCH_RUNS=2 ./island.sh bench-gpu-knobs "" 0 32768
+```
+
+On the RTX 5090 current SOTA base, the best measured exact mode was
+`GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_WAVE=128`: about `13,622 nonce/s` over `[0, 32768)`,
+roughly `2.8%` faster than `batch_comb16` on the same run. Treat this as a small tuning
+gain, not a new order-of-magnitude path.
+
 Interpretation caveats:
 
 - Run `test-gpu-knobs` first; speed is only meaningful for variants that preserve the
@@ -199,7 +217,7 @@ Interpretation caveats:
   run.
 - The benchmark measures single-process kernel throughput. Multi-GPU scheduling speed is
   still best checked with `./island.sh search`.
-- For `GPU_COMB_BITS=16`, the one-time table construction cost is outside the timed CUDA
+- For `GPU_COMB_BITS>8`, the one-time table construction cost is outside the timed CUDA
   event, so also check wall-clock behavior for very small chunks.
 
 ### Local vs remote GPU
@@ -209,6 +227,8 @@ working dir under the remote home (`~/.ecdsafail_island`, so it works for `ubunt
 any user) and run over SSH; the Rust steps (`dump`/`validate`, which need the challenge repo)
 stay on your laptop. You keep the repo + `ecdsafail` CLI local and rent GPUs only for the
 search. Arch is auto-detected on the remote, so you don't need to know the card's `sm_XX`.
+The script can be invoked as either `./island.sh ...` or `bash island.sh ...`; internal
+self-calls resolve through the script directory.
 
 **Long unattended searches:** an `init`+`search` over millions of nonces holds the SSH
 connection open for the duration. For multi-hour runs, wrap the node-side search in `tmux`/

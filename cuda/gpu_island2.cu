@@ -363,19 +363,30 @@ __device__ bool check_gcd_factor(const u32 factor[8]){
 // ================= comb + per-nonce derivation =================
 // comb table in global memory: 32*256 affine points, each 16 u32 (x[8],y[8]).
 __device__ u32* d_comb;  // [32*256*16]
-__device__ u32* d_comb16; // [16*65536*16], optional runtime-built table
+__device__ u32* d_comb_large; // optional runtime-built table for 16/20/22-bit windows
 __device__ __constant__ int d_comb_bits;
 __device__ __forceinline__ const u32* comb_x(int j,int d){ return &d_comb[((j*256+d)*16)]; }
 __device__ __forceinline__ const u32* comb_y(int j,int d){ return &d_comb[((j*256+d)*16)+8]; }
-__device__ __forceinline__ const u32* comb16_x(int j,int d){ return &d_comb16[((j*65536+d)*16)]; }
-__device__ __forceinline__ const u32* comb16_y(int j,int d){ return &d_comb16[((j*65536+d)*16)+8]; }
+__device__ __forceinline__ const u32* comb_large_x(int bits,int j,int d){ return &d_comb_large[(((u64)j*(1ull<<bits)+d)*16)]; }
+__device__ __forceinline__ const u32* comb_large_y(int bits,int j,int d){ return &d_comb_large[(((u64)j*(1ull<<bits)+d)*16)+8]; }
+
+__device__ __forceinline__ u32 scalar_window_bits(const u32 k[8], int bit, int width){
+    int word=bit>>5, shift=bit&31;
+    u64 val = (word<8) ? ((u64)k[word] >> shift) : 0;
+    if(shift && word+1<8) val |= ((u64)k[word+1] << (32-shift));
+    return (u32)(val & ((1u<<width)-1u));
+}
 
 __device__ void comb_mul_jac(const u32 k[8], Jac& acc){
     for(int i=0;i<8;i++){ acc.X[i]=0; acc.Y[i]=0; acc.Z[i]=0; }
-    if(d_comb_bits==16 && d_comb16!=NULL){
-        for(int j=0;j<16;j++){
-            u32 digit=(k[j>>1]>>((j&1)*16))&0xffffu;
-            if(digit){ Jac r; jacAddAff(acc, comb16_x(j,digit), comb16_y(j,digit), r); acc=r; }
+    int bits=d_comb_bits;
+    if(bits>8 && d_comb_large!=NULL){
+        int windows=(256+bits-1)/bits;
+        for(int j=0;j<windows;j++){
+            int bit=j*bits;
+            int width=(bit+bits<=256) ? bits : (256-bit);
+            u32 digit=scalar_window_bits(k,bit,width);
+            if(digit){ Jac r; jacAddAff(acc, comb_large_x(bits,j,digit), comb_large_y(bits,j,digit), r); acc=r; }
         }
         return;
     }
@@ -389,20 +400,38 @@ __device__ __forceinline__ void submod_p(const u32 a[8], const u32 b[8], u32 out
     cpy(out,a); submod(out,b);
 }
 
-__global__ void build_comb16_kernel(const u32* comb8, u32* comb16){
+__global__ void build_comb_large_kernel(const u32* comb8, u32* comb_large, int bits){
     u64 idx = blockIdx.x*(u64)blockDim.x + threadIdx.x;
-    const u64 total = 16ull*65536ull;
+    const u64 stride = 1ull << bits;
+    const int windows = (256 + bits - 1) / bits;
+    const u64 total = (u64)windows * stride;
     for(u64 i=idx; i<total; i += gridDim.x*(u64)blockDim.x){
-        int j=(int)(i>>16);
-        int d=(int)(i&0xffffu);
-        int lo=d&0xff, hi=d>>8;
-        const u32* lx=&comb8[(((2*j)*256+lo)*16)];
-        const u32* ly=lx+8;
-        const u32* hx=&comb8[(((2*j+1)*256+hi)*16)];
-        const u32* hy=hx+8;
+        int j=(int)(i / stride);
+        u32 d=(u32)(i & (stride - 1));
+        int start_bit=j*bits;
+        int width=(start_bit+bits<=256) ? bits : (256-start_bit);
+        if(width<bits && d>=(1u<<width)) continue;
+
+        Jac acc; setZero(acc.X); setZero(acc.Y); setZero(acc.Z);
+        int consumed=0;
+        while(consumed<width){
+            int bitpos=start_bit+consumed;
+            int byte_idx=bitpos>>3;
+            int byte_shift=bitpos&7;
+            int take=8-byte_shift;
+            if(take>width-consumed) take=width-consumed;
+            u32 part=(d>>consumed) & ((1u<<take)-1u);
+            u32 byte_digit=part<<byte_shift;
+            if(byte_digit){
+                const u32* px=&comb8[((byte_idx*256+(int)byte_digit)*16)];
+                const u32* py=px+8;
+                Jac r; jacAddAff(acc,px,py,r); acc=r;
+            }
+            consumed += take;
+        }
         u32 ox[8],oy[8];
-        affineAddAff(lx,ly,hx,hy,ox,oy);
-        u32* out=&comb16[i*16];
+        jacToAff(acc,ox,oy);
+        u32* out=&comb_large[i*16];
         for(int k=0;k<8;k++){ out[k]=ox[k]; out[8+k]=oy[k]; }
     }
 }
@@ -728,7 +757,7 @@ static int parse_gcd_mode(){
 }
 static int parse_comb_bits(){
     int bits=env_int("GPU_COMB_BITS", env_flag("GPU_LARGE_COMB") ? 16 : 8);
-    return bits==16 ? 16 : 8;
+    return (bits==16 || bits==20 || bits==22) ? bits : 8;
 }
 
 int main(int argc, char** argv){
@@ -774,17 +803,26 @@ int main(int argc, char** argv){
     u64 utx0=tx0,utx1=tx1; cudaMemcpyToSymbol(d_tx0,&utx0,8); cudaMemcpyToSymbol(d_tx1,&utx1,8);
     u32* dcomb; cudaMalloc(&dcomb, sizeof(comb)); cudaMemcpy(dcomb,comb,sizeof(comb),cudaMemcpyHostToDevice);
     cudaMemcpyToSymbol(d_comb,&dcomb,sizeof(dcomb));
-    u32* dcomb16=0;
-    if(comb_bits==16){
-        size_t comb16_bytes = (size_t)16*65536*16*sizeof(u32);
-        cudaError_t ce = cudaMalloc(&dcomb16, comb16_bytes);
-        if(ce){ printf("comb16 malloc err %s\n",cudaGetErrorString(ce)); return 1; }
-        build_comb16_kernel<<<4096,256>>>(dcomb,dcomb16);
+    u32* dcomb_large=0;
+    if(comb_bits>8){
+        size_t windows = (size_t)((256 + comb_bits - 1) / comb_bits);
+        size_t entries = windows * ((size_t)1 << comb_bits);
+        size_t comb_bytes = entries * 16 * sizeof(u32);
+        size_t free_b=0,total_b=0; cudaMemGetInfo(&free_b,&total_b);
+        printf("comb%d table request: %.1f MiB (%zu windows), device free %.1f MiB\n",
+            comb_bits, comb_bytes/1048576.0, windows, free_b/1048576.0);
+        cudaError_t ce = cudaMalloc(&dcomb_large, comb_bytes);
+        if(ce){ printf("comb%d malloc err %s\n",comb_bits,cudaGetErrorString(ce)); return 1; }
+        int build_blocks = env_int("GPU_COMB_BUILD_BLOCKS", 4096);
+        int build_threads = env_int("GPU_COMB_BUILD_THREADS", 256);
+        cudaEvent_t b0,b1; cudaEventCreate(&b0); cudaEventCreate(&b1); cudaEventRecord(b0);
+        build_comb_large_kernel<<<build_blocks,build_threads>>>(dcomb,dcomb_large,comb_bits);
         ce = cudaDeviceSynchronize();
-        if(ce){ printf("comb16 build err %s\n",cudaGetErrorString(ce)); return 1; }
-        printf("comb16 table built: %.1f MiB\n", comb16_bytes/1048576.0);
+        cudaEventRecord(b1); cudaEventSynchronize(b1); float build_ms=0; cudaEventElapsedTime(&build_ms,b0,b1);
+        if(ce){ printf("comb%d build err %s\n",comb_bits,cudaGetErrorString(ce)); return 1; }
+        printf("comb%d table built: %.1f MiB in %.2fs\n", comb_bits, comb_bytes/1048576.0, build_ms/1000.0);
     }
-    cudaMemcpyToSymbol(d_comb16,&dcomb16,sizeof(dcomb16));
+    cudaMemcpyToSymbol(d_comb_large,&dcomb_large,sizeof(dcomb_large));
     cudaMemcpyToSymbol(d_comb_bits,&comb_bits,4);
 
     if(do_probe){

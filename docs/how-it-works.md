@@ -51,8 +51,8 @@ width-envelope overflow or non-convergence — the dominant source of "hard" inp
   factor `c = ox - rx`. This is an exact circuit-structure prefilter, not a heuristic: it
   preserves the clean nonce set but avoids a costly field inversion on many dirty shots.
 - Experimental knobs can be enabled per run without changing the baseline: `GPU_BATCH_INV=1`
-  uses a cooperative block kernel with batch inversions, `GPU_COMB_BITS=16` builds a larger
-  runtime comb table, `GPU_GCD_MODE=trunc_first` changes exact GCD check order, and
+  uses a cooperative block kernel with batch inversions, `GPU_COMB_BITS=16/20/22` builds
+  larger runtime comb tables, `GPU_GCD_MODE=trunc_first` changes exact GCD check order, and
   `GPU_WAVE` tunes the threads per nonce wave. `GPU_GCD_MODE=trunc_only` is intentionally
   noisy and must be followed by normal validation.
 

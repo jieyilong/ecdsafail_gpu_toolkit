@@ -4,6 +4,74 @@ This file records not only what changed, but also why we made the change, what s
 we expect, and what still needs to be validated. For future work, add an entry whenever a
 change affects search behavior, performance assumptions, correctness risk, or workflow.
 
+## 2026-06-10 - Large comb VRAM tradeoff and shell self-call fix
+
+Branch: `quick_filtering`
+
+### Summary
+
+Added opt-in `GPU_COMB_BITS=20` and `GPU_COMB_BITS=22` modes to test whether spare VRAM on
+large GPUs can buy down scalar-multiplication compute, and fixed `island.sh` recursive
+self-calls so the script works when invoked as either `./island.sh ...` or
+`bash island.sh ...`.
+
+### Rationale
+
+`nvidia-smi` showed low VRAM capacity usage, so the natural experiment was to spend memory
+on larger fixed-base tables. The existing `comb16` table already showed that this path is
+exact and composable with `GPU_BATCH_INV=1`; `comb20` and `comb22` test the next two
+reasonable points before memory traffic and table size become likely bottlenecks.
+
+The self-call fix came from review: several commands invoke `island.sh` recursively. Using
+`"$0"` breaks when the user runs `bash island.sh ...` because `$0` may not be an executable
+path on `PATH`. Resolving `SELF="$HERE/island.sh"` and invoking `bash "$SELF"` makes both
+entry styles reliable.
+
+### Main Changes
+
+- Replaced the hard-coded `comb16` device table path with a generic runtime-built large
+  comb table for explicit `GPU_COMB_BITS=16`, `20`, or `22`.
+- Added arbitrary-window scalar digit extraction and a generic table-builder kernel that
+  composes entries from the dumped 8-bit comb table.
+- Added opt-in large-comb coverage to the correctness and benchmark harnesses:
+  `GPU_TEST_COMB_BITS="20 22"` and `GPU_BENCH_COMB_BITS="20 22"`.
+- Printed large-comb table build time in benchmark runs so kernel throughput is not
+  confused with wall-clock startup cost.
+- Fixed `island.sh` self-invocation by routing recursive calls through `bash "$SELF"`.
+- Updated `README.md`, `docs/kernel-notes.md`, `docs/how-it-works.md`, and
+  `docs/theory-knobs.md` with the new knob values, memory tradeoffs, and measured result.
+
+### Expected Impact
+
+No circuit-score change. The search-speed effect is real but small: larger comb tables
+reduce scalar-mul mixed additions, but after batch inversion the kernel is no longer
+dominated solely by comb work. On the RTX 5090, `batch_comb22` is the fastest exact mode
+measured so far, but only by a few percent over `batch_comb16`.
+
+### Validation Status
+
+- `bash -n island.sh` passed.
+- `git diff --check` passed.
+- Remote CUDA build passed on the RTX 5090 machine, still using CUDA 11.5 PTX fallback to
+  `sm_120`.
+- Correctness passed on current base `f6f9536`, baked nonce `1000005782829`:
+  - `GPU_TEST_COMB_BITS="20"` over dirty range `[0, 256)`;
+  - `GPU_TEST_COMB_BITS="22"` over dirty range `[0, 64)`;
+  - `GPU_TEST_COMB_BITS="20 22"` over candidate-bearing range
+    `[1000005782824, 1000005782840)`, where baseline candidates = 1.
+- Speed benchmark on the RTX 5090 over `[0, 32768)` with two measured repeats:
+
+```text
+variant        avg_nonce_s   speedup_vs_baseline
+baseline              8508    1.000x
+batch_comb16         13245    1.557x
+batch_comb20         13498    1.587x
+batch_comb22         13622    1.601x
+```
+
+`batch_comb22` was about `2.8%` faster than `batch_comb16` on this longer run. Table build
+time was about `0.10s` for `comb20` and `0.37s` for `comb22` on the RTX 5090.
+
 ## 2026-06-09 - GPU knob throughput benchmark
 
 Branch: `quick_filtering`

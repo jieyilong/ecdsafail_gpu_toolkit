@@ -15,8 +15,8 @@ Result (validated bit-exact: 431581 → CLEAN, agrees with serial):
 2 GPUs ≈ 3400 nonce/s → a ~1/1M island ≈ 5 min (was 12+ hr).
 Runtime knobs now keep this path as the baseline while letting experiments A/B against it:
 `GPU_WAVE` changes the block size, `GPU_BATCH_INV=1` launches a cooperative batch-inversion
-kernel, `GPU_COMB_BITS=16` builds a larger runtime comb table, and `GPU_GCD_MODE` controls
-the GCD check order.
+kernel, `GPU_COMB_BITS=16/20/22` builds larger runtime comb tables, and `GPU_GCD_MODE`
+controls the GCD check order.
 
 ## UPDATE: dx-first quick filter
 Point addition gives the dialog-GCD two factors:
@@ -41,9 +41,11 @@ GPU_BATCH_INV=0 GPU_COMB_BITS=8 GPU_GCD_MODE=full_first GPU_WAVE=128
 - `GPU_BATCH_INV=1` runs `search_kernel2_batch`, where every block batch-inverts the two
   Jacobian `Z` values and the affine-add denominator across the current wave. This is exact
   and shares one Fermat inversion per batch instead of one per lane.
-- `GPU_COMB_BITS=16` builds a 16x65536 comb table from the dumped 32x256 table at process
-  startup. The table is 64 MiB and halves the scalar-mul table-add loop from 32 windows to
-  16 windows. It is exact, but repeated small chunks pay repeated build cost.
+- `GPU_COMB_BITS=16/20/22` builds a larger fixed-base comb table from the dumped 32x256
+  table at process startup. The tables are about 64 MiB, 832 MiB, and 3.0 GiB respectively.
+  They are exact and reduce the scalar-mul table-add loop from 32 windows to 16, 13, or 12
+  windows. Measured RTX 5090 gains beyond `comb16` are modest: `batch_comb22` was about
+  2.8% faster than `batch_comb16` over a 32,768-nonce slice on the current SOTA base.
 - `GPU_GCD_MODE=trunc_first` is exact and checks the truncated width envelope before the
   full convergence counter. It should help when width overflows dominate failures.
   `GPU_GCD_MODE=trunc_only` skips the convergence counter and is intentionally noisy:

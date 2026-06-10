@@ -152,7 +152,7 @@ The expected gain depends on whether the saved inversions dominate the added cos
 
 That is why this is behind `GPU_BATCH_INV=1` instead of replacing the baseline immediately.
 
-## `GPU_COMB_BITS=16`: Larger Scalar-Multiplication Table
+## `GPU_COMB_BITS=16/20/22`: Larger Scalar-Multiplication Tables
 
 Scalar multiplication by the base point is done with a fixed-window comb table. The default
 table uses 8-bit digits:
@@ -175,16 +175,22 @@ k * G = table16[0][e0] + table16[1][e1] + ... + table16[15][e15]
 The loop length drops from 32 windows to 16 windows. The tradeoff is table size:
 
 ```text
-8-bit table:  32 * 256   affine points
-16-bit table: 16 * 65536 affine points
+8-bit table:  32 * 256      affine points
+16-bit table: 16 * 65536    affine points  (~64 MiB)
+20-bit table: 13 * 1048576  affine points  (~832 MiB)
+22-bit table: 12 * 4194304  affine points  (~3.0 GiB)
 ```
 
-Each affine point stores two 256-bit field elements, so the 16-bit table is about 64 MiB.
-The current implementation builds it at GPU process startup from the existing dumped 8-bit
-table. That keeps the state file backward-compatible, but small benchmark chunks pay the
-startup cost repeatedly.
+Each affine point stores two 256-bit field elements. The current implementation builds the
+larger table at GPU process startup from the existing dumped 8-bit table. That keeps the
+state file backward-compatible, but small benchmark chunks pay the startup cost repeatedly.
 
 This knob is exact: it changes how `k * G` is computed, not what point is computed.
+
+The measured return diminishes quickly. On the RTX 5090 current SOTA base, `batch_comb22`
+was about `2.8%` faster than `batch_comb16` over a 32,768-nonce slice. The larger tables
+are therefore useful as opt-in tuning knobs, but the main speedup still comes from batch
+inversion rather than VRAM alone.
 
 ## `GPU_GCD_MODE`: GCD Check Ordering
 

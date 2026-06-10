@@ -19,8 +19,10 @@
 #   CFG = a space-free env assignment, e.g. DIALOG_GCD_ACTIVE_ITERATIONS=258
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+SELF="$HERE/island.sh"
 CFGF="${ISLAND_CONFIG:-$HERE/config.env}"
 die(){ echo "ERROR: $*" >&2; exit 1; }
+truthy(){ case "${1:-}" in 1|true|TRUE|yes|YES|on|ON) return 0;; *) return 1;; esac; }
 
 # ---- config helpers (init-* don't require an existing config.env) ----
 cmd="${1:-help}"; shift || true
@@ -41,13 +43,13 @@ case "$cmd" in
 init-local)
   CH="${1:-}"; [ -n "$CH" ] || { [ -f "$CFGF" ] && CH="$(. "$CFGF"; echo "${CHALLENGE:-}")"; }
   [ -d "${CH:-}" ] || die "usage: init-local <path-to-ecdsafail-challenge>"
-  write_cfg local "" "$CH"; "$0" doctor; "$0" build; exit 0;;
+  write_cfg local "" "$CH"; bash "$SELF" doctor; bash "$SELF" build; exit 0;;
 init-remote)
   SSHCMD="${1:?usage: init-remote \"ssh -p PORT user@IP\" [CHALLENGE]}"
   CH="${2:-}"; [ -n "$CH" ] || { [ -f "$CFGF" ] && CH="$(. "$CFGF"; echo "${CHALLENGE:-}")"; }
   [ -d "${CH:-}" ] || die "give the challenge repo path: init-remote \"$SSHCMD\" <path-to-ecdsafail-challenge>"
   case "$SSHCMD" in ssh\ *) ;; *) SSHCMD="ssh $SSHCMD";; esac   # tolerate "-p PORT user@IP" without leading "ssh"
-  write_cfg remote "$SSHCMD" "$CH"; "$0" doctor; "$0" build; exit 0;;
+  write_cfg remote "$SSHCMD" "$CH"; bash "$SELF" doctor; bash "$SELF" build; exit 0;;
 esac
 
 [ -f "$CFGF" ] || die "not configured. Run: ./island.sh init-local <CHALLENGE>   OR   ./island.sh init-remote \"ssh -p PORT user@IP\" <CHALLENGE>"
@@ -70,7 +72,7 @@ tail_nonce(){
 }
 run_variant_search(){ # envs state start n chunk
   local envs="$1" state="$2" start="$3" n="$4" chunk="${5:-200000}"
-  env $envs "$0" search "$state" "$start" "$n" "$chunk" | sort -u
+  env $envs bash "$SELF" search "$state" "$start" "$n" "$chunk" | sort -u
 }
 require_variant_clean(){ # name envs state nonce
   local name="$1" envs="$2" state="$3" nonce="$4" out
@@ -117,7 +119,7 @@ run_raw_search(){ # envs state start n
 bench_variant(){ # name envs state start n summary_file
   local name="$1" envs="$2" state="$3" start="$4" n="$5" summary="$6"
   local warmups="${GPU_BENCH_WARMUPS:-1}" runs="${GPU_BENCH_RUNS:-3}"
-  local total=$((warmups + runs)) rates out rate secs clean i rate_file
+  local total=$((warmups + runs)) rates out rate secs clean build i rate_file
   rate_file="$(mktemp)"
   echo ">> bench: $name  env='$envs'"
   for ((i=1; i<=total; i++)); do
@@ -125,11 +127,13 @@ bench_variant(){ # name envs state start n summary_file
     rate=$(echo "$out" | sed -n 's/.*(\([0-9][0-9]*\) nonce\/s).*/\1/p' | tail -1)
     secs=$(echo "$out" | sed -n 's/.* in \([0-9.][0-9.]*\)s .*/\1/p' | tail -1)
     clean=$(echo "$out" | sed -n 's/.* clean=\([0-9][0-9]*\).*/\1/p' | tail -1)
+    build=$(echo "$out" | sed -n 's/.*table built: .* in \([0-9.][0-9.]*\)s.*/\1/p' | tail -1)
+    [ -n "$build" ] || build="-"
     [ -n "$rate" ] || { echo "$out"; rm -f "$rate_file"; die "could not parse benchmark rate for $name"; }
     if [ "$i" -le "$warmups" ]; then
-      printf "   warmup %d/%d: %s nonce/s in %ss clean=%s\n" "$i" "$warmups" "$rate" "${secs:-?}" "${clean:-?}"
+      printf "   warmup %d/%d: %s nonce/s in %ss clean=%s build=%ss\n" "$i" "$warmups" "$rate" "${secs:-?}" "${clean:-?}" "$build"
     else
-      printf "   run %d/%d: %s nonce/s in %ss clean=%s\n" "$((i-warmups))" "$runs" "$rate" "${secs:-?}" "${clean:-?}"
+      printf "   run %d/%d: %s nonce/s in %ss clean=%s build=%ss\n" "$((i-warmups))" "$runs" "$rate" "${secs:-?}" "${clean:-?}" "$build"
       echo "$rate" >> "$rate_file"
     fi
   done
@@ -205,18 +209,22 @@ test-gpu-knobs)
   echo ">> known clean DIALOG_TAIL_NONCE=$KNOWN"
   if [ "${GPU_TEST_SKIP_INSTALL:-0}" != 1 ]; then
     echo ">> [1/5] installing/rebuilding Rust helpers from current SOTA"
-    "$0" install >/dev/null
+    bash "$SELF" install >/dev/null
   else
     echo ">> [1/5] skipping Rust helper rebuild (GPU_TEST_SKIP_INSTALL=1)"
   fi
-  echo ">> [2/5] building CUDA kernel"
-  "$0" build
+  if [ "${GPU_TEST_SKIP_BUILD:-0}" != 1 ]; then
+    echo ">> [2/5] building CUDA kernel"
+    bash "$SELF" build
+  else
+    echo ">> [2/5] skipping CUDA rebuild (GPU_TEST_SKIP_BUILD=1)"
+  fi
   STATE="$(mktemp).bin"; BASE="$(mktemp)"
   trap 'rm -f "$STATE" "$BASE"' EXIT
   echo ">> [3/5] dumping GPU state"
-  "$0" dump "$CFG" "$STATE"
+  bash "$SELF" dump "$CFG" "$STATE"
   echo ">> [4/5] probing GPU Keccak derivation"
-  probe_out=$("$0" probe "$STATE")
+  probe_out=$(bash "$SELF" probe "$STATE")
   echo "$probe_out" | grep -E "options:|probe nonce|k1:|k2:"
   echo "$probe_out" | grep -q "k1:OK k2:OK" || die "GPU probe mismatch"
 
@@ -230,6 +238,12 @@ test-gpu-knobs)
   require_variant_clean "batch_wave256" "GPU_BATCH_INV=1 GPU_WAVE=256" "$STATE" "$KNOWN"
   require_variant_clean "batch_comb16" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_WAVE=128" "$STATE" "$KNOWN"
   require_variant_clean "all_exact" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_GCD_MODE=trunc_first GPU_WAVE=256" "$STATE" "$KNOWN"
+  TEST_COMB_BITS="${GPU_TEST_COMB_BITS:-}"
+  if [ -z "$TEST_COMB_BITS" ] && truthy "${GPU_TEST_LARGE_COMB:-0}"; then TEST_COMB_BITS="20 22"; fi
+  for bits in $TEST_COMB_BITS; do
+    require_variant_clean "comb$bits" "GPU_COMB_BITS=$bits GPU_WAVE=128" "$STATE" "$KNOWN"
+    require_variant_clean "batch_comb$bits" "GPU_BATCH_INV=1 GPU_COMB_BITS=$bits GPU_WAVE=128" "$STATE" "$KNOWN"
+  done
   require_variant_clean "trunc_only" "GPU_GCD_MODE=trunc_only GPU_WAVE=128" "$STATE" "$KNOWN"
 
   echo ">> [5/5] baseline range over [$START, $((START+N)))"
@@ -243,6 +257,10 @@ test-gpu-knobs)
   compare_variant_range "batch_wave256" "GPU_BATCH_INV=1 GPU_WAVE=256" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
   compare_variant_range "batch_comb16" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_WAVE=128" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
   compare_variant_range "all_exact" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_GCD_MODE=trunc_first GPU_WAVE=256" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
+  for bits in $TEST_COMB_BITS; do
+    compare_variant_range "comb$bits" "GPU_COMB_BITS=$bits GPU_WAVE=128" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
+    compare_variant_range "batch_comb$bits" "GPU_BATCH_INV=1 GPU_COMB_BITS=$bits GPU_WAVE=128" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
+  done
   check_subset "trunc_only" "GPU_GCD_MODE=trunc_only GPU_WAVE=128" "$STATE" "$START" "$N" "$CHUNK" "$BASE"
   echo "PASS: GPU knob correctness smoke passed for known nonce $KNOWN and range [$START, $((START+N)))"
   ;;
@@ -256,13 +274,13 @@ bench-gpu-knobs)
   echo ">> measured runs=${GPU_BENCH_RUNS:-3}, warmups=${GPU_BENCH_WARMUPS:-1}"
   if [ "${GPU_BENCH_SKIP_INSTALL:-0}" != 1 ]; then
     echo ">> [1/4] installing/rebuilding Rust helpers"
-    "$0" install >/dev/null
+    bash "$SELF" install >/dev/null
   else
     echo ">> [1/4] skipping Rust helper rebuild (GPU_BENCH_SKIP_INSTALL=1)"
   fi
   if [ "${GPU_BENCH_SKIP_BUILD:-0}" != 1 ]; then
     echo ">> [2/4] building CUDA kernel"
-    "$0" build
+    bash "$SELF" build
   else
     echo ">> [2/4] skipping CUDA rebuild (GPU_BENCH_SKIP_BUILD=1)"
   fi
@@ -270,7 +288,7 @@ bench-gpu-knobs)
   RAW_STATE="$STATE"
   trap 'rm -f "$STATE" "$SUMMARY"' EXIT
   echo ">> [3/4] dumping GPU state"
-  "$0" dump "$CFG" "$STATE"
+  bash "$SELF" dump "$CFG" "$STATE"
   if [ "$GPU" != local ]; then
     echo ">> uploading benchmark state once"
     rcp "$STATE" bench_state.bin
@@ -286,6 +304,12 @@ bench-gpu-knobs)
   bench_variant "batch_wave256" "GPU_BATCH_INV=1 GPU_WAVE=256" "$RAW_STATE" "$START" "$N" "$SUMMARY"
   bench_variant "batch_comb16" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_WAVE=128" "$RAW_STATE" "$START" "$N" "$SUMMARY"
   bench_variant "all_exact" "GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_GCD_MODE=trunc_first GPU_WAVE=256" "$RAW_STATE" "$START" "$N" "$SUMMARY"
+  BENCH_COMB_BITS="${GPU_BENCH_COMB_BITS:-}"
+  if [ -z "$BENCH_COMB_BITS" ] && truthy "${GPU_BENCH_LARGE_COMB:-0}"; then BENCH_COMB_BITS="20 22"; fi
+  for bits in $BENCH_COMB_BITS; do
+    bench_variant "comb$bits" "GPU_COMB_BITS=$bits GPU_WAVE=128" "$RAW_STATE" "$START" "$N" "$SUMMARY"
+    bench_variant "batch_comb$bits" "GPU_BATCH_INV=1 GPU_COMB_BITS=$bits GPU_WAVE=128" "$RAW_STATE" "$START" "$N" "$SUMMARY"
+  done
   echo
   echo "variant        avg_nonce_s   min       max       speedup_vs_baseline"
   awk '
@@ -324,15 +348,15 @@ bake)
 
 hunt)
   CFG="${1:?usage: hunt CFG START N}"; START="${2:?}"; N="${3:?}"
-  echo ">> [1/3] Toffoli cost:"; "$0" measure "$CFG"
+  echo ">> [1/3] Toffoli cost:"; bash "$SELF" measure "$CFG"
   echo ">> [2/3] dump + multi-GPU search ($N nonces from $START):"
-  STATE="$(mktemp).bin"; "$0" dump "$CFG" "$STATE" >/dev/null
-  cands=$("$0" search "$STATE" "$START" "$N" | grep -oE '[0-9]+' | sort -un)
+  STATE="$(mktemp).bin"; bash "$SELF" dump "$CFG" "$STATE" >/dev/null
+  cands=$(bash "$SELF" search "$STATE" "$START" "$N" | grep -oE '[0-9]+' | sort -un)
   echo "GCD-clean candidates: $(echo "$cands" | grep -c . || true)"
   echo ">> [3/3] validating (looking for 0/0/0):"; found=0
-  for n in $cands; do line=$("$0" validate "$CFG" "$n"); echo "$line"; case "$line" in CLEAN*) found=1;; esac; done
+  for n in $cands; do line=$(bash "$SELF" validate "$CFG" "$n"); echo "$line"; case "$line" in CLEAN*) found=1;; esac; done
   [ "$found" = 1 ] || echo "(no fully-clean island in this range — search a larger N)"
   ;;
 
-help|*) sed -n '2,20p' "$0" ;;
+help|*) sed -n '2,20p' "$SELF" ;;
 esac
