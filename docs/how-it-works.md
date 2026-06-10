@@ -52,7 +52,8 @@ width-envelope overflow or non-convergence — the dominant source of "hard" inp
   preserves the clean nonce set but avoids a costly field inversion on many dirty shots.
 - Experimental knobs can be enabled per run without changing the baseline: `GPU_BATCH_INV=1`
   uses a cooperative block kernel with batch inversions, `GPU_COMB_BITS=16/20/22` builds
-  larger runtime comb tables, `GPU_GCD_MODE=trunc_first` changes exact GCD check order, and
+  larger runtime comb tables, `GPU_GCD_MODE=trunc_first` and `GPU_GCD_MODE=single_pass` are
+  exact GCD-check variants (single_pass folds the two passes into one), and
   `GPU_WAVE` tunes the threads per nonce wave. `GPU_GCD_MODE=trunc_only` is intentionally
   noisy and must be followed by normal validation.
 

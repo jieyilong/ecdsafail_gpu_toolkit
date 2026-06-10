@@ -49,13 +49,19 @@ passed `test-gpu-knobs` on the current base. As of the RTX 5090 measurements, th
 measured exact mode is:
 
 ```bash
-GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_WAVE=128 ./island.sh search s.bin <START> <N>
+GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_WAVE=128 ./island.sh search s.bin <START> <N>
 ```
 
-This uses a ~3.0 GiB runtime fixed-base comb table and was only a small improvement over
-`GPU_BATCH_INV=1 GPU_COMB_BITS=16` (~2.8% on a 32,768-nonce slice), so treat it as a tuning
-knob rather than a breakthrough. If VRAM is constrained or process startup dominates, fall
-back to `GPU_COMB_BITS=16`.
+`GPU_GCD_MODE=single_pass` is exact (validated identical candidate set) and adds a free ~0-4%.
+The `comb22` table is ~3.0 GiB and was only ~2.8% over `comb16`; if VRAM is constrained or
+process startup dominates, use `GPU_COMB_BITS=16`.
+
+Calibrate expectations: the absolute speedup of these exact knobs is **base-dependent**.
+`batch_inv` is ~1.5x on bases where nonces reject slowly (per-shot inversions dominate) but
+only a few percent on bases where nonces reject fast (the per-nonce SHAKE `squeeze_init`
+dominates). Native `sm_120` compilation was measured to give no benefit over PTX-JIT on a
+581-series driver. Always re-measure with `bench-gpu-knobs` on the actual base before assuming
+a number.
 
 Before trusting new GPU knob combinations on a fresh base or GPU, run:
 

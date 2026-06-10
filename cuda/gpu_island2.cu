@@ -14,6 +14,7 @@ struct U256 { u32 v[8]; };
 #define GCD_MODE_FULL_FIRST 0
 #define GCD_MODE_TRUNC_FIRST 1
 #define GCD_MODE_TRUNC_ONLY 2
+#define GCD_MODE_SINGLE_PASS 3
 
 // p and c=2^256-p=2^32+977
 __device__ __constant__ u32 P[8]  = {0xFFFFFC2F,0xFFFFFFFE,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
@@ -345,8 +346,33 @@ __device__ bool check_gcd_factor_truncated(const u32 factor[8]){
     }
     return true;
 }
+// Single-pass exact check: one truncated GCD walk that detects BOTH rejection
+// modes at once -- width overflow (truncated_gcd_step) and non-convergence
+// (v never reaches 0 within active_iters). Replaces the full_first/trunc_first
+// pair of (full untruncated convergence pass + truncated overflow pass) with a
+// single pass.
+//
+// Exactness argument: within the width envelope the truncated step is identical
+// to the full step (truncation only drops bits that are zero / branches the
+// truncated comparator resolves the same way), which is exactly the support
+// condition under which the 2-pass filter is itself exact. So when truncated
+// reaches v==0 with no overflow at step k, the full GCD also converges at k
+// (=> clean); when it runs all active_iters with no overflow and no v==0, the
+// full GCD also failed to converge in active_iters (=> hard). Confirmed by the
+// candidate-set equality test vs the full_first baseline.
+__device__ bool check_gcd_factor_single(const u32 factor[8]){
+    u32 u[8],v[8]; cpy(u,d_P); cpy(v,factor);
+    for(int step=0; step<d_active_iters; step++){
+        if(truncated_gcd_step(u,v,step)) return false; // width overflow -> hard
+        if(isZero(v)) return true;                     // converged in envelope -> clean
+    }
+    return false; // ran active_iters with no overflow and no convergence -> hard
+}
 __device__ bool check_gcd_factor(const u32 factor[8]){
     if(isZero(factor)) return false;
+    if(d_gcd_mode==GCD_MODE_SINGLE_PASS){
+        return check_gcd_factor_single(factor);
+    }
     if(d_gcd_mode==GCD_MODE_TRUNC_FIRST){
         if(!check_gcd_factor_truncated(factor)) return false;
         int steps=full_gcd_steps_until_zero(d_P, factor, d_active_iters+1);
@@ -753,6 +779,7 @@ static int parse_gcd_mode(){
     if(!s || !*s) return GCD_MODE_FULL_FIRST;
     if(strcmp(s,"trunc_first")==0 || strcmp(s,"1")==0) return GCD_MODE_TRUNC_FIRST;
     if(strcmp(s,"trunc_only")==0 || strcmp(s,"2")==0) return GCD_MODE_TRUNC_ONLY;
+    if(strcmp(s,"single_pass")==0 || strcmp(s,"single")==0 || strcmp(s,"3")==0) return GCD_MODE_SINGLE_PASS;
     return GCD_MODE_FULL_FIRST;
 }
 static int parse_comb_bits(){

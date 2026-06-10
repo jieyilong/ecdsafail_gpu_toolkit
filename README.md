@@ -162,7 +162,7 @@ GPU_GCD_MODE=trunc_first ./island.sh search s.bin 1 2000000
 |---|---|---|
 | `GPU_BATCH_INV` | `0`/`1` | `1` launches the cooperative block kernel that batch-inverts the two Jacobian `Z` values and the affine-add denominator across a wave. Exact candidate set. |
 | `GPU_COMB_BITS` | `8`/`16`/`20`/`22` | Larger values build runtime fixed-base comb tables from the dumped 8-bit table. `16` is ~64 MiB, `20` is ~832 MiB, and `22` is ~3.0 GiB. Exact candidate set; larger tables trade VRAM and startup time for fewer scalar-mul additions. |
-| `GPU_GCD_MODE` | `full_first`, `trunc_first`, `trunc_only` | `full_first` is the current exact order. `trunc_first` is exact but checks width overflow before convergence. `trunc_only` is a noisy experimental prefilter that can emit extra false positives, so always validate. |
+| `GPU_GCD_MODE` | `full_first`, `trunc_first`, `single_pass`, `trunc_only` | `full_first` is the default exact order. `trunc_first` is exact but checks width overflow before convergence. `single_pass` is exact and folds the two GCD passes into one truncated walk with an added convergence check (free few-percent; see `docs/theory-knobs.md`). `trunc_only` is a noisy experimental prefilter that can emit extra false positives, so always validate. |
 | `GPU_WAVE` | `32`..`256` | CUDA block threads per nonce wave. Default `128`; values are rounded up to a warp multiple and capped at `256`. |
 
 Before trusting a new GPU build, run the integrated correctness smoke:
@@ -192,9 +192,9 @@ GPU_BENCH_RUNS=3 GPU_BENCH_WARMUPS=1 ./island.sh bench-gpu-knobs "" 0 16384
 This dumps the current SOTA state once, uploads it once in remote mode, warms up each
 variant, then runs the raw `gpu_island2` binary over the same nonce interval and prints
 average/min/max `nonce/s` plus speedup relative to the default baseline. The default
-benchmark variants include isolated knobs (`trunc_first`, `wave64`, `wave256`,
+benchmark variants include isolated knobs (`trunc_first`, `single_pass`, `wave64`, `wave256`,
 `batch_inv`, `comb16`) and combined exact paths (`batch_wave256`, `batch_comb16`,
-`all_exact`). Use `GPU_BENCH_SKIP_INSTALL=1` or `GPU_BENCH_SKIP_BUILD=1` when the Rust
+`batch_comb16_single`, `all_exact`). Use `GPU_BENCH_SKIP_INSTALL=1` or `GPU_BENCH_SKIP_BUILD=1` when the Rust
 helpers or CUDA binary are already fresh.
 
 Benchmark large comb tables explicitly:

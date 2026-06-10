@@ -224,6 +224,35 @@ exact replacement for the full filter. It can emit extra candidates that later f
 validation, so it should be treated as a noisy candidate generator, not as proof of
 cleanliness.
 
+`GPU_GCD_MODE=single_pass` is the *exact* version of `trunc_only`. The full filter rejects a
+factor for either of two reasons: (1) the untruncated GCD does not converge within
+`active_iters`, or (2) the truncated circuit-style walk overflows the width envelope. The
+baseline runs these as two separate passes (a full untruncated convergence walk plus the
+truncated overflow walk). `single_pass` folds them into one truncated walk that also tests
+"did `v` reach 0 within `active_iters`?":
+
+```text
+for step in 0..active_iters:
+    if truncated_step overflows -> reject (width)
+    if v == 0                   -> accept (converged)
+reject (ran out of steps without converging)
+```
+
+Why it is exact: inside the width envelope the truncated step is identical to the full step
+(truncation only drops bits that are zero on the support / the truncated comparator resolves
+the same branch) — which is precisely the support condition under which the two-pass filter
+is itself exact. So when the truncated walk reaches `v==0` with no overflow at step `k`, the
+full GCD also converges at `k`; when it runs all `active_iters` with neither, the full GCD
+also failed to converge in time. The candidate-set equality test vs the `full_first` baseline
+confirms this empirically.
+
+Performance note (measured, RTX 5090): the saving is **small** — about `+4%` stacked on
+`batch_inv`+`comb` and ~`0%` on its own. The reason is that the full convergence walk it
+removes is already nearly free: it early-exits as soon as `v==0`, and for the common hard
+factors the dominant cost is elsewhere (per-shot field arithmetic + SHAKE), not the second
+GCD pass. So `single_pass` is worth enabling (it is exact and never hurts), but it is not a
+large lever. See the changelog for the full A/B table.
+
 ## `GPU_WAVE`: Threads Per Nonce Wave
 
 `gpu_island2.cu` assigns one CUDA block to one nonce. The block processes the 9,024 shots
@@ -261,12 +290,29 @@ be benchmarked separately for baseline mode and batch-inversion mode.
 Test exact knobs before noisy knobs:
 
 1. default baseline;
-2. `GPU_GCD_MODE=trunc_first`;
+2. `GPU_GCD_MODE=trunc_first` and `GPU_GCD_MODE=single_pass` (both exact);
 3. `GPU_WAVE=64`, `128`, `256`;
 4. `GPU_BATCH_INV=1` with wave sweeps;
 5. `GPU_COMB_BITS=16` on sufficiently large chunks;
-6. combinations of the winners;
+6. combinations of the winners (e.g. `GPU_BATCH_INV=1 GPU_COMB_BITS=16 GPU_GCD_MODE=single_pass`);
 7. `GPU_GCD_MODE=trunc_only` only as an aggressive candidate-generation experiment.
 
 For every setting, first check a known-clean nonce, then benchmark a dirty range and compare
 both nonce/s and candidate count.
+
+## Measured Reality Check (what actually moves the needle)
+
+After A/B'ing all of the above on an RTX 5090, the practical takeaways are:
+
+- `GPU_BATCH_INV=1` is the only large exact lever, but its size is **base-dependent**: ~1.5x
+  on bases where nonces reject slowly (many per-shot inversions run) and only a few percent on
+  bases where nonces reject fast (the per-nonce SHAKE `squeeze_init`, ~35 Keccak-f, dominates
+  instead). `GPU_COMB_BITS` adds ~10%; `single_pass` adds ~0-4%.
+- Native `sm_120` compilation (CUDA 12.8) was measured to give **no** speedup over the
+  driver's PTX-JIT from `compute_80` on a 581-series driver — sometimes slightly slower. Keep
+  the PTX path; don't carry a second toolchain for it.
+- Per-shot field-arithmetic tricks (Montgomery multiply, fused single inversion, lazy
+  reduction) only help the slow-reject regime, where `GPU_BATCH_INV` already captures most of
+  the inversion cost. The genuinely under-optimized cost on fast-reject bases is the per-nonce
+  `squeeze_init`, but an exact incremental update across sequential nonces is blocked by the
+  tail feed order (low nonce bits are absorbed first), so it is left as an open problem.

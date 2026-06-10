@@ -4,6 +4,83 @@ This file records not only what changed, but also why we made the change, what s
 we expect, and what still needs to be validated. For future work, add an entry whenever a
 change affects search behavior, performance assumptions, correctness risk, or workflow.
 
+## 2026-06-10 - Single-pass exact GCD + measured limits of further exact speedups
+
+Branch: `exact-speedups` (not yet merged)
+
+### Summary
+
+Added `GPU_GCD_MODE=single_pass`, an exact one-walk GCD filter, and — more importantly —
+ran a careful A/B pass on the RTX 5090 that establishes the *realistic* ceiling for further
+exact-mode speedups. The headline result is sobering: beyond the existing `batch_inv`, the
+remaining exact levers are single-digit-percent, and several proposed ones give ~0.
+
+### Main Changes
+
+- New exact GCD mode `GPU_GCD_MODE=single_pass` (kernel + `parse_gcd_mode` + harness). It
+  folds the two baseline GCD passes (untruncated convergence walk + truncated overflow walk)
+  into one truncated walk that also tests `v==0` convergence. Exact by the same
+  within-envelope argument the two-pass filter already relies on; see `docs/theory-knobs.md`.
+- Wired `single_pass` and `batch_comb16_single` into `test-gpu-knobs` and `bench-gpu-knobs`.
+
+### Correctness (validated on RTX 5090, SOTA base f6f9536, island 1000005782829)
+
+`single_pass` and `batch_comb16_single` both find the known island AND produce the
+**bit-identical candidate set** as the `full_first` baseline over the candidate-bearing
+range. `PASS`.
+
+### Speedup (measured, the honest numbers)
+
+The gains are **strongly base-dependent**, which is the main finding. On the current SOTA
+base, `[0, 32768)`:
+
+```text
+variant              avg_nonce_s   speedup
+baseline                  10209    1.000x
+single_pass               10228    1.002x   (~0 on its own)
+batch_inv                 10333    1.012x   (only +1.2% here!)
+batch_comb16              11821    1.158x
+batch_comb16_single       12065    1.182x   (best exact)
+```
+
+On the base benchmarked the day before, the SAME `batch_inv` gave ~`1.5x` and
+`batch_comb16` ~`1.6x`. The difference is reject speed: when nonces reject after only a few
+shots (as on this base), the per-NONCE `squeeze_init` (~35 Keccak-f permutations, paid once
+regardless of early-exit) dominates, and the per-SHOT levers (`batch_inv`, `comb`,
+`single_pass`) barely run. When nonces reject slowly, the per-shot inversions dominate and
+`batch_inv` shines. So the real bottleneck shifts between SHAKE-init and field-arithmetic
+depending on the config.
+
+### Tricks evaluated and NOT implemented (with reasons)
+
+- **Native `sm_120` build (CUDA 12.8):** built and measured — **no benefit**. On this card's
+  driver (581.x) the PTX-JIT from `compute_80` matches or beats nvcc-12.8 native codegen
+  (baseline native 9185 vs PTX-JIT 10515 n/s). Not worth carrying a second toolchain.
+- **Montgomery multiplication, fused single inversion, lazy reduction:** these speed up
+  per-shot field arithmetic, which is NOT the bottleneck in the fast-reject (SHAKE-bound)
+  regime, and where it IS the bottleneck `batch_inv` already captured most of it. Predicted
+  ~1.05-1.1x for a large, correctness-risky refactor — declined on ROI grounds after
+  `single_pass` and native both underdelivered their estimates.
+- **Faster/incremental SHAKE squeeze_init:** this is the *right* lever for fast-reject bases
+  (squeeze_init dominates there), but an exact incremental update across sequential nonces is
+  blocked by the tail feed order (the nonce's low bits are fed first, so an increment changes
+  the first absorbed block and forces a full re-permute). Left as an open problem; any future
+  attempt must preserve the exact op-stream byte order or it changes the derived inputs.
+
+### Expected Impact
+
+`single_pass` is exact and never hurts, so it is safe to enable, but it is a ~0-4% lever, not
+a multiplier. The practical recommendation is unchanged: `batch_inv` + `comb16` remains the
+default-good exact mode; add `single_pass` for a free few-percent; expect the absolute win to
+vary with the base's reject dynamics.
+
+### Validation Status
+
+- `bash -n island.sh` passed; kernel compiles clean (PTX compute_80 JIT + native sm_120).
+- `test-gpu-knobs` PASS (candidate-set equality incl single_pass) on f6f9536.
+- `bench-gpu-knobs` table above, RTX 5090, 2 measured repeats.
+- NOT committed/pushed (per request).
+
 ## 2026-06-10 - Large comb VRAM tradeoff and shell self-call fix
 
 Branch: `quick_filtering`
