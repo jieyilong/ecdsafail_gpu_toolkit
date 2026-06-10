@@ -74,18 +74,28 @@ passed `test-gpu-knobs` on the current base. As of the RTX 5090 measurements, th
 measured exact scan mode is:
 
 ```bash
-GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_WAVE=128 ./island.sh search s.bin <START> <N>
+GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_FAN_BITS=22 GPU_WAVE=128 ./island.sh search s.bin <START> <N>
 ```
 
+(`GPU_FAN_BITS=22` is the fastest measured exact scan, ~13,676 n/s ≈ 1.42× baseline; its
+~872 MiB table builds in ~0.3s and amortizes at the default 500k chunk. Drop it only for
+tiny chunks ≪200k.)
+
 `GPU_GCD_MODE=single_pass` is a valid necessary filter (won't miss true islands) and adds a
-free ~0-4%, but it is **not** candidate-set-identical to `full_first` -- it checks *truncated*
-GCD convergence (what the circuit runs) and correctly rejects GCD false-positives `full_first`
-accepts. Validate it against the eval, not just a sparse candidate range. See
-`docs/measured-speedups.md` -> "Known issues".
-The `comb22` table is ~3.0 GiB and was only ~2.8% over `comb16`; if VRAM is constrained or
-process startup dominates, use `GPU_COMB_BITS=16`.
-For large chunks (roughly 500k nonces or more per process), test `GPU_FAN_BITS=20`; for normal
-200k chunks leave `GPU_FAN_BITS=0` because table build usually eats the small kernel win.
+free ~0-4% scan, but it is **not** candidate-set-identical to `full_first` -- it checks
+*truncated* GCD convergence (what the circuit runs), `full_first` checks untruncated. They
+disagree on borderline eval-dirty nonces: measured, `single_pass` is **looser** (it found
+`{46719, 644403}` where `full_first` found only `{644403}` -- a superset -- with `46719`
+`single_pass`-specific and eval-dirty). So `single_pass` passes a few more eval-dirty
+false-positives for the faster scan; use `full_first` for the strictest pre-filter. Validate
+against the eval, not a sparse candidate range. See `docs/measured-speedups.md`.
+The `comb22` table is ~3.0 GiB and was only ~2.8% over `comb16`, but its build is only ~0.33s
+(measured), so process startup does **not** dominate even at 200k chunks -- prefer `comb22`
+unless VRAM is constrained, then `GPU_COMB_BITS=16`.
+`GPU_FAN_BITS=22` (with the comb22 combo) is the fastest measured exact scan; its ~872 MiB
+table also builds in ~0.3s. For long/billion-scale runs use `CHUNK≈1000000` to amortize the
+~1s startup to ~1.3% (vs ~6% at 200k). The combo is exact and scale-invariant at any size, so
+chunk size is a throughput/memory knob only -- see "Per-process startup cost & chunk sizing".
 
 Calibrate expectations: the absolute speedup of these exact knobs is **strongly
 base-dependent** (e.g. `GPU_BATCH_INV` is ~1.42x on slow-reject bases but only +1.2% on the

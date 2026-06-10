@@ -65,9 +65,11 @@ nonce.
   `GPU_GCD_MODE=single_pass` folds the two GCD passes into one truncated walk that also
   detects `v==0` convergence (never runs the separate untruncated pass). It is a valid
   necessary filter (won't miss true islands) but is **not** candidate-set-identical to
-  `full_first`: it uses *truncated* convergence (the circuit's actual behavior), so it rejects
-  GCD false-positives `full_first` accepts. Measured gain ~0-4%. See measured-speedups.md
-  "Known issues".
+  `full_first`: it uses *truncated* convergence (the circuit's actual behavior), `full_first`
+  uses untruncated. Measured, `single_pass` is **looser** — on `[0,1M)` it found
+  `{46719,644403}` vs `full_first`'s `{644403}` (a superset; `46719` is `single_pass`-specific
+  and eval-dirty), i.e. it passes a few more eval-dirty false-positives for ~0-4% faster scan.
+  See measured-speedups.md "`single_pass` is a different (looser) necessary filter".
   `GPU_GCD_MODE=trunc_only` skips the convergence counter and is intentionally noisy:
   it can emit extra false positives, so it is for candidate-generation experiments only.
 - `GPU_WAVE` accepts 32..256 and is rounded up to a warp multiple. Batch mode uses more
@@ -84,10 +86,14 @@ nonce.
 Recommended exact search settings on the RTX 5090:
 
 ```text
-GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_WAVE=128 GPU_FAN_BITS=0
+GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=single_pass GPU_WAVE=128 GPU_FAN_BITS=22
 ```
 
-Use `GPU_FAN_BITS=20` only for larger chunks where its table-build cost is amortized.
+`GPU_FAN_BITS=22` is the fastest measured exact scan (~13,676 n/s, ~1.42× baseline); its
+~872 MiB table builds in ~0.3s and amortizes at the default 500k chunk. Drop it to `0` only
+for tiny chunks (≪200k). For long/billion-scale runs raise `CHUNK` to ~1M (~1.3% startup
+overhead). The combo is exact and scale-invariant at any size — chunk for throughput, not
+correctness.
 
 ## Lever value (exact CCX counts on b55ede3 base, peak 1309, tof 1,503,871):
 active257 −2989 (3.9M score win), active256 −5978 (8.1M), apply20 −516 (675k),

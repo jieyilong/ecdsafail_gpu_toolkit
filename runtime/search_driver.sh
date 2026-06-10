@@ -6,7 +6,7 @@
 #   args: START COUNT [CHUNK] [NGPU=auto]
 set -uo pipefail
 export PATH="$PATH:/usr/local/cuda/bin:/opt/cuda/bin"
-START="${1:?START}"; COUNT="${2:?COUNT}"; CHUNK="${3:-200000}"; NGPU="${4:-auto}"
+START="${1:?START}"; COUNT="${2:?COUNT}"; CHUNK="${3:-500000}"; NGPU="${4:-auto}"
 BIN="${GPU_ISLAND_BIN:?set GPU_ISLAND_BIN}"; STATE="${GPU_STATE_FILE:?set GPU_STATE_FILE}"; BLOCKS="${BLOCKS:-512}"
 GPU_BATCH_INV="${GPU_BATCH_INV:-${BATCH_INV:-0}}"
 GPU_COMB_BITS="${GPU_COMB_BITS:-8}"

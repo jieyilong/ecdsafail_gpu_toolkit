@@ -4,6 +4,55 @@ This file records not only what changed, but also why we made the change, what s
 we expect, and what still needs to be validated. For future work, add an entry whenever a
 change affects search behavior, performance assumptions, correctness risk, or workflow.
 
+## 2026-06-10 - Retract the "combo corruption" bug; measure startup & chunk sizing
+
+Branch: `speculative-and-fan`
+
+### Summary
+
+Root-caused the alleged "batch+large-comb combo corrupts its output over a very large single
+launch" issue. **It was a misdiagnosis — there is no corruption and no count-dependence.**
+Also measured the real per-process startup cost (it is ~1s even for the 3 GiB comb22 + fan22,
+not the heavy per-chunk tax previously assumed), and set a billion-scale chunk recommendation.
+
+### What we verified (RTX 5090)
+
+- **Deterministic:** the 6M combo run twice produced the identical 7 candidates both times
+  (and matched the original). Refutes the "non-deterministic race" hypothesis.
+- **Scale-invariant:** the *identical* combo finds offset 46719 at N=200k, 1M, and 6M; offset
+  644403 appears once N≥645k. Smaller candidate sets are clean subsets of larger ones.
+- **Mechanism:** grid-stride scan (`nidx += gridDim.x`), read-only comb/fan tables during the
+  scan, and a bounds-guarded output write (`if(pos<max_out)`) mean no mutable global state is
+  read per-nonce — a verdict *cannot* depend on launch size. The old A/B's "extra" candidates
+  were `single_pass` false-positives vs a `full_first` baseline at a different size (a config
+  mismatch). `compute-sanitizer` 11.5 and 12.8 both refuse to run on this 5090+581 driver
+  ("device not supported"), but no race exists to find.
+- **`single_pass` direction corrected:** it is *looser* than `full_first`, not stricter.
+  Measured on `[0,1M)`: `single_pass`={46719,644403}, `full_first`={644403}. Both are
+  necessary filters (neither misses a true island); `single_pass` passes a few more eval-dirty
+  false-positives for ~3% faster scan. (Earlier note claimed `single_pass` *rejects* 644403 —
+  backwards; both accept it.)
+
+### Measured startup (N=2000 wall, 3 reps, <0.03s spread)
+
+`comb8` 0.47s | `comb16`+batch 0.44s | `comb22`+batch 0.80s | `comb22`+batch+sp+fan22 1.10s.
+The 3 GiB comb22 build is ~0.33s; fan22 (~872 MiB) adds ~0.30s. Scan rate climbs
+9,655 → 13,676 n/s (1.42×) across that range.
+
+### Main Changes
+
+- Replaced the wrong "Known issues #1 (corruption)" in `docs/measured-speedups.md` with a
+  "Resolved: exact and scale-invariant" section + a new "Per-process startup cost & chunk
+  sizing" section (startup table, amortization table, billion-scale throughput table).
+- Corrected the `single_pass` vs `full_first` direction in `docs/measured-speedups.md`,
+  `README.md`, and `SKILL.md` (looser, superset, not stricter).
+- Updated the recommended exact scanner to include `GPU_FAN_BITS=22` (fastest measured) for
+  the now-default larger chunks.
+- **Bumped default `CHUNK` 200000 → 500000** in `island.sh` (search + hunt) and
+  `runtime/search_driver.sh` — the 200k cap only existed for the now-retracted corruption
+  fear; 500k cuts startup overhead from ~6% to ~2.7% with finer output granularity than 1M.
+  Recommend `CHUNK≈1000000` for long/billion-scale runs (~1.3% overhead).
+
 ## 2026-06-10 - Document previous-release-compatible baseline knobs
 
 Branch: `speculative-and-fan`
@@ -37,6 +86,14 @@ avoids comparing against the wrong baseline.
 ## 2026-06-10 - Large-range A/B: correctness findings + corrections
 
 Branch: `speculative-and-fan`
+
+> **⚠ PARTIALLY RETRACTED (see the "Retract the combo corruption bug" entry above).** The
+> "combo corrupts output over a very large single launch" claim below was a **misdiagnosis** —
+> the combo is exact and scale-invariant (verified: identical candidates at 200k/1M/6M, a 6M
+> run reproduces bit-for-bit, no mutable global state is read per-nonce). The `single_pass`
+> direction below is also **backwards**: it is *looser* than `full_first` (a superset), not
+> stricter — both accept `5000644403`; `single_pass` additionally accepts `46719`. The 1.40x
+> throughput number and the chunking change are still valid. Kept for history.
 
 A 6M-nonce A/B (baseline vs `batch_inv+comb22+single_pass+fan22`) measured **1.40x** scan
 throughput (9,794 -> 13,719 n/s) but also exposed two correctness issues the sparse

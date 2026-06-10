@@ -185,7 +185,7 @@ probe)
   ;;
 
 search)
-  STATE="${1:?usage: search STATE START N [CHUNK]}"; START="${2:?}"; N="${3:?}"; CHUNK="${4:-200000}"
+  STATE="${1:?usage: search STATE START N [CHUNK]}"; START="${2:?}"; N="${3:?}"; CHUNK="${4:-500000}"
   if [ "$GPU" = local ]; then
     [ -x "$HERE/gpu_island2" ] || die "run './island.sh build' first"
     GPU_ISLAND_BIN="$HERE/gpu_island2" GPU_STATE_FILE="$STATE" BLOCKS="$BLOCKS" \
@@ -357,13 +357,14 @@ bake)
   ;;
 
 hunt)
-  CFG="${1:?usage: hunt CFG START N [CHUNK]}"; START="${2:?}"; N="${3:?}"; CHUNK="${4:-200000}"
+  CFG="${1:?usage: hunt CFG START N [CHUNK]}"; START="${2:?}"; N="${3:?}"; CHUNK="${4:-500000}"
   echo ">> [1/3] Toffoli cost:"; bash "$SELF" measure "$CFG"
   echo ">> [2/3] dump + multi-GPU search ($N nonces from $START, chunk $CHUNK):"
   STATE="$(mktemp).bin"; bash "$SELF" dump "$CFG" "$STATE" >/dev/null
-  # CHUNK is bounded (default 200k) on purpose: the batch+large-comb combo corrupts its
-  # output over very large single kernel launches (>~2M). Chunking keeps results exact.
-  # You can raise CHUNK to amortize comb/fan table builds, but verify exactness first.
+  # CHUNK only affects throughput, not correctness: the batch+large-comb combo is exact and
+  # scale-invariant (verified — identical candidates at 200k/1M/6M; see measured-speedups.md
+  # "Per-process startup cost & chunk sizing"). Chunk size just amortizes the ~1s per-process
+  # table build (~6% at 200k, ~1.3% at 1M). Raise CHUNK to ~1M for long/billion-scale runs.
   cands=$(bash "$SELF" search "$STATE" "$START" "$N" "$CHUNK" | grep -oE '[0-9]+' | sort -un)
   echo "GCD-clean candidates: $(echo "$cands" | grep -c . || true)"
   echo ">> [3/3] validating (looking for 0/0/0):"; found=0

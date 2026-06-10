@@ -243,18 +243,25 @@ the width envelope the truncated step equals the full step, so single-pass conve
 equal `full_first`'s untruncated convergence. That is **not** generally true: a body-carry or
 comparator truncation can alter the GCD trajectory *without* triggering width overflow, so the
 *truncated* convergence (single_pass) and the *untruncated* convergence (`full_first`) diverge
-on some factors. A 6M-nonce A/B confirmed it — e.g. `5000644403` is `full_first`-clean but
-eval-dirty (`cls=1`), and `single_pass` correctly rejects it.
+on some factors. A 6M-nonce A/B confirmed they diverge — and measured the divergence makes
+single_pass **looser**: e.g. `5000046719` is `full_first`-hard (untruncated non-convergence)
+but `single_pass`-clean (truncated *does* converge), and it is eval-dirty (`cls=1`). (Both
+filters accept `5000644403`, a separate GCD-clean-but-eval-dirty false-positive.) So on this
+range single_pass accepts a superset of `full_first` — a few more eval-dirty false-positives,
+never fewer, and it still never misses a true island.
 
 So `single_pass` is **not** candidate-set-identical to `full_first` (the earlier sparse test
 just never hit a divergent nonce). It *is* still a valid necessary filter — a true island is
-truncated-GCD-clean on every shot, so single_pass accepts it (no missed islands) — and it is
-arguably *more* circuit-faithful than `full_first`, since the circuit runs the truncated GCD.
-Treat it as a different filter, and validate against the eval on a candidate-dense range.
+truncated-GCD-clean on every shot, so single_pass accepts it (no missed islands). Measured,
+the disagreement makes `single_pass` **looser**, not stricter: on `[0,1M)` it found
+`{46719,644403}` vs `full_first`'s `{644403}` (a superset; `46719` is `single_pass`-specific
+and eval-dirty). It is arguably *more* circuit-faithful (the circuit runs the truncated GCD),
+but the practical effect is a few extra eval-dirty false-positives to validate. Treat it as a
+different filter, and validate against the eval on a candidate-dense range.
 
 Performance note (measured, RTX 5090): the saving is **small** — about `+4%` stacked on
 `batch_inv`+`comb` and ~`0%` on its own (the convergence pass it removes already early-exits
-cheaply). See `docs/measured-speedups.md` for the full A/B and the "Known issues".
+cheaply). See `docs/measured-speedups.md` for the full A/B and the startup/chunk-sizing notes.
 
 ## `GPU_WAVE`: Threads Per Nonce Wave
 
