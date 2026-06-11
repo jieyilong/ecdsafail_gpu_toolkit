@@ -343,6 +343,7 @@ CHANGELOG.md           decision log for major search changes, rationale, expecte
 runtime/               scripts that run ON the GPU machine (local or scp'd to the remote):
   build_kernel.sh        auto-detect compute cap -> nvcc (native + PTX-JIT fallback)
   search_driver.sh       multi-GPU parallel chunked search (splits range across all GPUs)
+  remote_gpu_scan_loop.sh long-running per-node scan loop with status/candidate files
   doctor.sh              report GPUs / compute cap / nvcc
 cuda/
   gpu_island2.cu       PRODUCTION shot-parallel kernel (KERNEL2=1)
@@ -352,6 +353,7 @@ rust/
   count_tof.rs         static Toffoli (CCX) lever meter
   island_search.rs     CPU reference searcher (no-GPU fallback)
 docs/
+  1216-balanced.md     current 1216-qubit balanced scan/validation recipe
   how-it-works.md      the dialog-GCD circuit + island search, explained
   levers.md            the lever catalog + measured Toffoli costs
   kernel-notes.md      kernel design / throughput / validation notes
