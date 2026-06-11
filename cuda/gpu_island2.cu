@@ -15,6 +15,9 @@ struct U256 { u32 v[8]; };
 #define GCD_MODE_TRUNC_FIRST 1
 #define GCD_MODE_TRUNC_ONLY 2
 #define GCD_MODE_SINGLE_PASS 3
+#define TRUNC_OK 0
+#define TRUNC_HARD 1
+#define TRUNC_BODY_IGNORED 2
 
 // p and c=2^256-p=2^32+977
 __device__ __constant__ u32 P[8]  = {0xFFFFFC2F,0xFFFFFFFE,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
@@ -305,7 +308,7 @@ __device__ __forceinline__ void sub_low_window(u32 v[8], const u32 uu[8], int wi
 
 // cfg in constant memory
 __device__ __constant__ int d_odd_u, d_k2, d_k2f0, d_active_iters, d_compare_bits;
-__device__ __constant__ int d_gcd_mode;
+__device__ __constant__ int d_gcd_mode, d_ignore_body_trim;
 __device__ __constant__ int d_aw[402], d_cb[402], d_bw[402];
 
 __device__ void full_gcd_step(u32 u[8], u32 v[8]){
@@ -320,29 +323,43 @@ __device__ int full_gcd_steps_until_zero(const u32 uin[8], const u32 vin[8], int
     while(!isZero(v) && steps<limit){ full_gcd_step(u,v); steps++; }
     return steps;
 }
-// returns true if HARD (overflow); advances u,v one truncated step
-__device__ bool truncated_gcd_step(u32 u[8], u32 v[8], int step){
+// returns TRUNC_OK, TRUNC_HARD, or TRUNC_BODY_IGNORED; advances u,v one truncated step.
+__device__ int truncated_gcd_step(u32 u[8], u32 v[8], int step){
     int aw=d_aw[step];
-    if(u_bitlen(u)>aw || u_bitlen(v)>aw) return true; // WidthOverflow
+    if(u_bitlen(u)>aw || u_bitlen(v)>aw) return TRUNC_HARD; // WidthOverflow
     int cb=d_cb[step];
     bool trunc_gt=cmp_gt_truncated(u,v,aw,cb);
     bool b0=u_bit(v,0);
     bool b0b1=b0 && trunc_gt;
     if(b0b1){ if(d_odd_u) swap_active_except_bit0(u,v,aw); else u_swap(u,v); }
     if(b0){ int body_w=d_bw[step];
-        if(d_odd_u){ if(body_w<=1){ v[0]^=1u; } else { sub_low_window(v,u,body_w); v[0]^=1u; } }
-        else { sub_low_window(v,u,body_w); }
+        u32 full_v[8], trimmed_v[8], full_low[8], trimmed_low[8];
+        cpy(full_v,v); cpy(trimmed_v,v);
+        if(d_odd_u){
+            sub_low_window(full_v,u,aw); full_v[0]^=1u;
+            if(body_w<=1){ trimmed_v[0]^=1u; } else { sub_low_window(trimmed_v,u,body_w); trimmed_v[0]^=1u; }
+        } else {
+            sub_low_window(full_v,u,aw);
+            sub_low_window(trimmed_v,u,body_w);
+        }
+        u_low(full_v,full_low,aw); u_low(trimmed_v,trimmed_low,aw);
+        if(!eq(full_low,trimmed_low)){
+            if(d_ignore_body_trim) return TRUNC_BODY_IGNORED;
+        }
+        cpy(v,trimmed_v);
     }
     shift_right_active(v,aw);
     if(d_k2 && !d_k2f0){ if(!u_bit(v,0)) shift_right_active(v,aw); }
-    return false;
+    return TRUNC_OK;
 }
 // returns true if factor is CLEAN (Ok), false if hard
 __device__ __constant__ u32 d_P[8];
 __device__ bool check_gcd_factor_truncated(const u32 factor[8]){
     u32 u[8],v[8]; cpy(u,d_P); cpy(v,factor);
     for(int step=0; step<d_active_iters; step++){
-        if(truncated_gcd_step(u,v,step)) return false;
+        int r=truncated_gcd_step(u,v,step);
+        if(r==TRUNC_HARD) return false;
+        if(r==TRUNC_BODY_IGNORED) return true;
     }
     return true;
 }
@@ -363,7 +380,9 @@ __device__ bool check_gcd_factor_truncated(const u32 factor[8]){
 __device__ bool check_gcd_factor_single(const u32 factor[8]){
     u32 u[8],v[8]; cpy(u,d_P); cpy(v,factor);
     for(int step=0; step<d_active_iters; step++){
-        if(truncated_gcd_step(u,v,step)) return false; // width overflow -> hard
+        int r=truncated_gcd_step(u,v,step);
+        if(r==TRUNC_HARD) return false;                // width overflow -> hard
+        if(r==TRUNC_BODY_IGNORED) return true;         // relaxed body-trim prefilter
         if(isZero(v)) return true;                     // converged in envelope -> clean
     }
     return false; // ran active_iters with no overflow and no convergence -> hard
@@ -843,8 +862,9 @@ int main(int argc, char** argv){
     int wave = parse_wave();
     int gcd_mode = parse_gcd_mode();
     int comb_bits = parse_comb_bits();
-    printf("options: batch_inv=%u comb_bits=%d gcd_mode=%d wave=%d\n",
-        batch_inv?1u:0u, comb_bits, gcd_mode, wave);
+    int ignore_body_trim = env_flag("GPU_IGNORE_BODY_TRIM") || env_flag("REDSKY_TAIL_IGNORE_BODY_TRIM");
+    printf("options: batch_inv=%u comb_bits=%d gcd_mode=%d wave=%d ignore_body_trim=%d\n",
+        batch_inv?1u:0u, comb_bits, gcd_mode, wave, ignore_body_trim);
 
     // upload constants
     u32 Phost[8]={0xFFFFFC2F,0xFFFFFFFE,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
@@ -854,6 +874,7 @@ int main(int argc, char** argv){
     cudaMemcpyToSymbol(d_k2f0,&ik2f0,4); cudaMemcpyToSymbol(d_active_iters,&iai,4);
     cudaMemcpyToSymbol(d_compare_bits,&icb,4);
     cudaMemcpyToSymbol(d_gcd_mode,&gcd_mode,4);
+    cudaMemcpyToSymbol(d_ignore_body_trim,&ignore_body_trim,4);
     cudaMemcpyToSymbol(d_aw,aw,sizeof(aw)); cudaMemcpyToSymbol(d_cb,cb,sizeof(cb)); cudaMemcpyToSymbol(d_bw,bw,sizeof(bw));
     cudaMemcpyToSymbol(d_base_st,base_st,200); cudaMemcpyToSymbol(d_base_pt,&base_pt,4);
     u64 utx0=tx0,utx1=tx1; cudaMemcpyToSymbol(d_tx0,&utx0,8); cudaMemcpyToSymbol(d_tx1,&utx1,8);
