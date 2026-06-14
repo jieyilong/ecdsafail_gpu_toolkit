@@ -68,7 +68,7 @@ rsh(){ $REMOTE_SSH "$@"; }
 rcp(){ local p k; p="$(rport)"; k="$(rkey)"; scp ${p:+-P "$p"} ${k:+-i "$k"} -o StrictHostKeyChecking=no "$1" "$(rhost):$RDIR/$2" >/dev/null; }
 push_runtime(){ rsh "mkdir -p $RDIR"; rcp "$KSRC" gpu_island2.cu; for s in build_kernel search_driver doctor; do rcp "$HERE/runtime/$s.sh" "$s.sh"; done; }
 tail_nonce(){
-  grep -E 'set_default_env\("DIALOG_TAIL_NONCE", "[0-9]+"\)' "$CHALLENGE/src/point_add/mod.rs" \
+  grep -E '(set_default_env|std::env::set_var)\("DIALOG_TAIL_NONCE", "[0-9]+"\)' "$CHALLENGE/src/point_add/mod.rs" \
     | tail -1 | grep -oE '"[0-9]+"' | tr -d '"'
 }
 run_variant_search(){ # envs state start n chunk

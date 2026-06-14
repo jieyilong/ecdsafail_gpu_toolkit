@@ -5,7 +5,7 @@
 #   usage: build_kernel.sh SRC OUT [ARCH]    ARCH = auto | sm_XX | XX
 set -uo pipefail
 SRC="${1:?SRC}"; OUT="${2:?OUT}"; ARCH="${3:-auto}"
-export PATH="$PATH:/usr/local/cuda/bin:/opt/cuda/bin"
+export PATH="/usr/local/cuda/bin:/usr/local/cuda-12.8/bin:/usr/local/cuda-12.6/bin:/opt/cuda/bin:$PATH"
 command -v nvcc >/dev/null || { echo "ERROR: nvcc not on PATH. Install the CUDA toolkit (nvidia-cuda-toolkit)." >&2; exit 2; }
 if [ "$ARCH" = auto ] || [ -z "$ARCH" ]; then
   ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. \r')
