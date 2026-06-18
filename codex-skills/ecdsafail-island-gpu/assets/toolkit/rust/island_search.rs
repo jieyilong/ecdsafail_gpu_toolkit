@@ -438,14 +438,10 @@ fn main() {
         _ => panic!("reg0[1] not qubit"),
     };
 
-    // Sanity: the last 96 ops are the fixed nonce tail. Some frontier sources
-    // bake a nonzero default nonce, so the targets may be either tx0 or tx1.
+    // Sanity: the last 96 ops are the nonce-0 tail (all X on tx0).
     for op in &ops[n_ops - 96..] {
         assert_eq!(op.kind as u8, 6, "tail op not X");
-        assert!(
-            op.q_target.0 == tx0 || op.q_target.0 == tx1,
-            "tail op not on tx0/tx1 at nonce 0"
-        );
+        assert_eq!(op.q_target.0, tx0, "tail op not on tx0 at nonce 0");
     }
 
     // Hash domain + count + prefix (all ops EXCEPT the 96-op tail) once.

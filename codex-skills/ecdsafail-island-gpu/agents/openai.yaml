@@ -1,0 +1,4 @@
+interface:
+  display_name: "ECDSA Fail Island GPU"
+  short_description: "GPU island searches for ecdsa.fail"
+  default_prompt: "Use $ecdsafail-island-gpu to find and validate a clean island for DIALOG_GCD_ACTIVE_ITERATIONS=258."
