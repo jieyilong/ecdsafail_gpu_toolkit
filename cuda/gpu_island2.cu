@@ -15,6 +15,9 @@ struct U256 { u32 v[8]; };
 #define GCD_MODE_TRUNC_FIRST 1
 #define GCD_MODE_TRUNC_ONLY 2
 #define GCD_MODE_SINGLE_PASS 3
+#define FILTER_DIALOG_GCD 0
+#define FILTER_TRAILMIX_THIN 1
+#define SHRUNKEN_PZ_STEPS 530
 
 // p and c=2^256-p=2^32+977
 __device__ __constant__ u32 P[8]  = {0xFFFFFC2F,0xFFFFFFFE,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
@@ -306,7 +309,9 @@ __device__ __forceinline__ void sub_low_window(u32 v[8], const u32 uu[8], int wi
 // cfg in constant memory
 __device__ __constant__ int d_odd_u, d_k2, d_k2f0, d_active_iters, d_compare_bits;
 __device__ __constant__ int d_gcd_mode;
+__device__ __constant__ int d_filter_mode;
 __device__ __constant__ int d_aw[402], d_cb[402], d_bw[402];
+__device__ __constant__ int d_thin_w[SHRUNKEN_PZ_STEPS * 5];
 
 __device__ void full_gcd_step(u32 u[8], u32 v[8]){
     bool b0=u_bit(v,0); bool fgt=u_cmp(u,v)>0;
@@ -574,6 +579,147 @@ __device__ __forceinline__ void squeeze_bytes(Squeezer& s, uint8_t* out, int n){
     for(int i=0;i<n;i++){ if(s.pt==136){ keccakf(s.st); s.pt=0; } out[i]=sb[s.pt++]; }
 }
 
+// ================= TrailMix shrunken-PZ thin-schedule filter =================
+// Mirrors shrunken_pz_schedule::thin_factor_repairs_u256(value) == 0, using the
+// final per-step widths dumped by dump_gpu_state when TRAILMIX_GPU_THIN=1.
+__device__ __forceinline__ void z512(u32 a[16]){ for(int i=0;i<16;i++) a[i]=0; }
+__device__ __forceinline__ void cpy512(u32 d[16], const u32 s[16]){ for(int i=0;i<16;i++) d[i]=s[i]; }
+__device__ __forceinline__ bool isZero512(const u32 a[16]){ for(int i=0;i<16;i++) if(a[i]) return false; return true; }
+__device__ __forceinline__ bool isOne512(const u32 a[16]){ if(a[0]!=1) return false; for(int i=1;i<16;i++) if(a[i]) return false; return true; }
+__device__ __forceinline__ int cmp512(const u32 a[16], const u32 b[16]){
+    for(int i=15;i>=0;i--){ if(a[i]!=b[i]) return a[i]>b[i]?1:-1; }
+    return 0;
+}
+__device__ __forceinline__ int bitlen512(const u32 a[16]){
+    for(int i=15;i>=0;i--){ if(a[i]) return i*32 + (32 - __clz(a[i])); }
+    return 0;
+}
+__device__ __forceinline__ void add512(u32 a[16], const u32 b[16]){
+    u64 c=0;
+    for(int i=0;i<16;i++){ u64 t=(u64)a[i]+b[i]+c; a[i]=(u32)t; c=t>>32; }
+}
+__device__ __forceinline__ void sub512(u32 a[16], const u32 b[16]){
+    u64 br=0;
+    for(int i=0;i<16;i++){ u64 d=(u64)a[i]-b[i]-br; a[i]=(u32)d; br=(d>>63)&1; }
+}
+__device__ __forceinline__ void shl512(const u32 a[16], int n, u32 r[16]){
+    if(n>=512){ z512(r); return; }
+    int w=n>>5, b=n&31;
+    for(int i=15;i>=0;i--){
+        u64 lo=(i-w>=0)?a[i-w]:0;
+        u64 hi=(b && i-w-1>=0)?a[i-w-1]:0;
+        r[i]= b ? (u32)((lo<<b) | (hi>>(32-b))) : (u32)lo;
+    }
+}
+__device__ __forceinline__ void setP512(u32 a[16]){
+    a[0]=0xFFFFFC2Fu; a[1]=0xFFFFFFFEu;
+    for(int i=2;i<8;i++) a[i]=0xFFFFFFFFu;
+    for(int i=8;i<16;i++) a[i]=0;
+}
+__device__ __forceinline__ void setHalfP512(u32 a[16]){
+    // floor((2^256 - 2^32 - 977) / 2)
+    a[0]=0x7FFFFE17u; a[1]=0xFFFFFFFFu;
+    for(int i=2;i<8;i++) a[i]=0xFFFFFFFFu;
+    a[7]=0x7FFFFFFFu;
+    for(int i=8;i<16;i++) a[i]=0;
+}
+__device__ __forceinline__ void u256_to_512(const u32 a[8], u32 r[16]){
+    for(int i=0;i<8;i++) r[i]=a[i];
+    for(int i=8;i<16;i++) r[i]=0;
+}
+__device__ __forceinline__ bool q_zero(const u32 q[4]){ return !(q[0]|q[1]|q[2]|q[3]); }
+__device__ __forceinline__ int q_bitlen(const u32 q[4]){
+    for(int i=3;i>=0;i--){ if(q[i]) return i*32 + (32 - __clz(q[i])); }
+    return 0;
+}
+__device__ __forceinline__ int q_ctz(const u32 q[4]){
+    for(int i=0;i<4;i++){ if(q[i]) return i*32 + __ffs(q[i]) - 1; }
+    return 128;
+}
+__device__ __forceinline__ bool q_xor_bit(u32 q[4], int bit){
+    if(bit<0 || bit>=128) return false;
+    q[bit>>5] ^= 1u << (bit&31);
+    return true;
+}
+__device__ __forceinline__ void swap512(u32 a[16], u32 b[16]){
+    for(int i=0;i<16;i++){ u32 t=a[i]; a[i]=b[i]; b[i]=t; }
+}
+
+__device__ bool thin_factor_fits(const u32 factor[8]){
+    if(isZero(factor)) return false;
+
+    u32 p[16], half[16], x[16];
+    setP512(p);
+    setHalfP512(half);
+    u256_to_512(factor, x);
+    if(cmp512(x, half) > 0){
+        u32 px[16]; cpy512(px, p); sub512(px, x); cpy512(x, px);
+    }
+
+    u32 a[16], b[16], ca[16], cb[16], q[4];
+    cpy512(a, p);
+    cpy512(b, x);
+    z512(ca);
+    z512(cb); cb[0]=1;
+    q[0]=q[1]=q[2]=q[3]=0;
+
+    for(int step=0; step<SHRUNKEN_PZ_STEPS; step++){
+        int vals[5];
+        if(isZero512(a) && isOne512(b) && q_zero(q)){
+            vals[0]=0; vals[1]=1; vals[2]=bitlen512(ca); vals[3]=bitlen512(cb); vals[4]=1;
+        } else {
+            int wa=bitlen512(a), wb=bitlen512(b), wca=bitlen512(ca), wcb=bitlen512(cb), wq=q_bitlen(q);
+
+            if(cmp512(a,b) < 0 && !q_zero(q)){
+                int s2=q_ctz(q);
+                if(s2>=128) return false;
+                u32 cbs[16]; shl512(cb, s2, cbs);
+                int blcbs=bitlen512(cbs); if(blcbs>wcb) wcb=blcbs;
+                if(!q_xor_bit(q, s2)) return false;
+                add512(ca, cbs);
+                int blca=bitlen512(ca); if(blca>wca) wca=blca;
+                int blqv=q_bitlen(q); if(blqv>wq) wq=blqv;
+            }
+
+            if(cmp512(ca,cb) < 0){
+                int s=bitlen512(a) - bitlen512(b);
+                if(s>=0){
+                    u32 bsh[16]; shl512(b, s, bsh);
+                    if(cmp512(a,bsh) < 0) s--;
+                }
+                if(s>=0){
+                    if(s>=128) return false;
+                    u32 bsh[16]; shl512(b, s, bsh);
+                    int blbsh=bitlen512(bsh); if(blbsh>wb) wb=blbsh;
+                    if(cmp512(a,bsh) >= 0){
+                        sub512(a, bsh);
+                        if(!q_xor_bit(q, s)) return false;
+                        int blqv=q_bitlen(q); if(blqv>wq) wq=blqv;
+                    }
+                    int bla=bitlen512(a); if(bla>wa) wa=bla;
+                }
+            }
+
+            vals[0]=wa; vals[1]=wb; vals[2]=wca; vals[3]=wcb; vals[4]=wq;
+            if(q_zero(q) && !isZero512(a)){
+                swap512(a,b);
+                swap512(ca,cb);
+            }
+        }
+
+        for(int r=0;r<5;r++){
+            int need=vals[r] > 1 ? vals[r] : 1;
+            if(need > d_thin_w[step*5+r]) return false;
+        }
+    }
+    return true;
+}
+
+__device__ __forceinline__ bool factor_fits_filter(const u32 factor[8]){
+    if(d_filter_mode == FILTER_TRAILMIX_THIN) return thin_factor_fits(factor);
+    return check_gcd_factor(factor);
+}
+
 // returns true if nonce is CLEAN
 __device__ bool nonce_is_clean(u64 nonce){
     Squeezer sq; squeeze_init(sq, d_base_st, d_base_pt, nonce, d_tx0, d_tx1);
@@ -589,14 +735,14 @@ __device__ bool nonce_is_clean(u64 nonce){
         if(isZero(tx)&&isZero(ty)) continue;
         if(isZero(ox)&&isZero(oy)) continue;
         u32 dx[8]; submod_p(tx,ox,dx);
-        if(!check_gcd_factor(dx)) return false;
+        if(!factor_fits_filter(dx)) return false;
         u32 den[8]; submod_p(ox,tx,den);
         u32 deni[8]; invmod(den,deni);
         u32 num[8]; submod_p(oy,ty,num);
         u32 lambda[8]; mulmod(num,deni,lambda);
         u32 ex[8]; sqrmod(lambda,ex); submod(ex,tx); submod(ex,ox);
         u32 c[8]; submod_p(ox,ex,c);
-        if(!check_gcd_factor(c)) return false;
+        if(!factor_fits_filter(c)) return false;
     }
     return true;
 }
@@ -626,14 +772,14 @@ __device__ bool shot_is_hard(const u32 k1[8], const u32 k2[8]){
     // hard, reject this shot before paying the expensive affine-add denominator
     // inversion and rx/c construction for the second factor.
     u32 dx[8]; submod_p(tx,ox,dx);
-    if(!check_gcd_factor(dx)) return true;
+    if(!factor_fits_filter(dx)) return true;
     u32 den[8]; submod_p(ox,tx,den);
     u32 deni[8]; invmod(den,deni);
     u32 num[8]; submod_p(oy,ty,num);
     u32 lambda[8]; mulmod(num,deni,lambda);
     u32 ex[8]; sqrmod(lambda,ex); submod(ex,tx); submod(ex,ox);
     u32 c[8]; submod_p(ox,ex,c);
-    if(!check_gcd_factor(c)) return true;
+    if(!factor_fits_filter(c)) return true;
     return false;
 }
 
@@ -744,7 +890,7 @@ __global__ void search_kernel2_batch(u64 start, u64 count, u32* out_cnt, u64* ou
                 else if(isZero(ox)&&isZero(oy)) valid=false;
                 else {
                     u32 dx[8]; submod_p(tx,ox,dx);
-                    if(!check_gcd_factor(dx)) hard_flag=1;
+                    if(!factor_fits_filter(dx)) hard_flag=1;
                     else valid=true;
                 }
             }
@@ -759,7 +905,7 @@ __global__ void search_kernel2_batch(u64 start, u64 count, u32* out_cnt, u64* ou
                 u32 lambda[8]; mulmod(num,deni,lambda);
                 u32 ex[8]; sqrmod(lambda,ex); submod(ex,tx); submod(ex,ox);
                 u32 c[8]; submod_p(ox,ex,c);
-                if(!check_gcd_factor(c)) hard_flag=1;
+                if(!factor_fits_filter(c)) hard_flag=1;
             }
             __syncthreads();
         }
@@ -815,6 +961,15 @@ static int parse_comb_bits(){
     int bits=env_int("GPU_COMB_BITS", env_flag("GPU_LARGE_COMB") ? 16 : 8);
     return (bits==16 || bits==20 || bits==22) ? bits : 8;
 }
+static int parse_filter_mode(){
+    const char* s=getenv("GPU_FILTER");
+    if(!s || !*s) s=getenv("FILTER_MODE");
+    if((s && (strcmp(s,"trailmix")==0 || strcmp(s,"trailmix_thin")==0 || strcmp(s,"thin")==0)) ||
+       env_flag("GPU_TRAILMIX_THIN")){
+        return FILTER_TRAILMIX_THIN;
+    }
+    return FILTER_DIALOG_GCD;
+}
 
 int main(int argc, char** argv){
     const char* dump = getenv("GPU_STATE"); if(!dump) dump="/tmp/gpu_state.bin";
@@ -835,6 +990,23 @@ int main(int argc, char** argv){
     static u32 comb[32*256*16];
     fread(comb, 4, 32*256*16, f);
     u64 probe=rd64(f); u32 pk1[8],pk2[8]; fread(pk1,4,8,f); fread(pk2,4,8,f);
+    int thin_steps=0;
+    int thin_w[SHRUNKEN_PZ_STEPS * 5];
+    for(int i=0;i<SHRUNKEN_PZ_STEPS*5;i++) thin_w[i]=0;
+    u32 extra_magic=0;
+    if(fread(&extra_magic,4,1,f)==1){
+        if(extra_magic==0x54505a31u){
+            thin_steps=(int)rd32(f);
+            if(thin_steps!=SHRUNKEN_PZ_STEPS){
+                printf("bad TrailMix state steps %d\n", thin_steps);
+                return 1;
+            }
+            for(int i=0;i<SHRUNKEN_PZ_STEPS*5;i++) thin_w[i]=(int)rd32(f);
+        } else {
+            printf("unknown state extension magic %08x\n", extra_magic);
+            return 1;
+        }
+    }
     fclose(f);
     printf("loaded: n_ops=%llu tx0=%llu tx1=%llu base_pt=%u ai=%u cbits=%u odd_u=%u k2=%u\n",
         (unsigned long long)n_ops,(unsigned long long)tx0,(unsigned long long)tx1,base_pt,ai,cbits,odd_u,k2);
@@ -843,8 +1015,14 @@ int main(int argc, char** argv){
     int wave = parse_wave();
     int gcd_mode = parse_gcd_mode();
     int comb_bits = parse_comb_bits();
-    printf("options: batch_inv=%u comb_bits=%d gcd_mode=%d wave=%d\n",
-        batch_inv?1u:0u, comb_bits, gcd_mode, wave);
+    int filter_mode = parse_filter_mode();
+    if(filter_mode==FILTER_TRAILMIX_THIN && thin_steps!=SHRUNKEN_PZ_STEPS){
+        printf("GPU_FILTER=trailmix requires TRAILMIX_GPU_THIN=1 state extension\n");
+        return 1;
+    }
+    printf("options: batch_inv=%u comb_bits=%d gcd_mode=%d wave=%d filter=%s\n",
+        batch_inv?1u:0u, comb_bits, gcd_mode, wave,
+        filter_mode==FILTER_TRAILMIX_THIN ? "trailmix_thin" : "dialog_gcd");
 
     // upload constants
     u32 Phost[8]={0xFFFFFC2F,0xFFFFFFFE,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
@@ -854,6 +1032,8 @@ int main(int argc, char** argv){
     cudaMemcpyToSymbol(d_k2f0,&ik2f0,4); cudaMemcpyToSymbol(d_active_iters,&iai,4);
     cudaMemcpyToSymbol(d_compare_bits,&icb,4);
     cudaMemcpyToSymbol(d_gcd_mode,&gcd_mode,4);
+    cudaMemcpyToSymbol(d_filter_mode,&filter_mode,4);
+    if(filter_mode==FILTER_TRAILMIX_THIN) cudaMemcpyToSymbol(d_thin_w,thin_w,sizeof(thin_w));
     cudaMemcpyToSymbol(d_aw,aw,sizeof(aw)); cudaMemcpyToSymbol(d_cb,cb,sizeof(cb)); cudaMemcpyToSymbol(d_bw,bw,sizeof(bw));
     cudaMemcpyToSymbol(d_base_st,base_st,200); cudaMemcpyToSymbol(d_base_pt,&base_pt,4);
     u64 utx0=tx0,utx1=tx1; cudaMemcpyToSymbol(d_tx0,&utx0,8); cudaMemcpyToSymbol(d_tx1,&utx1,8);
