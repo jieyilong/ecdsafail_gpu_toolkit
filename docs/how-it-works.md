@@ -57,8 +57,13 @@ width-envelope overflow or non-convergence — the dominant source of "hard" inp
   and `GPU_FAN_BITS=K` (nonce-fan) precomputes the SHAKE prefix for the low `K` tail bits.
   `GPU_GCD_MODE=single_pass` and `GPU_GCD_MODE=trunc_only` are experimental filters and must
   not be used for production without a known-clean nonce check; `single_pass` missed the baked
-  clean nonce on the 1221-qubit SOTA. Separately, `EVAL_FAST_REJECT=1` speeds the *eval* phase
-  by stopping at the first failing batch. See `docs/measured-speedups.md` for measured gains.
+  clean nonce on the 1221-qubit SOTA. For TrailMix/shrunken-PZ scans, use
+  `GPU_TRAILMIX_WINDOW=1` with a TPZ3 state dump to enable the stricter schedule-window
+  checks: the GPU rejects factors that violate the circuit's exact per-step low-window
+  and shift bounds. This replaced the older `GPU_TRAILMIX_SLACK=1` width-margin idea,
+  which is only diagnostic because it can miss clean nonces such as q956 nonce `676055`.
+  Separately, `EVAL_FAST_REJECT=1` speeds the *eval* phase by stopping at the first failing
+  batch. See `docs/measured-speedups.md` for measured gains.
 
 ## The filter's blind spot (why you still validate)
 The pre-filter models the **GCD** (width + convergence) but **not the apply phase**. So a

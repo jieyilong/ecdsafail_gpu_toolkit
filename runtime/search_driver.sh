@@ -18,6 +18,7 @@ GPU_FAN_BITS="${GPU_FAN_BITS:-0}"
 GPU_FILTER="${GPU_FILTER:-dialog}"
 GPU_TRAILMIX_THIN="${GPU_TRAILMIX_THIN:-0}"
 GPU_TRAILMIX_SLACK="${GPU_TRAILMIX_SLACK:-0}"
+GPU_TRAILMIX_WINDOW="${GPU_TRAILMIX_WINDOW:-0}"
 GPU_STREAM_CANDIDATES="${GPU_STREAM_CANDIDATES:-1}"
 [ -x "$BIN" ] || { echo "ERROR: kernel binary not found/executable: $BIN (run build)" >&2; exit 1; }
 [ -f "$STATE" ] || { echo "ERROR: state file not found: $STATE" >&2; exit 1; }
@@ -39,7 +40,7 @@ for (( g=0; g<NGPU; g++ )); do
         GPU_BATCH_INV="$GPU_BATCH_INV" GPU_COMB_BITS="$GPU_COMB_BITS" \
         GPU_GCD_MODE="$GPU_GCD_MODE" GPU_WAVE="$GPU_WAVE" GPU_FAN_BITS="$GPU_FAN_BITS" \
         GPU_FILTER="$GPU_FILTER" GPU_TRAILMIX_THIN="$GPU_TRAILMIX_THIN" \
-        GPU_TRAILMIX_SLACK="$GPU_TRAILMIX_SLACK" \
+        GPU_TRAILMIX_SLACK="$GPU_TRAILMIX_SLACK" GPU_TRAILMIX_WINDOW="$GPU_TRAILMIX_WINDOW" \
         "$BIN" "$s" "$c" 2>/dev/null | grep -oE "CLEAN nonce=[0-9]+" || true)"
       if [ -n "$hits" ]; then
         printf '%s\n' "$hits" >> "$TMP/g$g"

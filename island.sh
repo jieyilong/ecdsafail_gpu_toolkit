@@ -57,7 +57,7 @@ esac
 . "$CFGF"
 : "${CHALLENGE:?set CHALLENGE in config.env}"; : "${GPU:=local}"; : "${REMOTE_SSH:=}"
 : "${REMOTE_DIR:=.ecdsafail_island}"; : "${NVCC_ARCH:=auto}"; : "${GPUS:=auto}"; : "${BLOCKS:=512}"
-: "${GPU_BATCH_INV:=0}"; : "${GPU_COMB_BITS:=8}"; : "${GPU_GCD_MODE:=full_first}"; : "${GPU_WAVE:=128}"; : "${GPU_FAN_BITS:=0}"; : "${GPU_FILTER:=dialog}"; : "${GPU_TRAILMIX_THIN:=0}"; : "${GPU_TRAILMIX_SLACK:=0}"; : "${GPU_STREAM_CANDIDATES:=1}"
+: "${GPU_BATCH_INV:=0}"; : "${GPU_COMB_BITS:=8}"; : "${GPU_GCD_MODE:=full_first}"; : "${GPU_WAVE:=128}"; : "${GPU_FAN_BITS:=0}"; : "${GPU_FILTER:=dialog}"; : "${GPU_TRAILMIX_THIN:=0}"; : "${GPU_TRAILMIX_SLACK:=0}"; : "${GPU_TRAILMIX_WINDOW:=0}"; : "${GPU_STREAM_CANDIDATES:=1}"
 BIN="$CHALLENGE/target/release"; KSRC="$HERE/cuda/gpu_island2.cu"; RDIR="$REMOTE_DIR"
 need_remote(){ [ -n "$REMOTE_SSH" ] || die "GPU=remote needs REMOTE_SSH (init-remote)"; }
 rhost(){ echo "$REMOTE_SSH" | grep -oE '[^ ]+@[^ ]+' | head -1; }
@@ -192,7 +192,7 @@ search)
       GPU_BATCH_INV="$GPU_BATCH_INV" GPU_COMB_BITS="$GPU_COMB_BITS" \
       GPU_GCD_MODE="$GPU_GCD_MODE" GPU_WAVE="$GPU_WAVE" GPU_FAN_BITS="$GPU_FAN_BITS" \
       GPU_FILTER="$GPU_FILTER" GPU_TRAILMIX_THIN="$GPU_TRAILMIX_THIN" \
-      GPU_TRAILMIX_SLACK="$GPU_TRAILMIX_SLACK" \
+      GPU_TRAILMIX_SLACK="$GPU_TRAILMIX_SLACK" GPU_TRAILMIX_WINDOW="$GPU_TRAILMIX_WINDOW" \
       GPU_STREAM_CANDIDATES="$GPU_STREAM_CANDIDATES" \
       bash "$HERE/runtime/search_driver.sh" "$START" "$N" "$CHUNK" "$GPUS"
   else
@@ -200,7 +200,7 @@ search)
     rcp "$HERE/runtime/search_driver.sh" search_driver.sh
     rsh "GPU_ISLAND_BIN=\$HOME/$RDIR/gpu_island2 GPU_STATE_FILE=\$HOME/$RDIR/state.bin BLOCKS=$BLOCKS \
          GPU_BATCH_INV=$GPU_BATCH_INV GPU_COMB_BITS=$GPU_COMB_BITS GPU_GCD_MODE=$GPU_GCD_MODE GPU_WAVE=$GPU_WAVE GPU_FAN_BITS=$GPU_FAN_BITS GPU_STREAM_CANDIDATES=$GPU_STREAM_CANDIDATES \
-         GPU_FILTER=$GPU_FILTER GPU_TRAILMIX_THIN=$GPU_TRAILMIX_THIN GPU_TRAILMIX_SLACK=$GPU_TRAILMIX_SLACK \
+         GPU_FILTER=$GPU_FILTER GPU_TRAILMIX_THIN=$GPU_TRAILMIX_THIN GPU_TRAILMIX_SLACK=$GPU_TRAILMIX_SLACK GPU_TRAILMIX_WINDOW=$GPU_TRAILMIX_WINDOW \
          bash \$HOME/$RDIR/search_driver.sh $START $N $CHUNK $GPUS"
   fi
   ;;

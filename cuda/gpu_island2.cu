@@ -311,8 +311,13 @@ __device__ __constant__ int d_odd_u, d_k2, d_k2f0, d_active_iters, d_compare_bit
 __device__ __constant__ int d_gcd_mode;
 __device__ __constant__ int d_filter_mode;
 __device__ __constant__ int d_trailmix_slack;
+__device__ __constant__ int d_trailmix_window;
 __device__ __constant__ int d_aw[402], d_cb[402], d_bw[402];
 __device__ __constant__ int d_thin_w[SHRUNKEN_PZ_STEPS * 5];
+__device__ __constant__ int d_thin_univ[SHRUNKEN_PZ_STEPS * 5];
+__device__ __constant__ int d_thin_lo[SHRUNKEN_PZ_STEPS * 5];
+__device__ __constant__ int d_thin_sdiv[SHRUNKEN_PZ_STEPS];
+__device__ __constant__ int d_thin_s2[SHRUNKEN_PZ_STEPS];
 
 __device__ void full_gcd_step(u32 u[8], u32 v[8]){
     bool b0=u_bit(v,0); bool fgt=u_cmp(u,v)>0;
@@ -666,7 +671,9 @@ __device__ bool thin_factor_fits(const u32 factor[8]){
 
     for(int step=0; step<SHRUNKEN_PZ_STEPS; step++){
         int vals[5];
+        bool terminal = false;
         if(isZero512(a) && isOne512(b) && q_zero(q)){
+            terminal = true;
             vals[0]=0; vals[1]=1; vals[2]=bitlen512(ca); vals[3]=bitlen512(cb); vals[4]=1;
         } else {
             int wa=bitlen512(a), wb=bitlen512(b), wca=bitlen512(ca), wcb=bitlen512(cb), wq=q_bitlen(q);
@@ -674,6 +681,7 @@ __device__ bool thin_factor_fits(const u32 factor[8]){
             if(cmp512(a,b) < 0 && !q_zero(q)){
                 int s2=q_ctz(q);
                 if(s2>=128) return false;
+                if(d_trailmix_window && s2 > d_thin_s2[step]) return false;
                 u32 cbs[16]; shl512(cb, s2, cbs);
                 int blcbs=bitlen512(cbs); if(blcbs>wcb) wcb=blcbs;
                 if(!q_xor_bit(q, s2)) return false;
@@ -689,6 +697,7 @@ __device__ bool thin_factor_fits(const u32 factor[8]){
                     if(cmp512(a,bsh) < 0) s--;
                 }
                 if(s>=0){
+                    if(d_trailmix_window && s > d_thin_sdiv[step]) return false;
                     if(s>=128) return false;
                     u32 bsh[16]; shl512(b, s, bsh);
                     int blbsh=bitlen512(bsh); if(blbsh>wb) wb=blbsh;
@@ -710,7 +719,166 @@ __device__ bool thin_factor_fits(const u32 factor[8]){
 
         for(int r=0;r<5;r++){
             int need=vals[r] > 1 ? vals[r] : 1;
-            if(need + d_trailmix_slack > d_thin_w[step*5+r]) return false;
+            if(d_trailmix_window && !terminal && need > 1 && need < d_thin_lo[step*5+r]) return false;
+            int req=need + (!terminal && need > 1 ? d_trailmix_slack : 0);
+            int universal=d_thin_univ[step*5+r];
+            if(req > universal) req = universal;
+            if(req > d_thin_w[step*5+r]) return false;
+        }
+    }
+    return true;
+}
+
+struct TrailMixDebugFail {
+    int found;
+    int shot;
+    int factor; // 0=dx, 1=qx_minus_rx
+    int step;
+    int reg;
+    int need;
+    int avail;
+    int slack;
+    int vals[5];
+};
+
+__device__ bool thin_factor_first_fail(
+    const u32 factor[8],
+    int shot,
+    int factor_label,
+    TrailMixDebugFail* out
+){
+    if(isZero(factor)){
+        if(out && !out->found){
+            out->found=1; out->shot=shot; out->factor=factor_label;
+            out->step=-1; out->reg=-1; out->need=0; out->avail=0; out->slack=d_trailmix_slack;
+            for(int i=0;i<5;i++) out->vals[i]=0;
+        }
+        return false;
+    }
+
+    u32 p[16], half[16], x[16];
+    setP512(p);
+    setHalfP512(half);
+    u256_to_512(factor, x);
+    if(cmp512(x, half) > 0){
+        u32 px[16]; cpy512(px, p); sub512(px, x); cpy512(x, px);
+    }
+
+    u32 a[16], b[16], ca[16], cb[16], q[4];
+    cpy512(a, p);
+    cpy512(b, x);
+    z512(ca);
+    z512(cb); cb[0]=1;
+    q[0]=q[1]=q[2]=q[3]=0;
+
+    for(int step=0; step<SHRUNKEN_PZ_STEPS; step++){
+        int vals[5];
+        bool terminal = false;
+        if(isZero512(a) && isOne512(b) && q_zero(q)){
+            terminal = true;
+            vals[0]=0; vals[1]=1; vals[2]=bitlen512(ca); vals[3]=bitlen512(cb); vals[4]=1;
+        } else {
+            int wa=bitlen512(a), wb=bitlen512(b), wca=bitlen512(ca), wcb=bitlen512(cb), wq=q_bitlen(q);
+
+            if(cmp512(a,b) < 0 && !q_zero(q)){
+                int s2=q_ctz(q);
+                if(s2>=128) return false;
+                if(d_trailmix_window && s2 > d_thin_s2[step]){
+                    if(out && !out->found){
+                        out->found=1;
+                        out->shot=shot;
+                        out->factor=factor_label;
+                        out->step=step;
+                        out->reg=-2;
+                        out->need=s2;
+                        out->avail=d_thin_s2[step];
+                        out->slack=-2;
+                        out->vals[0]=wa; out->vals[1]=wb; out->vals[2]=wca; out->vals[3]=wcb; out->vals[4]=wq;
+                    }
+                    return false;
+                }
+                u32 cbs[16]; shl512(cb, s2, cbs);
+                int blcbs=bitlen512(cbs); if(blcbs>wcb) wcb=blcbs;
+                if(!q_xor_bit(q, s2)) return false;
+                add512(ca, cbs);
+                int blca=bitlen512(ca); if(blca>wca) wca=blca;
+                int blqv=q_bitlen(q); if(blqv>wq) wq=blqv;
+            }
+
+            if(cmp512(ca,cb) < 0){
+                int s=bitlen512(a) - bitlen512(b);
+                if(s>=0){
+                    u32 bsh[16]; shl512(b, s, bsh);
+                    if(cmp512(a,bsh) < 0) s--;
+                }
+                if(s>=0){
+                    if(d_trailmix_window && s > d_thin_sdiv[step]){
+                        if(out && !out->found){
+                            out->found=1;
+                            out->shot=shot;
+                            out->factor=factor_label;
+                            out->step=step;
+                            out->reg=-3;
+                            out->need=s;
+                            out->avail=d_thin_sdiv[step];
+                            out->slack=-3;
+                            out->vals[0]=wa; out->vals[1]=wb; out->vals[2]=wca; out->vals[3]=wcb; out->vals[4]=wq;
+                        }
+                        return false;
+                    }
+                    if(s>=128) return false;
+                    u32 bsh[16]; shl512(b, s, bsh);
+                    int blbsh=bitlen512(bsh); if(blbsh>wb) wb=blbsh;
+                    if(cmp512(a,bsh) >= 0){
+                        sub512(a, bsh);
+                        if(!q_xor_bit(q, s)) return false;
+                        int blqv=q_bitlen(q); if(blqv>wq) wq=blqv;
+                    }
+                    int bla=bitlen512(a); if(bla>wa) wa=bla;
+                }
+            }
+
+            vals[0]=wa; vals[1]=wb; vals[2]=wca; vals[3]=wcb; vals[4]=wq;
+            if(q_zero(q) && !isZero512(a)){
+                swap512(a,b);
+                swap512(ca,cb);
+            }
+        }
+
+        for(int r=0;r<5;r++){
+            int need=vals[r] > 1 ? vals[r] : 1;
+            int avail=d_thin_w[step*5+r];
+            if(d_trailmix_window && !terminal && need > 1 && need < d_thin_lo[step*5+r]){
+                if(out && !out->found){
+                    out->found=1;
+                    out->shot=shot;
+                    out->factor=factor_label;
+                    out->step=step;
+                    out->reg=r;
+                    out->need=need;
+                    out->avail=d_thin_lo[step*5+r];
+                    out->slack=-1;
+                    for(int i=0;i<5;i++) out->vals[i]=vals[i];
+                }
+                return false;
+            }
+            int universal=d_thin_univ[step*5+r];
+            int req=need + (!terminal && need > 1 ? d_trailmix_slack : 0);
+            if(req > universal) req = universal;
+            if(req > avail){
+                if(out && !out->found){
+                    out->found=1;
+                    out->shot=shot;
+                    out->factor=factor_label;
+                    out->step=step;
+                    out->reg=r;
+                    out->need=need;
+                    out->avail=avail;
+                    out->slack=d_trailmix_slack;
+                    for(int i=0;i<5;i++) out->vals[i]=vals[i];
+                }
+                return false;
+            }
         }
     }
     return true;
@@ -926,6 +1094,33 @@ __global__ void probe_kernel(u64 nonce, u32* out){
     for(int i=0;i<8;i++) out[8+i]=rb[32+4*i]|(rb[32+4*i+1]<<8)|(rb[32+4*i+2]<<16)|(rb[32+4*i+3]<<24);
 }
 
+__global__ void trailmix_debug_kernel(u64 nonce, TrailMixDebugFail* out){
+    if(threadIdx.x || blockIdx.x) return;
+    out->found = 0;
+    Squeezer sq; squeeze_init(sq, d_base_st, d_base_pt, nonce, d_tx0, d_tx1);
+    for(int shot=0; shot<9024; shot++){
+        uint8_t rb[64]; squeeze_bytes(sq, rb, 64);
+        u32 k1[8],k2[8];
+        for(int i=0;i<8;i++) k1[i]=rb[4*i]|(rb[4*i+1]<<8)|(rb[4*i+2]<<16)|(rb[4*i+3]<<24);
+        for(int i=0;i<8;i++) k2[i]=rb[32+4*i]|(rb[32+4*i+1]<<8)|(rb[32+4*i+2]<<16)|(rb[32+4*i+3]<<24);
+        Jac tj,oj; comb_mul_jac(k1,tj); comb_mul_jac(k2,oj);
+        u32 tx[8],ty[8],ox[8],oy[8];
+        jacToAff(tj,tx,ty); jacToAff(oj,ox,oy);
+        if(eq(tx,ox)) continue;
+        if(isZero(tx)&&isZero(ty)) continue;
+        if(isZero(ox)&&isZero(oy)) continue;
+        u32 dx[8]; submod_p(tx,ox,dx);
+        if(!thin_factor_first_fail(dx, shot, 0, out)) return;
+        u32 den[8]; submod_p(ox,tx,den);
+        u32 deni[8]; invmod(den,deni);
+        u32 num[8]; submod_p(oy,ty,num);
+        u32 lambda[8]; mulmod(num,deni,lambda);
+        u32 ex[8]; sqrmod(lambda,ex); submod(ex,tx); submod(ex,ox);
+        u32 c[8]; submod_p(ox,ex,c);
+        if(!thin_factor_first_fail(c, shot, 1, out)) return;
+    }
+}
+
 // ================= host =================
 #include <cstdlib>
 #include <cstring>
@@ -993,16 +1188,33 @@ int main(int argc, char** argv){
     u64 probe=rd64(f); u32 pk1[8],pk2[8]; fread(pk1,4,8,f); fread(pk2,4,8,f);
     int thin_steps=0;
     int thin_w[SHRUNKEN_PZ_STEPS * 5];
+    int thin_univ[SHRUNKEN_PZ_STEPS * 5];
+    int thin_lo[SHRUNKEN_PZ_STEPS * 5];
+    int thin_sdiv[SHRUNKEN_PZ_STEPS];
+    int thin_s2[SHRUNKEN_PZ_STEPS];
     for(int i=0;i<SHRUNKEN_PZ_STEPS*5;i++) thin_w[i]=0;
+    for(int i=0;i<SHRUNKEN_PZ_STEPS*5;i++) thin_univ[i]=0;
+    for(int i=0;i<SHRUNKEN_PZ_STEPS*5;i++) thin_lo[i]=0;
+    for(int i=0;i<SHRUNKEN_PZ_STEPS;i++){ thin_sdiv[i]=0; thin_s2[i]=0; }
     u32 extra_magic=0;
     if(fread(&extra_magic,4,1,f)==1){
-        if(extra_magic==0x54505a31u){
+        if(extra_magic==0x54505a31u || extra_magic==0x54505a32u || extra_magic==0x54505a33u){
             thin_steps=(int)rd32(f);
             if(thin_steps!=SHRUNKEN_PZ_STEPS){
                 printf("bad TrailMix state steps %d\n", thin_steps);
                 return 1;
             }
             for(int i=0;i<SHRUNKEN_PZ_STEPS*5;i++) thin_w[i]=(int)rd32(f);
+            if(extra_magic==0x54505a32u){
+                for(int i=0;i<SHRUNKEN_PZ_STEPS*5;i++) thin_univ[i]=(int)rd32(f);
+            } else if(extra_magic==0x54505a33u){
+                for(int i=0;i<SHRUNKEN_PZ_STEPS*5;i++) thin_univ[i]=(int)rd32(f);
+                for(int i=0;i<SHRUNKEN_PZ_STEPS*5;i++) thin_lo[i]=(int)rd32(f);
+                for(int i=0;i<SHRUNKEN_PZ_STEPS;i++) thin_sdiv[i]=(int)rd32(f);
+                for(int i=0;i<SHRUNKEN_PZ_STEPS;i++) thin_s2[i]=(int)rd32(f);
+            } else {
+                for(int i=0;i<SHRUNKEN_PZ_STEPS*5;i++) thin_univ[i]=thin_w[i];
+            }
         } else {
             printf("unknown state extension magic %08x\n", extra_magic);
             return 1;
@@ -1017,16 +1229,29 @@ int main(int argc, char** argv){
     int gcd_mode = parse_gcd_mode();
     int comb_bits = parse_comb_bits();
     int filter_mode = parse_filter_mode();
-    int trailmix_slack = env_int("GPU_TRAILMIX_SLACK", 0);
-    if(trailmix_slack < 0) trailmix_slack = 0;
+    int requested_trailmix_slack = env_int("GPU_TRAILMIX_SLACK", 0);
+    if(requested_trailmix_slack < 0) requested_trailmix_slack = 0;
+    int trailmix_slack = requested_trailmix_slack;
+    bool trailmix_window = env_flag("GPU_TRAILMIX_WINDOW");
     if(filter_mode==FILTER_TRAILMIX_THIN && thin_steps!=SHRUNKEN_PZ_STEPS){
         printf("GPU_FILTER=trailmix requires TRAILMIX_GPU_THIN=1 state extension\n");
         return 1;
     }
-    printf("options: batch_inv=%u comb_bits=%d gcd_mode=%d wave=%d filter=%s trailmix_slack=%d\n",
+    if(filter_mode==FILTER_TRAILMIX_THIN && trailmix_slack > 0 &&
+       extra_magic!=0x54505a32u && extra_magic!=0x54505a33u){
+        printf("GPU_TRAILMIX_SLACK=%d requires a TPZ2 TrailMix state dump with universal widths\n",
+            trailmix_slack);
+        return 1;
+    }
+    if(filter_mode==FILTER_TRAILMIX_THIN && trailmix_window && extra_magic!=0x54505a33u){
+        printf("GPU_TRAILMIX_WINDOW=1 requires a TPZ3 TrailMix state dump with low/shift bounds\n");
+        return 1;
+    }
+    printf("options: batch_inv=%u comb_bits=%d gcd_mode=%d wave=%d filter=%s trailmix_slack=%d",
         batch_inv?1u:0u, comb_bits, gcd_mode, wave,
         filter_mode==FILTER_TRAILMIX_THIN ? "trailmix_thin" : "dialog_gcd",
         trailmix_slack);
+    printf("\n");
 
     // upload constants
     u32 Phost[8]={0xFFFFFC2F,0xFFFFFFFE,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
@@ -1038,7 +1263,13 @@ int main(int argc, char** argv){
     cudaMemcpyToSymbol(d_gcd_mode,&gcd_mode,4);
     cudaMemcpyToSymbol(d_filter_mode,&filter_mode,4);
     cudaMemcpyToSymbol(d_trailmix_slack,&trailmix_slack,4);
+    int iwindow=trailmix_window ? 1 : 0;
+    cudaMemcpyToSymbol(d_trailmix_window,&iwindow,4);
     if(filter_mode==FILTER_TRAILMIX_THIN) cudaMemcpyToSymbol(d_thin_w,thin_w,sizeof(thin_w));
+    if(filter_mode==FILTER_TRAILMIX_THIN) cudaMemcpyToSymbol(d_thin_univ,thin_univ,sizeof(thin_univ));
+    if(filter_mode==FILTER_TRAILMIX_THIN) cudaMemcpyToSymbol(d_thin_lo,thin_lo,sizeof(thin_lo));
+    if(filter_mode==FILTER_TRAILMIX_THIN) cudaMemcpyToSymbol(d_thin_sdiv,thin_sdiv,sizeof(thin_sdiv));
+    if(filter_mode==FILTER_TRAILMIX_THIN) cudaMemcpyToSymbol(d_thin_s2,thin_s2,sizeof(thin_s2));
     cudaMemcpyToSymbol(d_aw,aw,sizeof(aw)); cudaMemcpyToSymbol(d_cb,cb,sizeof(cb)); cudaMemcpyToSymbol(d_bw,bw,sizeof(bw));
     cudaMemcpyToSymbol(d_base_st,base_st,200); cudaMemcpyToSymbol(d_base_pt,&base_pt,4);
     u64 utx0=tx0,utx1=tx1; cudaMemcpyToSymbol(d_tx0,&utx0,8); cudaMemcpyToSymbol(d_tx1,&utx1,8);
@@ -1065,6 +1296,40 @@ int main(int argc, char** argv){
     }
     cudaMemcpyToSymbol(d_comb_large,&dcomb_large,sizeof(dcomb_large));
     cudaMemcpyToSymbol(d_comb_bits,&comb_bits,4);
+
+    const char* debug_nonce_s = getenv("GPU_DEBUG_NONCE");
+    if(debug_nonce_s && *debug_nonce_s){
+        u64 debug_nonce = strtoull(debug_nonce_s, 0, 10);
+        TrailMixDebugFail hfail;
+        TrailMixDebugFail* dfail = 0;
+        cudaMalloc(&dfail, sizeof(TrailMixDebugFail));
+        trailmix_debug_kernel<<<1,1>>>(debug_nonce, dfail);
+        cudaError_t de = cudaDeviceSynchronize();
+        if(de){
+            printf("trailmix debug kernel err %s\n", cudaGetErrorString(de));
+            return 1;
+        }
+        cudaMemcpy(&hfail, dfail, sizeof(TrailMixDebugFail), cudaMemcpyDeviceToHost);
+        cudaFree(dfail);
+        if(hfail.found){
+            const char* factors[2] = {"dx", "qx_minus_rx"};
+            const char* regs[5] = {"A", "B", "ca", "cb", "q"};
+            printf("TRAILMIX_DEBUG nonce=%llu reject shot=%d factor=%s step=%d reg=%s need=%d avail=%d slack=%d vals=%d,%d,%d,%d,%d\n",
+                (unsigned long long)debug_nonce,
+                hfail.shot,
+                (hfail.factor >= 0 && hfail.factor < 2) ? factors[hfail.factor] : "?",
+                hfail.step,
+                (hfail.reg >= 0 && hfail.reg < 5) ? regs[hfail.reg] : "?",
+                hfail.need,
+                hfail.avail,
+                hfail.slack,
+                hfail.vals[0], hfail.vals[1], hfail.vals[2], hfail.vals[3], hfail.vals[4]);
+        } else {
+            printf("TRAILMIX_DEBUG nonce=%llu accepted by thin filter\n",
+                (unsigned long long)debug_nonce);
+        }
+        return 0;
+    }
 
     // nonce-fan (exact): precompute prefix states for the low GPU_FAN_BITS tail bits.
     int fan_bits = env_int("GPU_FAN_BITS", 0);

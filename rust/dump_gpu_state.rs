@@ -18,6 +18,10 @@
 use alloy_primitives::U256;
 use quantum_ecc::circuit::{analyze_ops, QubitOrBit};
 use quantum_ecc::point_add::dialog_gcd_classical_filter::DialogGcdFilterConfig;
+use quantum_ecc::point_add::trailmix_port::inversion::shrunken_pz_schedule::{
+    reg_los, reg_widths, shift_bounds, SHRUNKEN_PZ_A, SHRUNKEN_PZ_B, SHRUNKEN_PZ_CA, SHRUNKEN_PZ_CB,
+    SHRUNKEN_PZ_NSTEPS, SHRUNKEN_PZ_Q,
+};
 use quantum_ecc::point_add::{self, SECP256K1_P};
 use sha3::{
     digest::{ExtendableOutput, Update, XofReader},
@@ -164,6 +168,13 @@ fn feed_x_op_bytes(k: &mut Keccak, q_target: u64) {
     k.absorb(&NO.to_le_bytes());
 }
 
+fn truthy_env(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
 fn main() {
     std::env::set_var("DIALOG_TAIL_NONCE", "0");
     let ops = point_add::build();
@@ -285,6 +296,51 @@ fn main() {
     w64(&mut f, probe);
     wu256(&mut f, k1);
     wu256(&mut f, k2);
+    if truthy_env("TRAILMIX_GPU_THIN")
+        || truthy_env("GPU_TRAILMIX_THIN")
+        || matches!(
+            std::env::var("GPU_FILTER").ok().as_deref(),
+            Some("trailmix" | "trailmix_thin" | "thin")
+        )
+    {
+        w32(&mut f, 0x5450_5a33); // "TPZ3": widths + universal caps + low/shift bounds.
+        w32(&mut f, SHRUNKEN_PZ_NSTEPS as u32);
+        for step in 0..SHRUNKEN_PZ_NSTEPS {
+            let (a, b, ca, cb, q) = reg_widths(step);
+            for width in [a, b, ca, cb, q] {
+                w32(&mut f, width as u32);
+            }
+        }
+        for step in 0..SHRUNKEN_PZ_NSTEPS {
+            for width in [
+                SHRUNKEN_PZ_A[step],
+                SHRUNKEN_PZ_B[step],
+                SHRUNKEN_PZ_CA[step],
+                SHRUNKEN_PZ_CB[step],
+                SHRUNKEN_PZ_Q[step],
+            ] {
+                w32(&mut f, width as u32);
+            }
+        }
+        for step in 0..SHRUNKEN_PZ_NSTEPS {
+            let (a, b, ca, cb, q) = reg_los(step);
+            for lo in [a, b, ca, cb, q] {
+                w32(&mut f, lo as u32);
+            }
+        }
+        for step in 0..SHRUNKEN_PZ_NSTEPS {
+            let (sdiv, _) = shift_bounds(step);
+            w32(&mut f, sdiv as u32);
+        }
+        for step in 0..SHRUNKEN_PZ_NSTEPS {
+            let (_, s2) = shift_bounds(step);
+            w32(&mut f, s2 as u32);
+        }
+        eprintln!(
+            "trailmix-thin extension: wrote {}x5 widths/caps/lo + shift bounds",
+            SHRUNKEN_PZ_NSTEPS
+        );
+    }
     f.flush().unwrap();
     eprintln!("wrote {} ({} bytes header+arrays+comb)", path, "?");
     eprintln!("DONE");
