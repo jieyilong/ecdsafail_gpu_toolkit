@@ -310,6 +310,7 @@ __device__ __forceinline__ void sub_low_window(u32 v[8], const u32 uu[8], int wi
 __device__ __constant__ int d_odd_u, d_k2, d_k2f0, d_active_iters, d_compare_bits;
 __device__ __constant__ int d_gcd_mode;
 __device__ __constant__ int d_filter_mode;
+__device__ __constant__ int d_trailmix_slack;
 __device__ __constant__ int d_aw[402], d_cb[402], d_bw[402];
 __device__ __constant__ int d_thin_w[SHRUNKEN_PZ_STEPS * 5];
 
@@ -709,7 +710,7 @@ __device__ bool thin_factor_fits(const u32 factor[8]){
 
         for(int r=0;r<5;r++){
             int need=vals[r] > 1 ? vals[r] : 1;
-            if(need > d_thin_w[step*5+r]) return false;
+            if(need + d_trailmix_slack > d_thin_w[step*5+r]) return false;
         }
     }
     return true;
@@ -1016,13 +1017,16 @@ int main(int argc, char** argv){
     int gcd_mode = parse_gcd_mode();
     int comb_bits = parse_comb_bits();
     int filter_mode = parse_filter_mode();
+    int trailmix_slack = env_int("GPU_TRAILMIX_SLACK", 0);
+    if(trailmix_slack < 0) trailmix_slack = 0;
     if(filter_mode==FILTER_TRAILMIX_THIN && thin_steps!=SHRUNKEN_PZ_STEPS){
         printf("GPU_FILTER=trailmix requires TRAILMIX_GPU_THIN=1 state extension\n");
         return 1;
     }
-    printf("options: batch_inv=%u comb_bits=%d gcd_mode=%d wave=%d filter=%s\n",
+    printf("options: batch_inv=%u comb_bits=%d gcd_mode=%d wave=%d filter=%s trailmix_slack=%d\n",
         batch_inv?1u:0u, comb_bits, gcd_mode, wave,
-        filter_mode==FILTER_TRAILMIX_THIN ? "trailmix_thin" : "dialog_gcd");
+        filter_mode==FILTER_TRAILMIX_THIN ? "trailmix_thin" : "dialog_gcd",
+        trailmix_slack);
 
     // upload constants
     u32 Phost[8]={0xFFFFFC2F,0xFFFFFFFE,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
@@ -1033,6 +1037,7 @@ int main(int argc, char** argv){
     cudaMemcpyToSymbol(d_compare_bits,&icb,4);
     cudaMemcpyToSymbol(d_gcd_mode,&gcd_mode,4);
     cudaMemcpyToSymbol(d_filter_mode,&filter_mode,4);
+    cudaMemcpyToSymbol(d_trailmix_slack,&trailmix_slack,4);
     if(filter_mode==FILTER_TRAILMIX_THIN) cudaMemcpyToSymbol(d_thin_w,thin_w,sizeof(thin_w));
     cudaMemcpyToSymbol(d_aw,aw,sizeof(aw)); cudaMemcpyToSymbol(d_cb,cb,sizeof(cb)); cudaMemcpyToSymbol(d_bw,bw,sizeof(bw));
     cudaMemcpyToSymbol(d_base_st,base_st,200); cudaMemcpyToSymbol(d_base_pt,&base_pt,4);
