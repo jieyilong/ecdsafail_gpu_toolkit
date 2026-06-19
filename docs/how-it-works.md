@@ -63,6 +63,9 @@ width-envelope overflow or non-convergence — the dominant source of "hard" inp
   and shift bounds. `GPU_TRAILMIX_SLACK=1` is kept as a compatibility spelling for the
   same safe TPZ3 schedule-window filter; it no longer applies the older width-margin
   heuristic, which could miss clean nonces such as q956 nonce `676055`.
+  For the accepted TrailMix-ludicrous product-min circuit family (`bdb1d22`), use
+  `GPU_FILTER=ludicrous` instead; it replays the baked `SCHED_J2`/`GAP_J2` jump-GCD
+  schedule and was smoke-tested against submitted nonce `28565`.
   Separately, `EVAL_FAST_REJECT=1` speeds the *eval* phase by stopping at the first failing
   batch. See `docs/measured-speedups.md` for measured gains.
 

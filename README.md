@@ -191,6 +191,26 @@ GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=trunc_first GPU_WAVE=128 GPU_FAN_B
   ./island.sh search s.bin <START> <N>
 ```
 
+For the accepted TrailMix-ludicrous circuit family (`bdb1d22`, submitted
+`DIALOG_TAIL_NONCE=28565`), use the dedicated jump-GCD schedule filter:
+
+```bash
+GPU_FILTER=ludicrous GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_WAVE=128 GPU_FAN_BITS=22 \
+  ./island.sh search s.bin <START> <N>
+```
+
+The `ludicrous` filter replays the product-min `SCHED_J2`/`GAP_J2` jump=2 GCD
+schedule. It replaces the old dialog-GCD prefilter for that circuit. The older
+`GPU_FILTER=trailmix` / `GPU_TRAILMIX_THIN=1` mode targets a different
+TrailMix-thin/shrunken-PZ schedule and should not be used for `trailmix_ludicrous`.
+As usual, first smoke-test the known clean nonce:
+
+```bash
+GPU_FILTER=ludicrous ./island.sh search s.bin 28565 1
+```
+
+It must print `CLEAN nonce=28565` before larger scans are trusted.
+
 On the 2026-06-10 1221-qubit SOTA (`155ebc5` / local commit `572bba4`), this found the baked
 clean nonce and measured about **12.3k nonce/s** on the RTX 5090 (`~1.2x` the previous-release
 baseline). `fan22`'s ~872 MiB table builds in only ~0.3s (measured), so at the default 500k

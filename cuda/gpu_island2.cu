@@ -17,7 +17,9 @@ struct U256 { u32 v[8]; };
 #define GCD_MODE_SINGLE_PASS 3
 #define FILTER_DIALOG_GCD 0
 #define FILTER_TRAILMIX_THIN 1
+#define FILTER_LUDICROUS 2
 #define SHRUNKEN_PZ_STEPS 530
+#define LUDICROUS_J2_STEPS 258
 
 // p and c=2^256-p=2^32+977
 __device__ __constant__ u32 P[8]  = {0xFFFFFC2F,0xFFFFFFFE,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
@@ -318,6 +320,8 @@ __device__ __constant__ int d_thin_univ[SHRUNKEN_PZ_STEPS * 5];
 __device__ __constant__ int d_thin_lo[SHRUNKEN_PZ_STEPS * 5];
 __device__ __constant__ int d_thin_sdiv[SHRUNKEN_PZ_STEPS];
 __device__ __constant__ int d_thin_s2[SHRUNKEN_PZ_STEPS];
+__device__ __constant__ int d_lud_sched[LUDICROUS_J2_STEPS];
+__device__ __constant__ int d_lud_gap[LUDICROUS_J2_STEPS];
 
 __device__ void full_gcd_step(u32 u[8], u32 v[8]){
     bool b0=u_bit(v,0); bool fgt=u_cmp(u,v)>0;
@@ -884,7 +888,83 @@ __device__ bool thin_factor_first_fail(
     return true;
 }
 
+__device__ __forceinline__ bool cmp_lt_top_window(const u32 a[8], const u32 b[8], int width, int k){
+    if(k > width) k = width;
+    if(k < 1) k = 1;
+    for(int bit=width-1; bit>=width-k; bit--){
+        bool abit = u_bit(a, bit);
+        bool bbit = u_bit(b, bit);
+        if(abit != bbit) return !abit && bbit;
+    }
+    return false;
+}
+
+__device__ __forceinline__ bool cmp_lt_active(const u32 a[8], const u32 b[8], int width){
+    for(int bit=width-1; bit>=0; bit--){
+        bool abit = u_bit(a, bit);
+        bool bbit = u_bit(b, bit);
+        if(abit != bbit) return !abit && bbit;
+    }
+    return false;
+}
+
+// TrailMix-ludicrous product-min jump=2 GCD schedule-fit filter.
+//
+// This mirrors the classical control path of
+// trailmix_ludicrous::gcd::forward_gcd_jump enough to decide whether a factor
+// fits the baked SCHED_J2/GAP_J2 envelope. It is still only a GCD prefilter:
+// every emitted nonce must be validated by eval_circuit for apply/fold/phase
+// effects.
+__device__ bool ludicrous_factor_fits(const u32 factor[8]){
+    if(isZero(factor)) return false;
+
+    u32 u[8], v[8];
+    cpy(u, d_P);
+    cpy(v, factor);
+
+    for(int step=0; step<LUDICROUS_J2_STEPS; step++){
+        int width = d_lud_sched[step];
+        if(width < 1 || width > 256) return false;
+        if(u_bitlen(u) > width || u_bitlen(v) > width) return false;
+
+        // Step 0 conditionally removes one factor of two; later steps always do
+        // the first shift because the previous subtract leaves v even.
+        if(step == 0){
+            if(!u_bit(v, 0)) u_shr1(v);
+        } else {
+            u_shr1(v);
+        }
+
+        // Jump=2 second shift, gated on the post-shift LSB.
+        if(!u_bit(v, 0)) u_shr1(v);
+
+        bool subtracted = u_bit(v, 0);
+        if(subtracted){
+            bool swap_flag;
+            if(step == 0){
+                swap_flag = true; // q > x on the first fitting step.
+            } else {
+                int gap = d_lud_gap[step];
+                if(gap < 1) gap = 1;
+                if(gap > width) gap = width;
+                bool top_lt = cmp_lt_top_window(v, u, width, gap);
+                bool full_lt = cmp_lt_active(v, u, width);
+                if(top_lt != full_lt) return false;
+                swap_flag = top_lt;
+            }
+            if(swap_flag) u_swap(u, v);
+            if(cmp_lt_active(v, u, width)) return false; // subtract would borrow.
+            u32 diff[8];
+            u_sub(v, u, diff);
+            cpy(v, diff);
+        }
+    }
+
+    return isZero(v) && u_bitlen(u) == 1 && u_bit(u, 0);
+}
+
 __device__ __forceinline__ bool factor_fits_filter(const u32 factor[8]){
+    if(d_filter_mode == FILTER_LUDICROUS) return ludicrous_factor_fits(factor);
     if(d_filter_mode == FILTER_TRAILMIX_THIN) return thin_factor_fits(factor);
     return check_gcd_factor(factor);
 }
@@ -1160,12 +1240,45 @@ static int parse_comb_bits(){
 static int parse_filter_mode(){
     const char* s=getenv("GPU_FILTER");
     if(!s || !*s) s=getenv("FILTER_MODE");
+    if(s && (strcmp(s,"ludicrous")==0 || strcmp(s,"trailmix_ludicrous")==0 || strcmp(s,"lud")==0)){
+        return FILTER_LUDICROUS;
+    }
     if((s && (strcmp(s,"trailmix")==0 || strcmp(s,"trailmix_thin")==0 || strcmp(s,"thin")==0)) ||
        env_flag("GPU_TRAILMIX_THIN")){
         return FILTER_TRAILMIX_THIN;
     }
     return FILTER_DIALOG_GCD;
 }
+
+static const int LUDICROUS_SCHED_J2[LUDICROUS_J2_STEPS] = {
+    256,256,256,256,256,256,256,256,256,256,256,255,254,253,252,251,250,249,248,
+    247,246,245,244,243,242,241,240,239,238,237,236,235,234,233,232,231,230,229,
+    228,227,226,225,224,223,222,221,220,219,218,217,216,215,214,213,212,211,210,
+    209,208,207,206,205,204,203,202,201,200,199,198,197,196,195,194,193,192,191,
+    190,189,188,187,186,185,184,183,182,181,180,179,178,177,176,175,174,173,173,
+    172,170,169,168,167,166,166,164,164,163,162,160,160,159,157,157,156,155,154,
+    153,152,151,149,148,147,146,145,145,144,143,141,141,140,139,138,137,136,135,
+    134,133,131,130,129,128,127,126,126,125,124,122,122,120,119,118,117,116,115,
+    114,113,112,111,110,109,108,107,106,105,104,103,102,101,100,99,98,97,96,95,
+    94,93,92,91,90,89,88,87,86,85,84,83,82,81,80,79,78,77,76,75,74,73,72,71,
+    70,69,68,67,66,65,64,63,62,61,60,59,58,57,56,55,54,53,52,51,50,49,48,47,
+    46,45,44,43,42,41,40,39,38,37,36,35,34,33,32,31,30,29,28,27,26,25,24,23,
+    23,22,22,21,20,19,19,18,18,18,16,16,14,13
+};
+
+static const int LUDICROUS_GAP_J2[LUDICROUS_J2_STEPS] = {
+    24,26,26,27,28,30,30,31,33,33,35,35,35,35,35,35,36,36,35,36,36,36,35,37,
+    37,36,36,37,36,36,38,36,37,37,37,37,38,37,38,38,38,37,38,38,38,38,39,38,
+    39,38,39,39,39,39,39,39,40,40,40,40,40,40,40,40,40,40,40,40,41,41,41,41,
+    41,41,42,42,43,42,41,42,42,43,43,44,42,42,43,43,43,43,43,43,44,43,45,44,
+    43,43,45,44,44,45,45,46,45,46,45,46,46,45,47,46,48,47,47,47,47,46,46,47,
+    46,47,49,48,48,48,48,48,48,48,49,49,49,49,48,49,49,48,48,49,48,50,49,50,
+    49,50,49,49,50,49,50,50,49,50,50,50,50,50,51,51,50,52,51,51,51,51,51,52,
+    51,51,52,52,52,53,52,52,53,52,52,53,53,53,53,53,53,53,54,55,54,54,54,54,
+    54,54,55,54,54,54,56,55,55,55,54,56,55,56,56,56,56,56,56,55,54,53,52,51,
+    50,49,48,47,46,45,44,43,42,41,40,39,38,37,36,35,34,33,32,31,30,29,28,27,
+    26,25,24,23,23,22,22,21,20,19,19,18,18,18,16,16,14,13
+};
 
 int main(int argc, char** argv){
     const char* dump = getenv("GPU_STATE"); if(!dump) dump="/tmp/gpu_state.bin";
@@ -1255,9 +1368,12 @@ int main(int argc, char** argv){
         printf("GPU_TRAILMIX_WINDOW=1 requires a TPZ3 TrailMix state dump with low/shift bounds\n");
         return 1;
     }
+    const char* filter_name =
+        filter_mode==FILTER_LUDICROUS ? "ludicrous" :
+        (filter_mode==FILTER_TRAILMIX_THIN ? "trailmix_thin" : "dialog_gcd");
     printf("options: batch_inv=%u comb_bits=%d gcd_mode=%d wave=%d filter=%s trailmix_slack=%d trailmix_window=%d",
         batch_inv?1u:0u, comb_bits, gcd_mode, wave,
-        filter_mode==FILTER_TRAILMIX_THIN ? "trailmix_thin" : "dialog_gcd",
+        filter_name,
         trailmix_slack, trailmix_window ? 1 : 0);
     printf("\n");
 
@@ -1278,6 +1394,8 @@ int main(int argc, char** argv){
     if(filter_mode==FILTER_TRAILMIX_THIN) cudaMemcpyToSymbol(d_thin_lo,thin_lo,sizeof(thin_lo));
     if(filter_mode==FILTER_TRAILMIX_THIN) cudaMemcpyToSymbol(d_thin_sdiv,thin_sdiv,sizeof(thin_sdiv));
     if(filter_mode==FILTER_TRAILMIX_THIN) cudaMemcpyToSymbol(d_thin_s2,thin_s2,sizeof(thin_s2));
+    if(filter_mode==FILTER_LUDICROUS) cudaMemcpyToSymbol(d_lud_sched,LUDICROUS_SCHED_J2,sizeof(LUDICROUS_SCHED_J2));
+    if(filter_mode==FILTER_LUDICROUS) cudaMemcpyToSymbol(d_lud_gap,LUDICROUS_GAP_J2,sizeof(LUDICROUS_GAP_J2));
     cudaMemcpyToSymbol(d_aw,aw,sizeof(aw)); cudaMemcpyToSymbol(d_cb,cb,sizeof(cb)); cudaMemcpyToSymbol(d_bw,bw,sizeof(bw));
     cudaMemcpyToSymbol(d_base_st,base_st,200); cudaMemcpyToSymbol(d_base_pt,&base_pt,4);
     u64 utx0=tx0,utx1=tx1; cudaMemcpyToSymbol(d_tx0,&utx0,8); cudaMemcpyToSymbol(d_tx1,&utx1,8);
