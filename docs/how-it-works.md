@@ -60,8 +60,9 @@ width-envelope overflow or non-convergence — the dominant source of "hard" inp
   clean nonce on the 1221-qubit SOTA. For TrailMix/shrunken-PZ scans, use
   `GPU_TRAILMIX_WINDOW=1` with a TPZ3 state dump to enable the stricter schedule-window
   checks: the GPU rejects factors that violate the circuit's exact per-step low-window
-  and shift bounds. This replaced the older `GPU_TRAILMIX_SLACK=1` width-margin idea,
-  which is only diagnostic because it can miss clean nonces such as q956 nonce `676055`.
+  and shift bounds. `GPU_TRAILMIX_SLACK=1` is kept as a compatibility spelling for the
+  same safe TPZ3 schedule-window filter; it no longer applies the older width-margin
+  heuristic, which could miss clean nonces such as q956 nonce `676055`.
   Separately, `EVAL_FAST_REJECT=1` speeds the *eval* phase by stopping at the first failing
   batch. See `docs/measured-speedups.md` for measured gains.
 

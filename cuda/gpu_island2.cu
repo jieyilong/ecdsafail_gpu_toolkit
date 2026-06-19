@@ -1233,24 +1233,32 @@ int main(int argc, char** argv){
     if(requested_trailmix_slack < 0) requested_trailmix_slack = 0;
     int trailmix_slack = requested_trailmix_slack;
     bool trailmix_window = env_flag("GPU_TRAILMIX_WINDOW");
+    // The old width-margin interpretation of GPU_TRAILMIX_SLACK rejected known
+    // accepted TrailMix nonces (need==avail at a scheduled boundary is valid).
+    // Treat the public "slack" knob as the safe stricter filter: exact TPZ3
+    // schedule-window bounds, with no extra width margin.
+    if(requested_trailmix_slack > 0){
+        trailmix_window = true;
+        trailmix_slack = 0;
+    }
     if(filter_mode==FILTER_TRAILMIX_THIN && thin_steps!=SHRUNKEN_PZ_STEPS){
         printf("GPU_FILTER=trailmix requires TRAILMIX_GPU_THIN=1 state extension\n");
         return 1;
     }
-    if(filter_mode==FILTER_TRAILMIX_THIN && trailmix_slack > 0 &&
-       extra_magic!=0x54505a32u && extra_magic!=0x54505a33u){
-        printf("GPU_TRAILMIX_SLACK=%d requires a TPZ2 TrailMix state dump with universal widths\n",
-            trailmix_slack);
+    if(filter_mode==FILTER_TRAILMIX_THIN && requested_trailmix_slack > 0 &&
+       extra_magic!=0x54505a33u){
+        printf("GPU_TRAILMIX_SLACK=%d aliases the safe schedule-window filter and requires a TPZ3 TrailMix state dump\n",
+            requested_trailmix_slack);
         return 1;
     }
     if(filter_mode==FILTER_TRAILMIX_THIN && trailmix_window && extra_magic!=0x54505a33u){
         printf("GPU_TRAILMIX_WINDOW=1 requires a TPZ3 TrailMix state dump with low/shift bounds\n");
         return 1;
     }
-    printf("options: batch_inv=%u comb_bits=%d gcd_mode=%d wave=%d filter=%s trailmix_slack=%d",
+    printf("options: batch_inv=%u comb_bits=%d gcd_mode=%d wave=%d filter=%s trailmix_slack=%d trailmix_window=%d",
         batch_inv?1u:0u, comb_bits, gcd_mode, wave,
         filter_mode==FILTER_TRAILMIX_THIN ? "trailmix_thin" : "dialog_gcd",
-        trailmix_slack);
+        trailmix_slack, trailmix_window ? 1 : 0);
     printf("\n");
 
     // upload constants
