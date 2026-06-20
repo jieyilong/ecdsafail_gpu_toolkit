@@ -181,8 +181,22 @@ GPU_GCD_MODE=trunc_first ./island.sh search s.bin 1 2000000
 | `GPU_WAVE` | `32`..`256` | CUDA block threads per nonce wave. Default `128`; values are rounded up to a warp multiple and capped at `256`. |
 | `GPU_FAN_BITS` | `0`..`26` | Nonce-fan: precompute the SHAKE sponge for the low `K` tail bits so each nonce only absorbs its high bits. `0` = off. Exact candidate set. Table is `2^K * 208 B` (`K=20`≈208 MiB, `K=24`≈3.5 GiB). Measured gain is small (~+1.5% on the current SOTA base — `squeeze_init` is not the bottleneck there); may help more on init-bound bases. |
 | `EVAL_FAST_REJECT` | `0`/`1` | **Phase-2 (CPU validate) knob, not a scan knob** — no-op on a `search` line. `1` defers the per-shot EC-muls into the batch loop and stops at the **first failing shot**. Speedup is candidate-dependent: early-failing dirty candidates ~1.9s, but GCD-clean-but-eval-dirty ones (what the GPU hunt feeds the validator) fail later → ~6s; vs ~17s stock (~2.6–8.5×). Exact — clean islands still read `0/0/0` and take the full ~17s; with the var unset the eval is byte-identical, so `ecdsafail run` scoring is unaffected (default `0`). `island.sh validate` sets it to `1`. **Setup:** apply `patches/eval_fast_reject.diff` + `cargo build --release --bin eval_circuit` (reset by `ecdsafail sync`; `eval_circuit.rs` is a local tool, not submitted). Per-candidate context: `build_circuit` is only ~1.2s, so the whole per-candidate cost is this eval. |
+| `VALIDATE_REUSE_OPS` | `0`/`1` | **Phase-2 batch validation knob.** `1` builds one nonce-0 `ops.bin` per `validate` invocation, then evaluates each requested nonce with `EVAL_TAIL_NONCE=<nonce>` so the trusted Fiat-Shamir hash sees the exact 96-op identity tail for that nonce. This avoids rebuilding the same circuit body for every candidate. Exact for circuits with the standard fixed 48-pair `DIALOG_TAIL_NONCE` `X;X` tail; the evaluator refuses the override if the tail shape is not present. Requires the updated `patches/eval_fast_reject.diff` and rebuilt `eval_circuit`. |
+| `VALIDATE_RESULTS_LOG` | path | Optional validate-only durable ledger. When set, `island.sh validate` still prints every line to stdout, and also appends successful `dirty` / `CLEAN` verdict lines to this file under `flock` when available. |
+| `VALIDATE_ERRORS_LOG` | path | Optional validate-only error ledger. `ERROR ... stage=build/eval ...` lines are routed here instead of `VALIDATE_RESULTS_LOG`; defaults to `errors.log` next to `VALIDATE_RESULTS_LOG`. Error nonces are retryable and should not be counted as validated. |
+| `VALIDATE_LOCK_FILE` | path | Optional shared lock path for `VALIDATE_RESULTS_LOG` / `VALIDATE_ERRORS_LOG` appends. Defaults to `<VALIDATE_RESULTS_LOG>.lock`. |
 
-**Every improvement is an independent on/off knob** (all default to the conservative/exact baseline): `GPU_BATCH_INV`, `GPU_COMB_BITS`, `GPU_GCD_MODE` (`trunc_first` is the safer fast choice; `single_pass` is experimental), `GPU_WAVE`, `GPU_FAN_BITS`, and `EVAL_FAST_REJECT`. They compose; benchmark combinations with `bench-gpu-knobs`.
+**Every improvement is an independent on/off knob** (all default to the conservative/exact baseline): `GPU_BATCH_INV`, `GPU_COMB_BITS`, `GPU_GCD_MODE` (`trunc_first` is the safer fast choice; `single_pass` is experimental), `GPU_WAVE`, `GPU_FAN_BITS`, `EVAL_FAST_REJECT`, `VALIDATE_REUSE_OPS`, and the optional validation ledger paths. They compose; benchmark combinations with `bench-gpu-knobs`.
+
+For distributed validation, keep the verdict ledger clean and route build/eval failures to a
+separate retry ledger:
+
+```bash
+VALIDATE_REUSE_OPS=1 \
+VALIDATE_RESULTS_LOG=/root/<route>_validation/results.log \
+VALIDATE_ERRORS_LOG=/root/<route>_validation/errors.log \
+  ./island.sh validate "$CFG" <nonce...>
+```
 
 Recommended safer scan settings on the RTX 5090:
 
@@ -190,6 +204,26 @@ Recommended safer scan settings on the RTX 5090:
 GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=trunc_first GPU_WAVE=128 GPU_FAN_BITS=22 \
   ./island.sh search s.bin <START> <N>
 ```
+
+For the accepted TrailMix-ludicrous circuit family (`bdb1d22`, submitted
+`DIALOG_TAIL_NONCE=28565`), use the dedicated jump-GCD schedule filter:
+
+```bash
+GPU_FILTER=ludicrous GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_WAVE=128 GPU_FAN_BITS=22 \
+  ./island.sh search s.bin <START> <N>
+```
+
+The `ludicrous` filter replays the product-min `SCHED_J2`/`GAP_J2` jump=2 GCD
+schedule. It replaces the old dialog-GCD prefilter for that circuit. The older
+`GPU_FILTER=trailmix` / `GPU_TRAILMIX_THIN=1` mode targets a different
+TrailMix-thin/shrunken-PZ schedule and should not be used for `trailmix_ludicrous`.
+As usual, first smoke-test the known clean nonce:
+
+```bash
+GPU_FILTER=ludicrous ./island.sh search s.bin 28565 1
+```
+
+It must print `CLEAN nonce=28565` before larger scans are trusted.
 
 On the 2026-06-10 1221-qubit SOTA (`155ebc5` / local commit `572bba4`), this found the baked
 clean nonce and measured about **12.3k nonce/s** on the RTX 5090 (`~1.2x` the previous-release
@@ -343,6 +377,7 @@ CHANGELOG.md           decision log for major search changes, rationale, expecte
 runtime/               scripts that run ON the GPU machine (local or scp'd to the remote):
   build_kernel.sh        auto-detect compute cap -> nvcc (native + PTX-JIT fallback)
   search_driver.sh       multi-GPU parallel chunked search (splits range across all GPUs)
+  remote_gpu_scan_loop.sh long-running per-node scan loop with status/candidate files
   doctor.sh              report GPUs / compute cap / nvcc
 cuda/
   gpu_island2.cu       PRODUCTION shot-parallel kernel (KERNEL2=1)
@@ -352,6 +387,7 @@ rust/
   count_tof.rs         static Toffoli (CCX) lever meter
   island_search.rs     CPU reference searcher (no-GPU fallback)
 docs/
+  1216-balanced.md     current 1216-qubit balanced scan/validation recipe
   how-it-works.md      the dialog-GCD circuit + island search, explained
   levers.md            the lever catalog + measured Toffoli costs
   kernel-notes.md      kernel design / throughput / validation notes

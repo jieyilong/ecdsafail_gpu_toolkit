@@ -23,6 +23,34 @@ SELF="$HERE/island.sh"
 CFGF="${ISLAND_CONFIG:-$HERE/config.env}"
 die(){ echo "ERROR: $*" >&2; exit 1; }
 truthy(){ case "${1:-}" in 1|true|TRUE|yes|YES|on|ON) return 0;; *) return 1;; esac; }
+line_score_suffix(){ # tof qubits
+  local tof="${1:-}" q="${2:-}" score
+  [ -n "$tof" ] && [ -n "$q" ] || return 0
+  score=$(awk -v t="$tof" -v q="$q" 'BEGIN{printf "%d", int(t + 0.5) * q}')
+  printf ' score=%s' "$score"
+}
+emit_validation_record(){ # line
+  local line="$1" dest lock dir
+  echo "$line"
+  [ -n "${VALIDATE_RESULTS_LOG:-}" ] || return 0
+  case "$line" in
+    ERROR*)
+      dest="${VALIDATE_ERRORS_LOG:-$(dirname "$VALIDATE_RESULTS_LOG")/errors.log}"
+      ;;
+    *)
+      dest="$VALIDATE_RESULTS_LOG"
+      ;;
+  esac
+  dir="$(dirname "$dest")"
+  mkdir -p "$dir"
+  lock="${VALIDATE_LOCK_FILE:-$VALIDATE_RESULTS_LOG.lock}"
+  mkdir -p "$(dirname "$lock")"
+  if command -v flock >/dev/null 2>&1; then
+    { flock 9; printf '%s\n' "$line" >> "$dest"; } 9>"$lock"
+  else
+    printf '%s\n' "$line" >> "$dest"
+  fi
+}
 
 # ---- config helpers (init-* don't require an existing config.env) ----
 cmd="${1:-help}"; shift || true
@@ -57,7 +85,7 @@ esac
 . "$CFGF"
 : "${CHALLENGE:?set CHALLENGE in config.env}"; : "${GPU:=local}"; : "${REMOTE_SSH:=}"
 : "${REMOTE_DIR:=.ecdsafail_island}"; : "${NVCC_ARCH:=auto}"; : "${GPUS:=auto}"; : "${BLOCKS:=512}"
-: "${GPU_BATCH_INV:=0}"; : "${GPU_COMB_BITS:=8}"; : "${GPU_GCD_MODE:=full_first}"; : "${GPU_WAVE:=128}"; : "${GPU_FAN_BITS:=0}"
+: "${GPU_BATCH_INV:=0}"; : "${GPU_COMB_BITS:=8}"; : "${GPU_GCD_MODE:=full_first}"; : "${GPU_WAVE:=128}"; : "${GPU_FAN_BITS:=0}"; : "${GPU_FILTER:=dialog}"; : "${GPU_TRAILMIX_THIN:=0}"; : "${GPU_TRAILMIX_SLACK:=0}"; : "${GPU_TRAILMIX_WINDOW:=0}"; : "${GPU_STREAM_CANDIDATES:=1}"
 BIN="$CHALLENGE/target/release"; KSRC="$HERE/cuda/gpu_island2.cu"; RDIR="$REMOTE_DIR"
 need_remote(){ [ -n "$REMOTE_SSH" ] || die "GPU=remote needs REMOTE_SSH (init-remote)"; }
 rhost(){ echo "$REMOTE_SSH" | grep -oE '[^ ]+@[^ ]+' | head -1; }
@@ -69,6 +97,27 @@ push_runtime(){ rsh "mkdir -p $RDIR"; rcp "$KSRC" gpu_island2.cu; for s in build
 tail_nonce(){
   grep -E 'set_default_env\("DIALOG_TAIL_NONCE", "[0-9]+"\)' "$CHALLENGE/src/point_add/mod.rs" \
     | tail -1 | grep -oE '"[0-9]+"' | tr -d '"'
+}
+eval_supports_tail_nonce(){
+  grep -a -q "EVAL_TAIL_NONCE" "$BIN/eval_circuit" 2>/dev/null
+}
+emit_validation_line(){ # nonce out eval_rc
+  local nonce="$1" out="$2" eval_rc="$3" cls pha anc tof q detail
+  cls=$(echo "$out"|grep "classical mismatches"|grep -oE '[0-9]+$')
+  pha=$(echo "$out"|grep "phase-garbage"|grep -oE '[0-9]+$')
+  anc=$(echo "$out"|grep "ancilla-garbage"|grep -oE '[0-9]+$')
+  tof=$(echo "$out"|grep "avg executed Toffoli"|grep -oE '[0-9.]+'|head -1)
+  q=$(echo "$out"|grep -E '^  qubits '|grep -oE '[0-9]+$'|head -1)
+  if [ -z "${cls:-}" ] || [ -z "${pha:-}" ] || [ -z "${anc:-}" ]; then
+    detail=$(echo "$out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')
+    emit_validation_record "ERROR nonce=$nonce stage=eval rc=$eval_rc detail=${detail:-eval_circuit failed}"
+    return
+  fi
+  if [ "${cls:-x}" = 0 ] && [ "${pha:-x}" = 0 ] && [ "${anc:-x}" = 0 ]; then
+    emit_validation_record "CLEAN nonce=$nonce tof=$tof qubits=$q$(line_score_suffix "$tof" "$q")"
+  else
+    emit_validation_record "dirty nonce=$nonce cls=${cls:-?} pha=${pha:-?} anc=${anc:-?}"
+  fi
 }
 run_variant_search(){ # envs state start n chunk
   local envs="$1" state="$2" start="$3" n="$4" chunk="${5:-200000}"
@@ -191,11 +240,16 @@ search)
     GPU_ISLAND_BIN="$HERE/gpu_island2" GPU_STATE_FILE="$STATE" BLOCKS="$BLOCKS" \
       GPU_BATCH_INV="$GPU_BATCH_INV" GPU_COMB_BITS="$GPU_COMB_BITS" \
       GPU_GCD_MODE="$GPU_GCD_MODE" GPU_WAVE="$GPU_WAVE" GPU_FAN_BITS="$GPU_FAN_BITS" \
+      GPU_FILTER="$GPU_FILTER" GPU_TRAILMIX_THIN="$GPU_TRAILMIX_THIN" \
+      GPU_TRAILMIX_SLACK="$GPU_TRAILMIX_SLACK" GPU_TRAILMIX_WINDOW="$GPU_TRAILMIX_WINDOW" \
+      GPU_STREAM_CANDIDATES="$GPU_STREAM_CANDIDATES" \
       bash "$HERE/runtime/search_driver.sh" "$START" "$N" "$CHUNK" "$GPUS"
   else
     need_remote; rcp "$STATE" state.bin
+    rcp "$HERE/runtime/search_driver.sh" search_driver.sh
     rsh "GPU_ISLAND_BIN=\$HOME/$RDIR/gpu_island2 GPU_STATE_FILE=\$HOME/$RDIR/state.bin BLOCKS=$BLOCKS \
-         GPU_BATCH_INV=$GPU_BATCH_INV GPU_COMB_BITS=$GPU_COMB_BITS GPU_GCD_MODE=$GPU_GCD_MODE GPU_WAVE=$GPU_WAVE GPU_FAN_BITS=$GPU_FAN_BITS \
+         GPU_BATCH_INV=$GPU_BATCH_INV GPU_COMB_BITS=$GPU_COMB_BITS GPU_GCD_MODE=$GPU_GCD_MODE GPU_WAVE=$GPU_WAVE GPU_FAN_BITS=$GPU_FAN_BITS GPU_STREAM_CANDIDATES=$GPU_STREAM_CANDIDATES \
+         GPU_FILTER=$GPU_FILTER GPU_TRAILMIX_THIN=$GPU_TRAILMIX_THIN GPU_TRAILMIX_SLACK=$GPU_TRAILMIX_SLACK GPU_TRAILMIX_WINDOW=$GPU_TRAILMIX_WINDOW \
          bash \$HOME/$RDIR/search_driver.sh $START $N $CHUNK $GPUS"
   fi
   ;;
@@ -333,17 +387,40 @@ bench-gpu-knobs)
 
 validate)
   CFG="${1:-}"; shift || true; [ $# -gt 0 ] || die "usage: validate CFG NONCE..."
-  for nonce in "$@"; do
+  if truthy "${VALIDATE_REUSE_OPS:-0}"; then
+    eval_supports_tail_nonce || die "VALIDATE_REUSE_OPS=1 needs patches/eval_fast_reject.diff applied and eval_circuit rebuilt"
     d="$(mktemp -d)"
-    ( cd "$d" && env ${CFG:+$CFG} DIALOG_TAIL_NONCE="$nonce" "$BIN/build_circuit" >/dev/null 2>&1 )
-    out=$( cd "$d" && env ${CFG:+$CFG} EVAL_FAST_REJECT="${EVAL_FAST_REJECT:-1}" DIALOG_TAIL_NONCE="$nonce" "$BIN/eval_circuit" --note "isl-$nonce" 2>&1 ); rm -rf "$d"
-    cls=$(echo "$out"|grep "classical mismatches"|grep -oE '[0-9]+$'); pha=$(echo "$out"|grep "phase-garbage"|grep -oE '[0-9]+$')
-    anc=$(echo "$out"|grep "ancilla-garbage"|grep -oE '[0-9]+$'); tof=$(echo "$out"|grep "avg executed Toffoli"|grep -oE '[0-9.]+'|head -1)
-    q=$(echo "$out"|grep -E '^  qubits '|grep -oE '[0-9]+$'|head -1)
-    if [ "${cls:-x}" = 0 ] && [ "${pha:-x}" = 0 ] && [ "${anc:-x}" = 0 ]; then
-      echo "CLEAN nonce=$nonce tof=$tof qubits=$q score=$(python3 -c "print(int(round(float('$tof')))*int('$q'))")"
-    else echo "dirty nonce=$nonce cls=${cls:-?} pha=${pha:-?} anc=${anc:-?}"; fi
-  done
+    build_out=$( cd "$d" && env ${CFG:+$CFG} DIALOG_TAIL_NONCE=0 "$BIN/build_circuit" 2>&1 )
+    build_rc=$?
+    if [ "$build_rc" -ne 0 ]; then
+      detail=$(echo "$build_out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')
+      rm -rf "$d"
+      for nonce in "$@"; do emit_validation_record "ERROR nonce=$nonce stage=build rc=$build_rc detail=${detail:-build_circuit failed}"; done
+      exit 0
+    fi
+    for nonce in "$@"; do
+      out=$( cd "$d" && env ${CFG:+$CFG} EVAL_FAST_REJECT="${EVAL_FAST_REJECT:-1}" EVAL_TAIL_NONCE="$nonce" "$BIN/eval_circuit" --note "isl-$nonce" 2>&1 )
+      eval_rc=$?
+      emit_validation_line "$nonce" "$out" "$eval_rc"
+    done
+    rm -rf "$d"
+  else
+    for nonce in "$@"; do
+      d="$(mktemp -d)"
+      build_out=$( cd "$d" && env ${CFG:+$CFG} DIALOG_TAIL_NONCE="$nonce" "$BIN/build_circuit" 2>&1 )
+      build_rc=$?
+      if [ "$build_rc" -ne 0 ]; then
+        detail=$(echo "$build_out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')
+        rm -rf "$d"
+        emit_validation_record "ERROR nonce=$nonce stage=build rc=$build_rc detail=${detail:-build_circuit failed}"
+        continue
+      fi
+      out=$( cd "$d" && env ${CFG:+$CFG} EVAL_FAST_REJECT="${EVAL_FAST_REJECT:-1}" DIALOG_TAIL_NONCE="$nonce" "$BIN/eval_circuit" --note "isl-$nonce" 2>&1 )
+      eval_rc=$?
+      rm -rf "$d"
+      emit_validation_line "$nonce" "$out" "$eval_rc"
+    done
+  fi
   ;;
 
 bake)

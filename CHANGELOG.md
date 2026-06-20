@@ -4,6 +4,36 @@ This file records not only what changed, but also why we made the change, what s
 we expect, and what still needs to be validated. For future work, add an entry whenever a
 change affects search behavior, performance assumptions, correctness risk, or workflow.
 
+## 2026-06-19 - Validation build cache via tail nonce override
+
+Branch: `codex/ludicrous-gpu-filter`
+
+### Validation ledger hygiene
+
+Added validate-only durable ledger support. When `VALIDATE_RESULTS_LOG` is set,
+`island.sh validate` appends successful `dirty` / `CLEAN` verdict lines to that file while
+routing `ERROR ... stage=build/eval ...` rows to `VALIDATE_ERRORS_LOG` (or `errors.log` next to
+the results file by default). Appends use `flock` when available.
+
+This keeps distributed validation result ledgers parseable during cached multi-process
+validation, and prevents interrupted `build_circuit` / `eval_circuit` processes from being
+counted as validated candidates. Error nonces remain retryable.
+
+### Summary
+
+Added a validate-only cache path for candidate batches. With `VALIDATE_REUSE_OPS=1`,
+`island.sh validate` builds the circuit once with `DIALOG_TAIL_NONCE=0`, then evaluates
+each supplied nonce by setting `EVAL_TAIL_NONCE=<nonce>` in the trusted evaluator. The
+evaluator verifies that the final 96 ops are the standard `X;X` identity tail on `tx[0]`
+/ `tx[1]` before synthesizing the candidate tail into the Fiat-Shamir hash.
+
+### Expected impact
+
+This removes repeated `build_circuit` calls from validation batches without changing the
+simulated unitary. On the q1162 timing check, three old-style builds took 159.9s total
+while one cached nonce-0 build took 54.9s; the default 32-candidate batch should save
+roughly 31 repeated builds.
+
 ## 2026-06-10 - Safer 1221-SOTA scan recipe; demote `single_pass`
 
 Branch: `main`

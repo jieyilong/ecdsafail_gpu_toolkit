@@ -164,6 +164,13 @@ fn feed_x_op_bytes(k: &mut Keccak, q_target: u64) {
     k.absorb(&NO.to_le_bytes());
 }
 
+fn truthy_env(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
 fn main() {
     std::env::set_var("DIALOG_TAIL_NONCE", "0");
     let ops = point_add::build();
@@ -285,6 +292,19 @@ fn main() {
     w64(&mut f, probe);
     wu256(&mut f, k1);
     wu256(&mut f, k2);
+    if truthy_env("TRAILMIX_GPU_THIN")
+        || truthy_env("GPU_TRAILMIX_THIN")
+        || matches!(
+            std::env::var("GPU_FILTER").ok().as_deref(),
+            Some("trailmix" | "trailmix_thin" | "thin")
+        )
+    {
+        eprintln!(
+            "error: trailmix-thin TPZ3 state dump is disabled in this branch; \
+             use GPU_FILTER=ludicrous for the bdb1d22 TrailMix-ludicrous circuit"
+        );
+        std::process::exit(2);
+    }
     f.flush().unwrap();
     eprintln!("wrote {} ({} bytes header+arrays+comb)", path, "?");
     eprintln!("DONE");

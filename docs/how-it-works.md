@@ -21,6 +21,11 @@ stream)`**. Appending a fixed-length **96-gate identity tail** (X;X pairs — ph
 no-op, zero Toffoli, zero qubits) selected by `DIALOG_TAIL_NONCE` changes the serialized
 bytes and therefore **reseeds all 9,024 inputs**.
 
+Validation batches can reuse that structure. `VALIDATE_REUSE_OPS=1` builds the circuit
+once with nonce 0, then the patched evaluator hashes each candidate's exact 96-op identity
+tail via `EVAL_TAIL_NONCE`. The simulated circuit body is unchanged because the tail is
+only `X;X` identity pairs.
+
 Every score win comes from *truncating* the worst-case provisioning down to the typical
 case — narrowing a comparator (drop always-zero high bits), tapering register width as u/v
 shrink, or emitting fewer GCD iterations than the worst input needs. Each truncation is
@@ -57,8 +62,17 @@ width-envelope overflow or non-convergence — the dominant source of "hard" inp
   and `GPU_FAN_BITS=K` (nonce-fan) precomputes the SHAKE prefix for the low `K` tail bits.
   `GPU_GCD_MODE=single_pass` and `GPU_GCD_MODE=trunc_only` are experimental filters and must
   not be used for production without a known-clean nonce check; `single_pass` missed the baked
-  clean nonce on the 1221-qubit SOTA. Separately, `EVAL_FAST_REJECT=1` speeds the *eval* phase
-  by stopping at the first failing batch. See `docs/measured-speedups.md` for measured gains.
+  clean nonce on the 1221-qubit SOTA. For TrailMix/shrunken-PZ scans, use
+  `GPU_TRAILMIX_WINDOW=1` with a TPZ3 state dump to enable the stricter schedule-window
+  checks: the GPU rejects factors that violate the circuit's exact per-step low-window
+  and shift bounds. `GPU_TRAILMIX_SLACK=1` is kept as a compatibility spelling for the
+  same safe TPZ3 schedule-window filter; it no longer applies the older width-margin
+  heuristic, which could miss clean nonces such as q956 nonce `676055`.
+  For the accepted TrailMix-ludicrous product-min circuit family (`bdb1d22`), use
+  `GPU_FILTER=ludicrous` instead; it replays the baked `SCHED_J2`/`GAP_J2` jump-GCD
+  schedule and was smoke-tested against submitted nonce `28565`.
+  Separately, `EVAL_FAST_REJECT=1` speeds the *eval* phase by stopping at the first failing
+  batch. See `docs/measured-speedups.md` for measured gains.
 
 ## The filter's blind spot (why you still validate)
 The pre-filter models the **GCD** (width + convergence) but **not the apply phase**. So a
