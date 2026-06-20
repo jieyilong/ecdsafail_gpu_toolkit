@@ -469,7 +469,11 @@ stage2)
     extract_nonces < "$CAND" > "$ALL"
   fi
   extract_file_nonces "$OUT" > "$SEEN"
-  awk 'NR==FNR { done[$1]=1; next } !($1 in done)' "$SEEN" "$ALL" > "$TODO"
+  if [ -s "$SEEN" ]; then
+    awk 'NR==FNR { done[$1]=1; next } !($1 in done)' "$SEEN" "$ALL" > "$TODO"
+  else
+    cp "$ALL" "$TODO"
+  fi
   total=$(wc -l < "$ALL" | tr -d ' ')
   seen=$(wc -l < "$SEEN" | tr -d ' ')
   todo=$(wc -l < "$TODO" | tr -d ' ')
