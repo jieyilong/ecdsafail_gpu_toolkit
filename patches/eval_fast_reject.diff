@@ -1,11 +1,107 @@
 diff --git a/src/bin/eval_circuit.rs b/src/bin/eval_circuit.rs
-index ab15ba9..3fe9567 100644
+index ab15ba9..f2cb7aa 100644
 --- a/src/bin/eval_circuit.rs
 +++ b/src/bin/eval_circuit.rs
-@@ -221,32 +221,52 @@ fn run_tests(
+@@ -180,20 +180,85 @@ fn secp256k1() -> WeierstrassEllipticCurve {
+ // SHAKE256 over the op stream. Determines test inputs, simulator RNG for
+ // R/Hmr phase randomization, etc.
+
+-fn fiat_shamir_seed(ops: &[Op]) -> sha3::Shake256Reader {
++fn env_u64(name: &str) -> Option<u64> {
++    std::env::var(name).ok().and_then(|s| s.parse::<u64>().ok())
++}
++
++fn feed_hash_op(hasher: &mut Shake256, op: &Op) {
++    hasher.update(&[op.kind as u8]);
++    hasher.update(&op.q_control2.0.to_le_bytes());
++    hasher.update(&op.q_control1.0.to_le_bytes());
++    hasher.update(&op.q_target.0.to_le_bytes());
++    hasher.update(&op.c_target.0.to_le_bytes());
++    hasher.update(&op.c_condition.0.to_le_bytes());
++    hasher.update(&op.r_target.0.to_le_bytes());
++}
++
++fn feed_tail_x(hasher: &mut Shake256, target: QubitId) {
++    hasher.update(&[OperationType::X as u8]);
++    hasher.update(&u64::MAX.to_le_bytes());
++    hasher.update(&u64::MAX.to_le_bytes());
++    hasher.update(&target.0.to_le_bytes());
++    hasher.update(&u64::MAX.to_le_bytes());
++    hasher.update(&u64::MAX.to_le_bytes());
++    hasher.update(&u64::MAX.to_le_bytes());
++}
++
++fn tail_x_target(op: &Op) -> Option<QubitId> {
++    if op.kind == OperationType::X
++        && op.q_control2.0 == u64::MAX
++        && op.q_control1.0 == u64::MAX
++        && op.c_target.0 == u64::MAX
++        && op.c_condition.0 == u64::MAX
++        && op.r_target.0 == u64::MAX
++        && op.q_target.0 != u64::MAX
++    {
++        Some(op.q_target)
++    } else {
++        None
++    }
++}
++
++fn fiat_shamir_seed(
++    ops: &[Op],
++    tail_nonce: Option<u64>,
++    tx0: QubitId,
++    tx1: QubitId,
++) -> Result<sha3::Shake256Reader, String> {
++    const TAIL_OPS: usize = 96;
+     let mut hasher = Shake256::default();
+     hasher.update(b"quantum_ecc-fiat-shamir-v2");
+     hasher.update(&(ops.len() as u64).to_le_bytes());
+-    for op in ops {
+-        hasher.update(&[op.kind as u8]);
+-        hasher.update(&op.q_control2.0.to_le_bytes());
+-        hasher.update(&op.q_control1.0.to_le_bytes());
+-        hasher.update(&op.q_target.0.to_le_bytes());
+-        hasher.update(&op.c_target.0.to_le_bytes());
+-        hasher.update(&op.c_condition.0.to_le_bytes());
+-        hasher.update(&op.r_target.0.to_le_bytes());
++    if let Some(nonce) = tail_nonce {
++        if ops.len() < TAIL_OPS {
++            return Err("EVAL_TAIL_NONCE requires a 96-op identity tail".to_string());
++        }
++        let prefix_len = ops.len() - TAIL_OPS;
++        for op in &ops[..prefix_len] {
++            feed_hash_op(&mut hasher, op);
++        }
++        let tail = &ops[prefix_len..];
++        for bit in 0..48 {
++            let a = tail_x_target(&tail[2 * bit])
++                .ok_or_else(|| format!("tail op {} is not plain X", 2 * bit))?;
++            let b = tail_x_target(&tail[2 * bit + 1])
++                .ok_or_else(|| format!("tail op {} is not plain X", 2 * bit + 1))?;
++            if a != b {
++                return Err(format!("tail pair {bit} is not an X;X identity pair"));
++            }
++            if a != tx0 && a != tx1 {
++                return Err(format!("tail pair {bit} targets q{}, not tx[0]/tx[1]", a.0));
++            }
++            let q = if (nonce >> bit) & 1 == 1 { tx1 } else { tx0 };
++            feed_tail_x(&mut hasher, q);
++            feed_tail_x(&mut hasher, q);
++        }
++    } else {
++        for op in ops {
++            feed_hash_op(&mut hasher, op);
++        }
+     }
+-    hasher.finalize_xof()
++    Ok(hasher.finalize_xof())
+ }
+
+ // ─── Test runner ──────────────────────────────────────────────────────────
+@@ -221,32 +286,52 @@ fn run_tests(
  ) -> SeedReport {
      let curve = secp256k1();
- 
+
 -    let mut targets = Vec::with_capacity(target_shots);
 -    let mut offsets = Vec::with_capacity(target_shots);
 -    let mut expected = Vec::with_capacity(target_shots);
@@ -72,13 +168,13 @@ index ab15ba9..3fe9567 100644
      }
 -    let n = targets.len();
 +    let n = if fast_reject { ks.len() } else { targets.len() };
- 
+
      let mut sim = Simulator::new(total_qubits as usize, num_bits as usize, &mut xof);
      let mut ok = true;
-@@ -261,27 +281,44 @@ fn run_tests(
+@@ -261,27 +346,44 @@ fn run_tests(
          let bs = BATCH.min(n - batch * BATCH);
          let cond_mask: u64 = if bs == 64 { u64::MAX } else { (1u64 << bs) - 1 };
- 
+
 -        sim.clear_for_shot();
 +        // Batch inputs: precomputed (full path) or derived lazily here (fast path), so an
 +        // early exit never pays for muls of batches it doesn't reach.
@@ -108,9 +204,9 @@ index ab15ba9..3fe9567 100644
 +            sim.set_register(&layout_regs[2], o.0, shot);
 +            sim.set_register(&layout_regs[3], o.1, shot);
          }
- 
+
          sim.apply_iter(ops.iter());
- 
+
          for shot in 0..bs {
              let i = batch * BATCH + shot;
 +            let (_, _, e) = bin[shot];
@@ -127,7 +223,7 @@ index ab15ba9..3fe9567 100644
                      ));
                  }
                  ok = false;
-@@ -329,6 +366,9 @@ fn run_tests(
+@@ -329,6 +431,9 @@ fn run_tests(
              }
              ok = false;
          }
@@ -135,5 +231,36 @@ index ab15ba9..3fe9567 100644
 +            break;
 +        }
      }
- 
+
      let _ = num_bits;
+@@ -488,8 +593,29 @@ fn main() {
+     println!("  qubits      : {}", total_qubits);
+     println!("  bits        : {}", num_bits);
+
++    let tx0 = match regs[0][0] {
++        QubitOrBit::Qubit(q) => q,
++        _ => unreachable!(),
++    };
++    let tx1 = match regs[0][1] {
++        QubitOrBit::Qubit(q) => q,
++        _ => unreachable!(),
++    };
++    let tail_nonce = env_u64("EVAL_TAIL_NONCE");
++    if let Some(nonce) = tail_nonce {
++        println!("  tail nonce override : {nonce}");
++    }
++
+     println!("\n-- correctness tests ({} shots) --", NUM_TESTS);
+-    let xof = fiat_shamir_seed(&ops);
++    let xof = match fiat_shamir_seed(&ops, tail_nonce, tx0, tx1) {
++        Ok(xof) => xof,
++        Err(e) => fail_and_exit(
++            &format!("invalid EVAL_TAIL_NONCE tail override: {e}"),
++            &note,
++            ops.len(),
++            total_qubits,
++        ),
++    };
+     let r = run_tests(&ops, &regs, total_qubits, num_bits, xof, NUM_TESTS);
+     println!("  tested shots            : {}", r.n_shots);
+     println!("  classical mismatches    : {}", r.classical_failures);

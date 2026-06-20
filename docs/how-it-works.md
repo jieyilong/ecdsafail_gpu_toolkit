@@ -21,6 +21,11 @@ stream)`**. Appending a fixed-length **96-gate identity tail** (X;X pairs — ph
 no-op, zero Toffoli, zero qubits) selected by `DIALOG_TAIL_NONCE` changes the serialized
 bytes and therefore **reseeds all 9,024 inputs**.
 
+Validation batches can reuse that structure. `VALIDATE_REUSE_OPS=1` builds the circuit
+once with nonce 0, then the patched evaluator hashes each candidate's exact 96-op identity
+tail via `EVAL_TAIL_NONCE`. The simulated circuit body is unchanged because the tail is
+only `X;X` identity pairs.
+
 Every score win comes from *truncating* the worst-case provisioning down to the typical
 case — narrowing a comparator (drop always-zero high bits), tapering register width as u/v
 shrink, or emitting fewer GCD iterations than the worst input needs. Each truncation is
