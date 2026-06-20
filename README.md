@@ -182,8 +182,21 @@ GPU_GCD_MODE=trunc_first ./island.sh search s.bin 1 2000000
 | `GPU_FAN_BITS` | `0`..`26` | Nonce-fan: precompute the SHAKE sponge for the low `K` tail bits so each nonce only absorbs its high bits. `0` = off. Exact candidate set. Table is `2^K * 208 B` (`K=20`≈208 MiB, `K=24`≈3.5 GiB). Measured gain is small (~+1.5% on the current SOTA base — `squeeze_init` is not the bottleneck there); may help more on init-bound bases. |
 | `EVAL_FAST_REJECT` | `0`/`1` | **Phase-2 (CPU validate) knob, not a scan knob** — no-op on a `search` line. `1` defers the per-shot EC-muls into the batch loop and stops at the **first failing shot**. Speedup is candidate-dependent: early-failing dirty candidates ~1.9s, but GCD-clean-but-eval-dirty ones (what the GPU hunt feeds the validator) fail later → ~6s; vs ~17s stock (~2.6–8.5×). Exact — clean islands still read `0/0/0` and take the full ~17s; with the var unset the eval is byte-identical, so `ecdsafail run` scoring is unaffected (default `0`). `island.sh validate` sets it to `1`. **Setup:** apply `patches/eval_fast_reject.diff` + `cargo build --release --bin eval_circuit` (reset by `ecdsafail sync`; `eval_circuit.rs` is a local tool, not submitted). Per-candidate context: `build_circuit` is only ~1.2s, so the whole per-candidate cost is this eval. |
 | `VALIDATE_REUSE_OPS` | `0`/`1` | **Phase-2 batch validation knob.** `1` builds one nonce-0 `ops.bin` per `validate` invocation, then evaluates each requested nonce with `EVAL_TAIL_NONCE=<nonce>` so the trusted Fiat-Shamir hash sees the exact 96-op identity tail for that nonce. This avoids rebuilding the same circuit body for every candidate. Exact for circuits with the standard fixed 48-pair `DIALOG_TAIL_NONCE` `X;X` tail; the evaluator refuses the override if the tail shape is not present. Requires the updated `patches/eval_fast_reject.diff` and rebuilt `eval_circuit`. |
+| `VALIDATE_RESULTS_LOG` | path | Optional validate-only durable ledger. When set, `island.sh validate` still prints every line to stdout, and also appends successful `dirty` / `CLEAN` verdict lines to this file under `flock` when available. |
+| `VALIDATE_ERRORS_LOG` | path | Optional validate-only error ledger. `ERROR ... stage=build/eval ...` lines are routed here instead of `VALIDATE_RESULTS_LOG`; defaults to `errors.log` next to `VALIDATE_RESULTS_LOG`. Error nonces are retryable and should not be counted as validated. |
+| `VALIDATE_LOCK_FILE` | path | Optional shared lock path for `VALIDATE_RESULTS_LOG` / `VALIDATE_ERRORS_LOG` appends. Defaults to `<VALIDATE_RESULTS_LOG>.lock`. |
 
-**Every improvement is an independent on/off knob** (all default to the conservative/exact baseline): `GPU_BATCH_INV`, `GPU_COMB_BITS`, `GPU_GCD_MODE` (`trunc_first` is the safer fast choice; `single_pass` is experimental), `GPU_WAVE`, `GPU_FAN_BITS`, `EVAL_FAST_REJECT`, and `VALIDATE_REUSE_OPS`. They compose; benchmark combinations with `bench-gpu-knobs`.
+**Every improvement is an independent on/off knob** (all default to the conservative/exact baseline): `GPU_BATCH_INV`, `GPU_COMB_BITS`, `GPU_GCD_MODE` (`trunc_first` is the safer fast choice; `single_pass` is experimental), `GPU_WAVE`, `GPU_FAN_BITS`, `EVAL_FAST_REJECT`, `VALIDATE_REUSE_OPS`, and the optional validation ledger paths. They compose; benchmark combinations with `bench-gpu-knobs`.
+
+For distributed validation, keep the verdict ledger clean and route build/eval failures to a
+separate retry ledger:
+
+```bash
+VALIDATE_REUSE_OPS=1 \
+VALIDATE_RESULTS_LOG=/root/<route>_validation/results.log \
+VALIDATE_ERRORS_LOG=/root/<route>_validation/errors.log \
+  ./island.sh validate "$CFG" <nonce...>
+```
 
 Recommended safer scan settings on the RTX 5090:
 

@@ -97,6 +97,23 @@ the previous-release binary and this branch with the scan baseline both measured
   `EVAL_TAIL_NONCE=<nonce>`. This is exact for circuits with the fixed 96-op `DIALOG_TAIL_NONCE`
   identity tail: the evaluator hashes the synthetic candidate tail but simulates the same
   identity body. Use it for multi-candidate validation batches after applying the same patch.
+- `VALIDATE_RESULTS_LOG=/path/results.log` — optional validate-only durable verdict ledger.
+  `island.sh validate` still prints every result to stdout, and additionally appends successful
+  `dirty` / `CLEAN` verdict lines to this file under `flock` when available.
+- `VALIDATE_ERRORS_LOG=/path/errors.log` — optional validate-only retry ledger for
+  `ERROR ... stage=build/eval ...` rows. If omitted, errors go to `errors.log` next to
+  `VALIDATE_RESULTS_LOG`. Do not count these nonces as validated; rerun them.
+- `VALIDATE_LOCK_FILE=/path/validate.lock` — optional shared append lock. Use one lock across
+  `results.log` and `errors.log` when multiple validators run on the same host.
+
+For remote distributed validation, prefer:
+
+```bash
+VALIDATE_REUSE_OPS=1 \
+VALIDATE_RESULTS_LOG=/root/<route>_validation/results.log \
+VALIDATE_ERRORS_LOG=/root/<route>_validation/errors.log \
+./island.sh validate "$CFG" <nonce...>
+```
 
 For production island searches on a large NVIDIA GPU, prefer the safer fast mode that has
 passed a known-clean nonce check on the current base. As of the RTX 5090 measurements on the

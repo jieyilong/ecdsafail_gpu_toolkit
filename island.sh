@@ -29,6 +29,28 @@ line_score_suffix(){ # tof qubits
   score=$(awk -v t="$tof" -v q="$q" 'BEGIN{printf "%d", int(t + 0.5) * q}')
   printf ' score=%s' "$score"
 }
+emit_validation_record(){ # line
+  local line="$1" dest lock dir
+  echo "$line"
+  [ -n "${VALIDATE_RESULTS_LOG:-}" ] || return 0
+  case "$line" in
+    ERROR*)
+      dest="${VALIDATE_ERRORS_LOG:-$(dirname "$VALIDATE_RESULTS_LOG")/errors.log}"
+      ;;
+    *)
+      dest="$VALIDATE_RESULTS_LOG"
+      ;;
+  esac
+  dir="$(dirname "$dest")"
+  mkdir -p "$dir"
+  lock="${VALIDATE_LOCK_FILE:-$VALIDATE_RESULTS_LOG.lock}"
+  mkdir -p "$(dirname "$lock")"
+  if command -v flock >/dev/null 2>&1; then
+    { flock 9; printf '%s\n' "$line" >> "$dest"; } 9>"$lock"
+  else
+    printf '%s\n' "$line" >> "$dest"
+  fi
+}
 
 # ---- config helpers (init-* don't require an existing config.env) ----
 cmd="${1:-help}"; shift || true
@@ -88,13 +110,13 @@ emit_validation_line(){ # nonce out eval_rc
   q=$(echo "$out"|grep -E '^  qubits '|grep -oE '[0-9]+$'|head -1)
   if [ -z "${cls:-}" ] || [ -z "${pha:-}" ] || [ -z "${anc:-}" ]; then
     detail=$(echo "$out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')
-    echo "ERROR nonce=$nonce stage=eval rc=$eval_rc detail=${detail:-eval_circuit failed}"
+    emit_validation_record "ERROR nonce=$nonce stage=eval rc=$eval_rc detail=${detail:-eval_circuit failed}"
     return
   fi
   if [ "${cls:-x}" = 0 ] && [ "${pha:-x}" = 0 ] && [ "${anc:-x}" = 0 ]; then
-    echo "CLEAN nonce=$nonce tof=$tof qubits=$q$(line_score_suffix "$tof" "$q")"
+    emit_validation_record "CLEAN nonce=$nonce tof=$tof qubits=$q$(line_score_suffix "$tof" "$q")"
   else
-    echo "dirty nonce=$nonce cls=${cls:-?} pha=${pha:-?} anc=${anc:-?}"
+    emit_validation_record "dirty nonce=$nonce cls=${cls:-?} pha=${pha:-?} anc=${anc:-?}"
   fi
 }
 run_variant_search(){ # envs state start n chunk
@@ -373,7 +395,7 @@ validate)
     if [ "$build_rc" -ne 0 ]; then
       detail=$(echo "$build_out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')
       rm -rf "$d"
-      for nonce in "$@"; do echo "ERROR nonce=$nonce stage=build rc=$build_rc detail=${detail:-build_circuit failed}"; done
+      for nonce in "$@"; do emit_validation_record "ERROR nonce=$nonce stage=build rc=$build_rc detail=${detail:-build_circuit failed}"; done
       exit 0
     fi
     for nonce in "$@"; do
@@ -390,7 +412,7 @@ validate)
       if [ "$build_rc" -ne 0 ]; then
         detail=$(echo "$build_out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')
         rm -rf "$d"
-        echo "ERROR nonce=$nonce stage=build rc=$build_rc detail=${detail:-build_circuit failed}"
+        emit_validation_record "ERROR nonce=$nonce stage=build rc=$build_rc detail=${detail:-build_circuit failed}"
         continue
       fi
       out=$( cd "$d" && env ${CFG:+$CFG} EVAL_FAST_REJECT="${EVAL_FAST_REJECT:-1}" DIALOG_TAIL_NONCE="$nonce" "$BIN/eval_circuit" --note "isl-$nonce" 2>&1 )

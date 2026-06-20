@@ -8,6 +8,17 @@ change affects search behavior, performance assumptions, correctness risk, or wo
 
 Branch: `codex/ludicrous-gpu-filter`
 
+### Validation ledger hygiene
+
+Added validate-only durable ledger support. When `VALIDATE_RESULTS_LOG` is set,
+`island.sh validate` appends successful `dirty` / `CLEAN` verdict lines to that file while
+routing `ERROR ... stage=build/eval ...` rows to `VALIDATE_ERRORS_LOG` (or `errors.log` next to
+the results file by default). Appends use `flock` when available.
+
+This keeps distributed validation result ledgers parseable during cached multi-process
+validation, and prevents interrupted `build_circuit` / `eval_circuit` processes from being
+counted as validated candidates. Error nonces remain retryable.
+
 ### Summary
 
 Added a validate-only cache path for candidate batches. With `VALIDATE_REUSE_OPS=1`,
