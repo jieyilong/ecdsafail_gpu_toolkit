@@ -86,14 +86,19 @@ stage 1, then run `./island.sh stage2` on the emitted candidates. Stage 2 is not
 it invokes the trusted evaluator on a configurable Fiat-Shamir shot prefix with
 `EVAL_FAST_REJECT=1`. Any rejection is a real circuit violation on a checked shot, so a clean
 9024-shot nonce cannot be lost. A pass is only a `stage2-pass`; it must still be fully
-validated before baking or submitting.
+validated before baking or submitting. The command builds one nonce-0 `ops.bin` for the
+whole stage-2 invocation, then evaluates candidate nonces in parallel with `EVAL_TAIL_NONCE`;
+results are appended as soon as each nonce finishes, so long validation batches can be tailed
+or resumed.
 
 Validation can also skip nearly all per-candidate circuit-building cost. The point-add circuit
 body is independent of `DIALOG_TAIL_NONCE`; only the final 96 identity-tail ops change their
-target qubit IDs to reseed SHAKE256. With the stage-2 evaluator patch, `VALIDATE_REUSE_OPS=1`
-builds nonce 0 once, keeps that `ops.bin`, and asks `eval_circuit` to hash the tail as
+target qubit IDs to reseed SHAKE256. With the stage-2 evaluator patch, validation can build
+nonce 0 once, keep that `ops.bin`, and ask `eval_circuit` to hash the tail as
 `EVAL_TAIL_NONCE=<candidate>` for each candidate. The simulator still runs the nonce-0 tail,
-which is equivalent because each tail bit is an `X;X` identity pair.
+which is equivalent because each tail bit is an `X;X` identity pair. `./island.sh stage2`
+uses that one-build path automatically; `VALIDATE_REUSE_OPS=1 ./island.sh validate ...`
+offers the same trick for ad hoc validation batches.
 
 ## Pipeline summary
 ```

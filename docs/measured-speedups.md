@@ -64,7 +64,7 @@ Combination caveat: `GPU_WAVE=256` *hurts* in batch mode (lower occupancy), so t
 combo uses `GPU_WAVE=128` — e.g. `all_exact` (which forces wave256) measured slower than
 `batch_comb16`.
 
-## Per-candidate validation cost: it's all eval, not build
+## Per-candidate validation cost: eval dominates, but build reuse matters at scale
 
 A common misconception is that `build_circuit` is the slow part. Profiled on the RTX-5090
 SOTA base:
@@ -75,9 +75,13 @@ SOTA base:
 | `eval_circuit` (stock, clean) | **~16.9 s** | full 9024-shot simulation |
 | `eval_circuit` (stock, **dirty**) | **~16.9 s** | ⚠️ stock eval does **not** fail-fast — it simulates all shots and *counts* mismatches |
 
-So per-candidate time is dominated by `eval_circuit` (~17 s), and the stock eval is ~17 s even
-for *dirty* candidates. `build_circuit` (~1.2 s) is not worth optimizing; trimming the 550 MB
-disk round-trip (in-memory pipe) would save <1 s.
+So per-candidate time is usually dominated by `eval_circuit` (~17 s), and the stock eval is
+~17 s even for *dirty* candidates. For one-off full validation, shaving the 550 MB build
+round-trip is secondary to fast-rejecting eval. For high-density TrailMix-ludicrous stage-2
+filtering, though, thousands of candidates can hit the validator, so repeated builds are pure
+waste. `./island.sh stage2` therefore builds one nonce-0 `ops.bin` once per invocation and
+uses `EVAL_TAIL_NONCE` to evaluate every candidate as an input. That removes build cost from
+the inner candidate loop without changing the simulated unitary.
 
 ## Eval phase (`EVAL_FAST_REJECT`, exact) — the one big exact win
 

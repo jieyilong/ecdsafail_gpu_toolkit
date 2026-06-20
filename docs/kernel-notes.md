@@ -87,8 +87,10 @@ nonce.
 - `VALIDATE_REUSE_OPS=1` makes validation build one nonce-0 `ops.bin` and reuse it for
   a batch of nonces. The patched evaluator's `EVAL_TAIL_NONCE` rewrites only the
   Fiat-Shamir hash of the 96-op identity tail, so this removes repeated `build_circuit`
-  cost while preserving exact candidate inputs. `stage2` enables this automatically and
-  batches candidates with `STAGE2_BATCH` (default `32`).
+  cost while preserving exact candidate inputs. `stage2` uses the same one-build idea
+  directly: it builds once for the whole invocation, then evaluates one candidate nonce
+  per worker. `STAGE2_BATCH` is deprecated and ignored; use `JOBS` / `STAGE2_JOBS` for
+  parallelism.
 - `VALIDATE_RESULTS_LOG` / `VALIDATE_ERRORS_LOG` can split durable validation verdicts
   from retryable build/eval errors during distributed validation.
 

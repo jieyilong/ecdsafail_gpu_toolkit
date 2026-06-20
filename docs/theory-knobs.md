@@ -311,6 +311,9 @@ The patch also supports `EVAL_TAIL_NONCE`, which removes repeated circuit-build 
 the nonce tail is fixed-length `X;X` identities, a nonce-0 `ops.bin` has the same unitary as
 any nonce's `ops.bin`; only the serialized tail target IDs change the Fiat-Shamir hash. The
 validator can therefore build once and hash the tail as the candidate nonce during eval.
+`./island.sh stage2` uses this directly: one build per stage-2 invocation, parallel
+candidate evals with `EVAL_TAIL_NONCE`, and immediate `stage2-pass` / `stage2-reject`
+log streaming. `STAGE2_BATCH` is no longer part of the stage-2 cost model.
 
 ## `dx`-First Quick Filter
 

@@ -460,8 +460,10 @@ stage2)
   CFG="${1:-}"; CAND="${2:-}"; OUT="${3:-stage2-results.log}"; JOBS="${4:-$(default_jobs)}"
   [ -n "$CAND" ] || die "usage: stage2 CFG CANDIDATES|- [RESULTS.log] [JOBS]"
   [ "$JOBS" -gt 0 ] 2>/dev/null || die "JOBS must be a positive integer"
+  eval_supports_tail_nonce || die "stage2 needs patches/eval_stage2_prefilter.diff applied and eval_circuit rebuilt with EVAL_TAIL_NONCE support"
   ALL="$(mktemp)"; SEEN="$(mktemp)"; TODO="$(mktemp)"
-  trap 'rm -f "$ALL" "$SEEN" "$TODO"' EXIT
+  WORK="$(mktemp -d)"
+  trap 'rm -f "$ALL" "$SEEN" "$TODO"; rm -rf "$WORK"' EXIT
   if [ "$CAND" = "-" ]; then
     extract_nonces > "$ALL"
   else
@@ -477,27 +479,52 @@ stage2)
   total=$(wc -l < "$ALL" | tr -d ' ')
   seen=$(wc -l < "$SEEN" | tr -d ' ')
   todo=$(wc -l < "$TODO" | tr -d ' ')
-  echo ">> stage2 exact prefilter: candidates=$total already_logged=$seen todo=$todo shots=${EVAL_SHOT_LIMIT:-$EVAL_STAGE2_SHOTS} jobs=$JOBS out=$OUT"
+  EVAL_STAGE2_PREFIX="${EVAL_SHOT_LIMIT:-$EVAL_STAGE2_SHOTS}"
+  [ "$EVAL_STAGE2_PREFIX" -gt 0 ] 2>/dev/null || die "EVAL_STAGE2_SHOTS/EVAL_SHOT_LIMIT must be a positive integer"
+  EVAL_FAST_REJECT="${EVAL_FAST_REJECT:-1}"
+  echo ">> stage2 exact prefilter: candidates=$total already_logged=$seen todo=$todo shots=$EVAL_STAGE2_PREFIX jobs=$JOBS fast_reject=$EVAL_FAST_REJECT out=$OUT"
   if [ "$todo" = 0 ]; then
     echo ">> stage2: no new candidates"
     exit 0
   fi
   mkdir -p "$(dirname "$OUT")"
-  export EVAL_STAGE2_PREFIX="${EVAL_SHOT_LIMIT:-$EVAL_STAGE2_SHOTS}"
-  export EVAL_FAST_REJECT="${EVAL_FAST_REJECT:-1}"
-  export STAGE2_BATCH="${STAGE2_BATCH:-32}"
-  xargs -n "$STAGE2_BATCH" -P "$JOBS" bash -c '
-    self="$1"; cfg="$2"; out_file="$3"; shift 3
-    line=$(VALIDATE_REUSE_OPS=1 EVAL_STAGE2_MODE=1 EVAL_SHOT_LIMIT="$EVAL_STAGE2_PREFIX" "$self" validate "$cfg" "$@" 2>&1)
+  if [ -n "${STAGE2_BATCH:-}" ]; then
+    echo ">> stage2: STAGE2_BATCH is ignored; this command now builds once and evaluates one nonce per worker"
+  fi
+  echo ">> stage2: building reusable nonce-0 ops.bin"
+  build_out=$( cd "$WORK" && env ${CFG:+$CFG} DIALOG_TAIL_NONCE=0 "$BIN/build_circuit" 2>&1 )
+  build_rc=$?
+  if [ "$build_rc" -ne 0 ]; then
+    detail=$(echo "$build_out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g' | cut -c1-2000)
+    die "stage2 build failed rc=$build_rc detail=${detail:-build_circuit failed}"
+  fi
+  [ -s "$WORK/ops.bin" ] || die "stage2 build did not produce ops.bin in $WORK"
+  export EVAL_STAGE2_PREFIX EVAL_FAST_REJECT
+  xargs -n 1 -P "$JOBS" bash -c '
+    bin="$1"; work="$2"; cfg="$3"; out_file="$4"; lock_file="$5"; prefix="$6"; fast="$7"; nonce="$8"
+    out=$( cd "$work" && env ${cfg:+$cfg} EVAL_STAGE2_MODE=1 EVAL_FAST_REJECT="$fast" EVAL_SHOT_LIMIT="$prefix" EVAL_TAIL_NONCE="$nonce" "$bin/eval_circuit" --note "stage2-$nonce" 2>&1 )
     rc=$?
-    if [ "$rc" -ne 0 ] && ! echo "$line" | grep -Eq "^(stage2-pass|stage2-reject|dirty|CLEAN|ERROR) nonce="; then
-      detail=$(echo "$line" | tr "\n" " " | sed -E "s/[[:space:]]+/ /g")
-      first="${1:-unknown}"
-      line="ERROR nonce=$first stage=stage2 rc=$rc detail=${detail:-stage2 failed}"
+    cls=$(printf "%s\n" "$out" | grep "classical mismatches" | grep -oE "[0-9]+$" | tail -1)
+    pha=$(printf "%s\n" "$out" | grep "phase-garbage" | grep -oE "[0-9]+$" | tail -1)
+    anc=$(printf "%s\n" "$out" | grep "ancilla-garbage" | grep -oE "[0-9]+$" | tail -1)
+    tof=$(printf "%s\n" "$out" | grep "avg executed Toffoli" | grep -oE "[0-9.]+" | head -1)
+    q=$(printf "%s\n" "$out" | grep -E "^  qubits " | grep -oE "[0-9]+$" | head -1)
+    shots=$(printf "%s\n" "$out" | grep "tested shots" | grep -oE "[0-9]+$" | head -1)
+    if [ -z "${cls:-}" ] || [ -z "${pha:-}" ] || [ -z "${anc:-}" ]; then
+      detail=$(printf "%s\n" "$out" | tr "\n" " " | sed -E "s/[[:space:]]+/ /g" | cut -c1-2000)
+      line="ERROR nonce=$nonce stage=stage2 rc=$rc detail=${detail:-eval_circuit failed}"
+    elif [ "$cls" = 0 ] && [ "$pha" = 0 ] && [ "$anc" = 0 ]; then
+      line="stage2-pass nonce=$nonce shots=${shots:-?} cls=0 pha=0 anc=0 tof=${tof:-?} qubits=${q:-?}"
+    else
+      line="stage2-reject nonce=$nonce shots=${shots:-?} cls=${cls:-?} pha=${pha:-?} anc=${anc:-?} tof=${tof:-?} qubits=${q:-?}"
     fi
-    printf "%s\n" "$line" >> "$out_file"
+    if command -v flock >/dev/null 2>&1; then
+      { flock 9; printf "%s\n" "$line" >> "$out_file"; } 9>"$lock_file"
+    else
+      printf "%s\n" "$line" >> "$out_file"
+    fi
     printf "%s\n" "$line"
-  ' _ "$SELF" "$CFG" "$OUT" < "$TODO"
+  ' _ "$BIN" "$WORK" "$CFG" "$OUT" "$OUT.lock" "$EVAL_STAGE2_PREFIX" "$EVAL_FAST_REJECT" < "$TODO"
   echo ">> stage2 survivors: $(grep -c '^stage2-pass nonce=' "$OUT" 2>/dev/null || true)"
   ;;
 
