@@ -83,12 +83,14 @@ the previous-release binary and this branch with the scan baseline both measured
   each nonce only absorbs its high bits. Exact. Table is `2^K * 208 B`. Measured ~+1.5% on the
   current SOTA base (`squeeze_init` is not the bottleneck there).
 - `EVAL_FAST_REJECT=1` — **eval early-exit (Phase-2 / validate only)**: defers the per-shot
-  EC-muls into the batch loop and stops at the **first failing shot**. Exact: a clean island
-  still reads `0/0/0` (verified), and with the var unset the eval is byte-identical, so
-  `ecdsafail run` scoring is unaffected. Realized speedup is **candidate-dependent** (it stops
-  at the first bad shot): early-failing dirty candidates hit ~1.9s, but GCD-clean-but-eval-dirty
-  ones — exactly what a GPU hunt feeds the validator — fail *later*, ~6s; vs ~17s stock
-  (~2.6–8.5×). Clean islands still take the full ~17s (they must check all 9024 shots).
+  EC-muls into the batch loop and stops at the **first failing 64-shot batch**. Exact for
+  clean/dirty: a clean island still reads `0/0/0` (verified), and with the var unset the eval is
+  byte-identical, so `ecdsafail run` scoring is unaffected. Fast dirty triples are prefix/batch
+  diagnostics, not full 9024-shot counts: `cls` can exceed 1 if multiple lanes fail in the first
+  bad batch, while `pha`/`anc` count bad batches. Realized speedup is **candidate-dependent**:
+  early-failing dirty candidates hit ~1.9s, but GCD-clean-but-eval-dirty ones — exactly what a
+  GPU hunt feeds the validator — fail *later*, ~6s; vs ~17s stock (~2.6–8.5×). Clean islands
+  still take the full ~17s (they must check all 9024 shots).
   **Needs `patches/eval_fast_reject.diff` applied + `cargo build --release --bin eval_circuit`**
   (reset by `ecdsafail sync`; `eval_circuit.rs` is a local tool, not a submitted file, so this
   never touches the grader). `island.sh validate` sets `EVAL_FAST_REJECT=1` by default.
@@ -96,7 +98,15 @@ the previous-release binary and this branch with the scan baseline both measured
   once per `validate` invocation, then evaluates every requested candidate with
   `EVAL_TAIL_NONCE=<nonce>`. This is exact for circuits with the fixed 96-op `DIALOG_TAIL_NONCE`
   identity tail: the evaluator hashes the synthetic candidate tail but simulates the same
-  identity body. Use it for multi-candidate validation batches after applying the same patch.
+  identity body. Use it for local/small multi-candidate validation batches after applying the
+  same patch.
+
+  **Remote high-parallelism rule:** build the nonce-0 `ops.bin` **once per host**, make it
+  read-only, then run many parallel `eval_circuit` processes from that same directory with
+  different `EVAL_TAIL_NONCE=<nonce>` values. Do **not** run `VALIDATE_REUSE_OPS=1` separately
+  in every worker process for large batches: that builds one giant temp `ops.bin` per worker,
+  wasting disk and throttling CPU parallelism. The op stream is identical and read-only; only the
+  evaluator's Fiat-Shamir tail hash changes per nonce.
 
 For production island searches on a large NVIDIA GPU, prefer the safer fast mode that has
 passed a known-clean nonce check on the current base. As of the RTX 5090 measurements on the

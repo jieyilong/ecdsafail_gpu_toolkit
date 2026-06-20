@@ -26,6 +26,13 @@ once with nonce 0, then the patched evaluator hashes each candidate's exact 96-o
 tail via `EVAL_TAIL_NONCE`. The simulated circuit body is unchanged because the tail is
 only `X;X` identity pairs.
 
+For remote high-parallel validation, reuse must happen **per host**, not per worker. Build one
+nonce-0 `ops.bin` in a shared validation directory, mark it read-only, and launch many
+`eval_circuit` processes from that directory with different `EVAL_TAIL_NONCE` values. The op
+stream is identical for all candidates; only the trusted evaluator's Fiat-Shamir input changes.
+Running many independent `VALIDATE_REUSE_OPS=1 ./island.sh validate ...` processes builds one
+large temp `ops.bin` per process and can waste disk while underusing CPU parallelism.
+
 Every score win comes from *truncating* the worst-case provisioning down to the typical
 case — narrowing a comparator (drop always-zero high bits), tapering register width as u/v
 shrink, or emitting fewer GCD iterations than the worst input needs. Each truncation is

@@ -85,6 +85,9 @@ nonce.
   nonce-0 circuit body, then validates each supplied candidate by setting `EVAL_TAIL_NONCE`
   in the patched evaluator. This removes repeated `build_circuit` calls from validation
   batches and is exact for the standard fixed 96-op `DIALOG_TAIL_NONCE` identity tail.
+  For high-parallel remote validation, build the nonce-0 `ops.bin` once per host and share it
+  read-only across many `eval_circuit` processes. Avoid one `VALIDATE_REUSE_OPS=1` process per
+  worker on huge circuits, because that creates one temp `ops.bin` per worker.
 
 Recommended safer search settings on the RTX 5090:
 

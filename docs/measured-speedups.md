@@ -82,9 +82,11 @@ disk round-trip (in-memory pipe) would save <1 s.
 ## Eval phase (`EVAL_FAST_REJECT`, exact) — the one big exact win
 
 `EVAL_FAST_REJECT=1` defers the per-shot EC scalar-mults into the batch loop and stops at the
-**first failing shot**. It is exact: a clean island still simulates all 9024 shots and reads
-`0/0/0` (re-verified on the current base), and with the var unset the path is byte-identical
-(`ecdsafail run` still scores 1766121990).
+**first failing 64-shot batch**. It is exact for clean/dirty: a clean island still simulates all
+9024 shots and reads `0/0/0` (re-verified on the current base), and with the var unset the path is
+byte-identical (`ecdsafail run` still scores 1766121990). Fast dirty triples are prefix/batch
+diagnostics, not full 9024-shot counts: `cls` can exceed 1 if multiple lanes fail in the first bad
+batch, while `pha`/`anc` count bad batches.
 
 | candidate type | stock eval | `EVAL_FAST_REJECT=1` | speedup |
 |---|---:|---:|---:|
@@ -92,7 +94,7 @@ disk round-trip (in-memory pipe) would save <1 s.
 | **GCD-clean but eval-dirty** (what a GPU hunt feeds the validator) | ~17 s | **~6 s** | **~2.6×** |
 | clean island | ~17 s | ~17 s (must check all shots) | 1× |
 
-The realized speedup is **candidate-dependent** — it exits at the *first* bad shot, so it
+The realized speedup is **candidate-dependent** — it exits at the *first* bad batch, so it
 helps most when failures are early. GCD-clean candidates already passed the GCD filter, so
 they fail *later* (in the apply/phase tail), landing around ~6 s rather than the ~1.9 s of
 arbitrary dirty nonces. Still a real win on the dominant cost: per-candidate validation drops
