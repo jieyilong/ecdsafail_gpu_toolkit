@@ -77,7 +77,7 @@ tail_nonce(){
     | tail -1 | grep -oE '"[0-9]+"' | tr -d '"'
 }
 eval_supports_tail_nonce(){
-  strings "$BIN/eval_circuit" 2>/dev/null | grep -q "EVAL_TAIL_NONCE"
+  grep -a -q "EVAL_TAIL_NONCE" "$BIN/eval_circuit" 2>/dev/null
 }
 emit_validation_line(){ # nonce out eval_rc
   local nonce="$1" out="$2" eval_rc="$3" cls pha anc tof q detail
