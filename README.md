@@ -297,6 +297,10 @@ This branch includes that first generic layer:
 # represented by DialogGcdFilterConfig, and always smoke-test known clean nonces.
 ./island.sh obligations emit-dialog-gcd dialog-gcd-obligations.txt
 
+# TrailMix-ludicrous/product-min safe manifest. This checks exact top-level
+# ec_add pseudo-Mersenne +f/-f fold no-escape obligations only.
+./island.sh obligations emit-trailmix-ludicrous trailmix-ludicrous-obligations.txt
+
 # Run exact manifest checks on candidate logs; pass/reject lines are durable and resumable.
 OBLIGATION_SHOTS=9024 OBLIGATION_BATCH=64 \
   ./island.sh obligations check "<CFG>" obligations.txt cands.log obligation.log 8
@@ -305,13 +309,14 @@ OBLIGATION_SHOTS=9024 OBLIGATION_BATCH=64 \
 Manifest lines are intentionally simple and fail closed if unknown:
 
 ```text
-gcd_factor_fits <name> <tx|ty|ox|oy|rx|ry|dx|c>
+gcd_factor_fits <name> <tx|ty|ox|oy|rx|ry|dx|dy|c>
 high_zero <name> <value> <keep_bits>
 low_eq <name> <left> <right> <bits>
 compare_window_agrees <name> <left> <right> <lo> <width>
 add_no_carry <name> <left> <right> <bits>
 sub_no_borrow <name> <left> <right> <bits>
 nonzero <name> <value>
+trailmix_top_level_fold_exact <name>
 ```
 
 No-false-negative rule: add a line only when it is an exact obligation of the submitted
@@ -319,9 +324,20 @@ circuit, not a statistical shortcut. For example, if the builder drops a carry b
 `k`, it can emit an `add_no_carry` obligation for the exact low-limb expression that must
 not carry. If a comparator is narrowed to a top window, it can emit
 `compare_window_agrees` for that exact window. The checker is route-stable because it only
-knows generic point-add shot values (`tx`, `ty`, `ox`, `oy`, `rx`, `ry`, `dx`, `c`) and
-generic predicates; circuit-specific meaning lives in the manifest. Known clean submitted
-nonces must pass a new manifest before it is trusted in production.
+knows generic point-add shot values (`tx`, `ty`, `ox`, `oy`, `rx`, `ry`, `dx`, `dy`, `c`)
+and generic predicates; circuit-specific meaning lives in the manifest. Known clean
+submitted nonces must pass a new manifest before it is trusted in production.
+
+For the f5c7775 q1162 TrailMix-ludicrous circuit, `emit-trailmix-ludicrous` emits one
+active manifest line: `trailmix_top_level_fold_exact`. It checks only the top-level
+`ec_add` coordinate primitive fold obligations from the submitted product-min builder:
+`x2 -= ox`, `y2 -= oy`, the `x2 += ox; temp = 2*ox; x2 += 2*ox` chain, `y2 -= oy`, and
+`x2 -= ox` before the final negate. A nonce is rejected only when the required +f/-f
+pseudo-Mersenne correction would carry or borrow out of the low `PAD + F_BITLEN` limb, which
+is a hard dropped-bit violation. The known-clean f5c7775 nonce `168011267` passes this
+manifest over all 9024 shots. Internal jump-GCD apply/phase effects are intentionally not
+replayed by this manifest; use `./island.sh stage2` with `EVAL_STAGE2_SHOTS=9024` for the
+full exact evaluator path on that family.
 
 On the 2026-06-10 1221-qubit SOTA (`155ebc5` / local commit `572bba4`), this found the baked
 clean nonce and measured about **12.3k nonce/s** on the RTX 5090 (`~1.2x` the previous-release

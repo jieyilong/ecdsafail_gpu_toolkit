@@ -96,10 +96,16 @@ nonce.
   from retryable build/eval errors during distributed validation.
 - `obligation_filter` is a CPU-side exact partial prefilter for circuit-specific
   obligations that should not be hard-coded into the CUDA GCD kernel. It derives stable
-  point-add shot values (`tx`, `ty`, `ox`, `oy`, `rx`, `ry`, `dx`, `c`) and evaluates a
+  point-add shot values (`tx`, `ty`, `ox`, `oy`, `rx`, `ry`, `dx`, `dy`, `c`) and evaluates a
   line-oriented manifest. The default manifest is empty; production manifests must contain
   only exact builder/audit obligations and must be smoke-tested against known clean nonces.
   Use `./island.sh obligations check` between GPU search and stage2/full validation.
+  For the f5c7775 q1162 TrailMix-ludicrous/product-min circuit,
+  `./island.sh obligations emit-trailmix-ludicrous` emits an active
+  `trailmix_top_level_fold_exact` manifest. It checks only top-level `ec_add` +f/-f fold
+  no-escape obligations and is smoke-tested against known-clean nonce 168011267. Internal
+  jump-GCD apply/phase behavior remains delegated to `./island.sh stage2` with
+  `EVAL_STAGE2_SHOTS=9024`.
 
 Recommended safer search settings on the RTX 5090:
 

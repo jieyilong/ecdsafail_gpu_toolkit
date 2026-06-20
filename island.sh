@@ -533,7 +533,7 @@ stage2)
 obligations)
   SUB="${1:-help}"; shift || true
   case "$SUB" in
-  emit-default|emit-dialog-gcd)
+  emit-default|emit-dialog-gcd|emit-trailmix-ludicrous)
     OUT="${1:-}"
     MODE="${SUB#emit-}"
     [ -x "$BIN/obligation_filter" ] || die "obligation_filter not built. Run: ./island.sh install"
@@ -618,6 +618,7 @@ obligations)
     echo "usage:"
     echo "  ./island.sh obligations emit-default [OUT]"
     echo "  ./island.sh obligations emit-dialog-gcd [OUT]"
+    echo "  ./island.sh obligations emit-trailmix-ludicrous [OUT]"
     echo "  ./island.sh obligations check CFG MANIFEST CANDIDATES|- [RESULTS.log] [JOBS]"
     ;;
   esac

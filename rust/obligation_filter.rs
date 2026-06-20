@@ -31,6 +31,10 @@ use sha3::{
 use std::fs;
 
 const P: U256 = SECP256K1_P;
+const F_SECP256K1: u64 = (1u64 << 32) + 977;
+const F_BITLEN: usize = 33;
+const TLM_PAD: usize = 19;
+const TLM_LSBS: usize = TLM_PAD + F_BITLEN;
 const NONCE_BITS: u32 = 48;
 const NUM_TESTS: usize = 9024;
 const DOMAIN: &[u8] = b"quantum_ecc-fiat-shamir-v2";
@@ -228,6 +232,7 @@ enum ValueName {
     Rx,
     Ry,
     Dx,
+    Dy,
     C,
 }
 
@@ -241,6 +246,7 @@ impl ValueName {
             "rx" => Ok(Self::Rx),
             "ry" => Ok(Self::Ry),
             "dx" => Ok(Self::Dx),
+            "dy" => Ok(Self::Dy),
             "c" => Ok(Self::C),
             _ => Err(format!("unknown value '{s}'")),
         }
@@ -255,6 +261,7 @@ impl ValueName {
             Self::Rx => "rx",
             Self::Ry => "ry",
             Self::Dx => "dx",
+            Self::Dy => "dy",
             Self::C => "c",
         }
     }
@@ -268,6 +275,7 @@ struct ShotValues {
     rx: U256,
     ry: U256,
     dx: U256,
+    dy: U256,
     c: U256,
 }
 
@@ -281,6 +289,7 @@ impl ShotValues {
             ValueName::Rx => self.rx,
             ValueName::Ry => self.ry,
             ValueName::Dx => self.dx,
+            ValueName::Dy => self.dy,
             ValueName::C => self.c,
         }
     }
@@ -325,6 +334,9 @@ enum Obligation {
         name: String,
         value: ValueName,
     },
+    TrailMixTopLevelFoldExact {
+        name: String,
+    },
 }
 
 impl Obligation {
@@ -336,7 +348,8 @@ impl Obligation {
             | Self::CompareWindowAgrees { name, .. }
             | Self::AddNoCarry { name, .. }
             | Self::SubNoBorrow { name, .. }
-            | Self::NonZero { name, .. } => name,
+            | Self::NonZero { name, .. }
+            | Self::TrailMixTopLevelFoldExact { name } => name,
         }
     }
 
@@ -438,8 +451,80 @@ impl Obligation {
                     Ok(())
                 }
             }
+            Self::TrailMixTopLevelFoldExact { .. } => check_trailmix_top_level_fold_exact(v),
         }
     }
+}
+
+fn fold_add_escape(value: U256) -> bool {
+    low_bits(value, TLM_LSBS) + U256::from(F_SECP256K1) >= (U256::from(1u64) << TLM_LSBS)
+}
+
+fn fold_sub_escape(value: U256) -> bool {
+    low_bits(value, TLM_LSBS) < U256::from(F_SECP256K1)
+}
+
+fn trailmix_mod_add_checked(label: &str, y: U256, x: U256) -> Result<U256, String> {
+    let out = y.wrapping_add(x);
+    let overflow = out < y;
+    if overflow && fold_add_escape(out) {
+        return Err(format!("{label}: +f fold carry escapes low {TLM_LSBS} bits"));
+    }
+    Ok(if overflow {
+        out.wrapping_add(U256::from(F_SECP256K1))
+    } else {
+        out
+    })
+}
+
+fn trailmix_mod_sub_checked(label: &str, y: U256, x: U256) -> Result<U256, String> {
+    let borrow = y < x;
+    let out = y.wrapping_sub(x);
+    if borrow && fold_sub_escape(out) {
+        return Err(format!("{label}: -f fold borrow escapes low {TLM_LSBS} bits"));
+    }
+    Ok(if borrow {
+        out.wrapping_sub(U256::from(F_SECP256K1))
+    } else {
+        out
+    })
+}
+
+fn trailmix_mod_double_checked(label: &str, x: U256) -> Result<U256, String> {
+    let overflow = (x >> 255) != U256::ZERO;
+    let out = x << 1;
+    if overflow && fold_add_escape(out) {
+        return Err(format!("{label}: double +f fold carry escapes low {TLM_LSBS} bits"));
+    }
+    Ok(if overflow {
+        out.wrapping_add(U256::from(F_SECP256K1))
+    } else {
+        out
+    })
+}
+
+fn check_trailmix_top_level_fold_exact(v: &ShotValues) -> Result<(), String> {
+    let lambda = v
+        .dx
+        .inv_mod(P)
+        .map(|inv_dx| fmul(v.dy, inv_dx))
+        .ok_or_else(|| "dx is non-invertible".to_string())?;
+
+    // These mirror only the top-level coordinate primitives in
+    // trailmix_ludicrous/ec_add.rs. Internal GCD apply and square folds are
+    // intentionally not modeled here.
+    let mut x = trailmix_mod_sub_checked("step3 x2 -= ox", v.tx, v.ox)?;
+    let _dy = trailmix_mod_sub_checked("step4 y2 -= oy", v.ty, v.oy)?;
+
+    x = trailmix_mod_add_checked("step7 x2 += ox", x, v.ox)?;
+    let two_ox = trailmix_mod_double_checked("step7 temp := 2*ox", v.ox)?;
+    let _x_pre_square = trailmix_mod_add_checked("step7 x2 += 2*ox", x, two_ox)?;
+
+    let c = v.c;
+    let y_after_forward_apply = fmul(lambda, c);
+    let _ry = trailmix_mod_sub_checked("step14 y2 -= oy", y_after_forward_apply, v.oy)?;
+    let _neg_rx = trailmix_mod_sub_checked("step15 x2 -= ox before neg", c, v.ox)?;
+    Ok(())
 }
 
 fn fits_bits(x: U256, bits: usize) -> bool {
@@ -558,6 +643,12 @@ fn parse_manifest(path: &str) -> Result<Vec<Obligation>, String> {
                         .map_err(|e| format!("line {line_no}: {e}"))?,
                 }
             }
+            "trailmix_top_level_fold_exact" => {
+                require_len(&parts, 2, line_no)?;
+                Obligation::TrailMixTopLevelFoldExact {
+                    name: parts[1].to_string(),
+                }
+            }
             other => {
                 return Err(format!(
                     "line {line_no}: unsupported obligation kind '{other}'"
@@ -654,6 +745,7 @@ fn shot_values(ctx: &Context, xof: &mut impl XofReader) -> ShotValues {
     let (ox, oy) = ctx.comb.mul(k2);
     let (rx, ry) = affine_add(tx, ty, ox, oy);
     let (dx, c) = point_add_gcd_factors(tx, ox, rx);
+    let dy = fsub(ty, oy);
     ShotValues {
         tx,
         ty,
@@ -662,6 +754,7 @@ fn shot_values(ctx: &Context, xof: &mut impl XofReader) -> ShotValues {
         rx,
         ry,
         dx,
+        dy,
         c,
     }
 }
@@ -699,13 +792,14 @@ fn print_default_manifest() {
     println!("# Default is intentionally empty: it cannot reject any clean nonce.");
     println!("# Add only exact obligations emitted by or audited against the circuit builder.");
     println!("# Supported forms:");
-    println!("#   gcd_factor_fits <name> <tx|ty|ox|oy|rx|ry|dx|c>");
+    println!("#   gcd_factor_fits <name> <tx|ty|ox|oy|rx|ry|dx|dy|c>");
     println!("#   high_zero <name> <value> <keep_bits>");
     println!("#   low_eq <name> <left> <right> <bits>");
     println!("#   compare_window_agrees <name> <left> <right> <lo> <width>");
     println!("#   add_no_carry <name> <left> <right> <bits>");
     println!("#   sub_no_borrow <name> <left> <right> <bits>");
     println!("#   nonzero <name> <value>");
+    println!("#   trailmix_top_level_fold_exact <name>");
 }
 
 fn print_dialog_gcd_manifest() {
@@ -717,10 +811,21 @@ fn print_dialog_gcd_manifest() {
     println!("gcd_factor_fits gcd_c c");
 }
 
+fn print_trailmix_ludicrous_manifest() {
+    println!("# ecdsafail obligation manifest v1");
+    println!("# TrailMix-ludicrous/product-min q1162 safe manifest.");
+    println!("# Checks top-level ec_add coordinate +f/-f fold no-escape obligations.");
+    println!("# It intentionally does not replay the internal jump-GCD apply stream");
+    println!("# or square folds; those remain delegated to exact stage2/eval.");
+    println!("# Smoke-test every new circuit/base against known clean nonces before use.");
+    println!("trailmix_top_level_fold_exact trailmix_top_level_fold_exact");
+}
+
 fn usage(program: &str) -> ! {
     eprintln!("usage:");
     eprintln!("  {program} emit-default");
     eprintln!("  {program} emit-dialog-gcd");
+    eprintln!("  {program} emit-trailmix-ludicrous");
     eprintln!("  OBLIGATION_SHOTS=9024 {program} check MANIFEST NONCE...");
     std::process::exit(2);
 }
@@ -736,6 +841,9 @@ fn main() {
         }
         "emit-dialog-gcd" => {
             print_dialog_gcd_manifest();
+        }
+        "emit-trailmix-ludicrous" => {
+            print_trailmix_ludicrous_manifest();
         }
         "check" => {
             if args.len() < 4 {

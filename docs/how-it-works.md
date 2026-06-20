@@ -110,12 +110,23 @@ obligation manifest: the builder or an audited optimization pass writes down exa
 conditions that a clean execution must satisfy, and `obligation_filter` evaluates those
 conditions over the same Fiat-Shamir shot values used by the evaluator.
 
-The checker is generic. It derives `tx`, `ty`, `ox`, `oy`, `rx`, `ry`, `dx`, and `c` for
-each shot, then applies simple predicates such as `high_zero`, `add_no_carry`,
+The checker is generic. It derives `tx`, `ty`, `ox`, `oy`, `rx`, `ry`, `dx`, `dy`, and `c`
+for each shot, then applies simple predicates such as `high_zero`, `add_no_carry`,
 `sub_no_borrow`, `compare_window_agrees`, `low_eq`, `nonzero`, and legacy
 `gcd_factor_fits`. Unknown predicates are errors rather than silent passes. The default
 manifest is empty, so it cannot introduce a false negative; production manifests must be
 smoke-tested against known clean submitted nonces before use.
+
+For the f5c7775 q1162 TrailMix-ludicrous/product-min circuit,
+`emit-trailmix-ludicrous` emits an active `trailmix_top_level_fold_exact` predicate. It
+checks the top-level `ec_add` coordinate primitive only: the submitted builder's explicit
+`+f`/`-f` pseudo-Mersenne corrections for `x2 -= ox`, `y2 -= oy`, the
+`x2 += ox; temp = 2*ox; x2 += 2*ox` chain, `y2 -= oy`, and `x2 -= ox` before the final
+negate. It rejects only hard fold-escape cases where the correction would carry or borrow
+out of the low `PAD + F_BITLEN` limb. The known-clean f5c7775 nonce 168011267 passes this
+manifest over all 9024 shots. The manifest intentionally does not replay internal
+jump-GCD apply/phase behavior; use `./island.sh stage2` with `EVAL_STAGE2_SHOTS=9024` when
+exact apply/phase filtering is needed for this family.
 
 ## Pipeline summary
 ```
