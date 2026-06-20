@@ -303,9 +303,10 @@ re-implementation of the apply phase. The change lives in the challenge repo (re
 `ecdsafail sync`); re-apply `patches/eval_stage2_prefilter.diff`.
 
 For high-density TrailMix-ludicrous scans, the same patch also supports
-`EVAL_SHOT_LIMIT` / `EVAL_STAGE2_SHOTS`. That turns trusted eval into an exact stage-2
-candidate prefilter: a checked-shot failure rejects the nonce, while a prefix pass is only
-a survivor for later full validation.
+`EVAL_SHOT_LIMIT` / `EVAL_STAGE2_SHOTS`. Stage 2 defaults to `9024`, so it is full-shot
+trusted eval with early reject. Setting a lower value turns trusted eval into an exact
+stage-2 candidate prefilter: a checked-shot failure rejects the nonce, while a prefix pass
+is only a survivor for later full validation.
 
 The patch also supports `EVAL_TAIL_NONCE`, which removes repeated circuit-build cost. Since
 the nonce tail is fixed-length `X;X` identities, a nonce-0 `ops.bin` has the same unitary as

@@ -83,13 +83,14 @@ quantum-confirm before submitting — `./island.sh validate` does this.
 For TrailMix-ludicrous, that blind spot is larger because `GPU_FILTER=ludicrous` checks only
 whether the two inversion factors fit the baked product-min jump-GCD schedule. Use it as
 stage 1, then run `./island.sh stage2` on the emitted candidates. Stage 2 is not a heuristic:
-it invokes the trusted evaluator on a configurable Fiat-Shamir shot prefix with
-`EVAL_FAST_REJECT=1`. Any rejection is a real circuit violation on a checked shot, so a clean
-9024-shot nonce cannot be lost. A pass is only a `stage2-pass`; it must still be fully
-validated before baking or submitting. The command builds one nonce-0 `ops.bin` for the
-whole stage-2 invocation, then evaluates candidate nonces in parallel with `EVAL_TAIL_NONCE`;
-results are appended as soon as each nonce finishes, so long validation batches can be tailed
-or resumed.
+it invokes the trusted evaluator with `EVAL_FAST_REJECT=1`. By default it checks all 9024
+Fiat-Shamir shots; set `EVAL_STAGE2_SHOTS` lower only when you deliberately want a prefix
+triage pass. Any rejection is a real circuit violation on a checked shot, so a clean
+9024-shot nonce cannot be lost. A default `stage2-pass` has passed the full eval shot set;
+a lower-shot pass is only a survivor for later full validation. The command builds one
+nonce-0 `ops.bin` for the whole stage-2 invocation, then evaluates candidate nonces in
+parallel with `EVAL_TAIL_NONCE`; results are appended as soon as each nonce finishes, so
+long validation batches can be tailed or resumed.
 
 Validation can also skip nearly all per-candidate circuit-building cost. The point-add circuit
 body is independent of `DIALOG_TAIL_NONCE`; only the final 96 identity-tail ops change their
@@ -103,6 +104,6 @@ offers the same trick for ad hoc validation batches.
 ## Pipeline summary
 ```
 config (lever)  --dump_gpu_state-->  gpu_state.bin  --gpu_island2-->  CLEAN candidates
-   --stage2 exact prefix prefilter--> survivors --eval_circuit-->  0/0/0 island
+   --stage2 exact eval filter--> survivors --eval_circuit-->  0/0/0 island
    --bake (perl, CRLF-safe)-->  mod.rs   --ecdsafail submit-->
 ```

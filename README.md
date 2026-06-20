@@ -184,7 +184,7 @@ GPU_GCD_MODE=trunc_first ./island.sh search s.bin 1 2000000
 | `GPU_WAVE` | `32`..`256` | CUDA block threads per nonce wave. Default `128`; values are rounded up to a warp multiple and capped at `256`. |
 | `GPU_FAN_BITS` | `0`..`26` | Nonce-fan: precompute the SHAKE sponge for the low `K` tail bits so each nonce only absorbs its high bits. `0` = off. Exact candidate set. Table is `2^K * 208 B` (`K=20`≈208 MiB, `K=24`≈3.5 GiB). Measured gain is small (~+1.5% on the current SOTA base — `squeeze_init` is not the bottleneck there); may help more on init-bound bases. |
 | `EVAL_FAST_REJECT` | `0`/`1` | **Phase-2 (CPU validate) knob, not a scan knob** — no-op on a `search` line. `1` defers the per-shot EC-muls into the batch loop and stops at the **first failing shot**. Speedup is candidate-dependent: early-failing dirty candidates ~1.9s, but GCD-clean-but-eval-dirty ones (what the GPU hunt feeds the validator) fail later → ~6s; vs ~17s stock (~2.6–8.5×). Exact — clean islands still read `0/0/0` and take the full ~17s; with the var unset the eval is byte-identical, so `ecdsafail run` scoring is unaffected (default `0`). `island.sh validate` sets it to `1`. **Setup:** apply `patches/eval_stage2_prefilter.diff` + `cargo build --release --bin eval_circuit` (reset by `ecdsafail sync`; `eval_circuit.rs` is a local tool, not submitted). Per-candidate context: `build_circuit` is only ~1.2s, so the whole per-candidate cost is this eval. |
-| `EVAL_SHOT_LIMIT` / `EVAL_STAGE2_SHOTS` | `1..9024` | **Stage-2 prefilter knob.** Limits trusted eval to a shot prefix and disables `score.json` / `results.tsv` writes for partial runs. A failure on any checked shot is an exact rejection; a pass is only `stage2-pass`, not a clean-island proof. Default stage-2 prefix is `512` shots. |
+| `EVAL_SHOT_LIMIT` / `EVAL_STAGE2_SHOTS` | `1..9024` | **Stage-2 shot-count knob.** Stage 2 defaults to full 9024-shot eval with early reject. Lower values, such as `512`, turn it into a trusted prefix prefilter; partial runs do not write `score.json` / `results.tsv`. A failure on any checked shot is an exact rejection. A `stage2-pass` at `shots=9024` has passed the full eval shot set; a pass at a lower shot count is only a survivor for later full validation. |
 | `VALIDATE_REUSE_OPS` | `0`/`1` | **Build-cache validation knob.** `1` builds one nonce-0 `ops.bin` per validator process and evaluates every requested nonce by overriding only the Fiat-Shamir identity-tail hash with `EVAL_TAIL_NONCE`. This avoids the expensive `build_circuit` call for every candidate. Exact because the tail is 48 `X;X` identity pairs; only the serialized tail targets reseed SHAKE. Requires `patches/eval_stage2_prefilter.diff`. |
 | `STAGE2_BATCH` | deprecated | Ignored by `stage2`. Stage 2 now builds one nonce-0 `ops.bin` for the whole invocation, then evaluates one candidate nonce per worker using `EVAL_TAIL_NONCE`. Use the `JOBS` argument or `STAGE2_JOBS` to control parallelism. |
 | `VALIDATE_RESULTS_LOG` | path | Optional validate-only durable ledger. When set, `island.sh validate` still prints every line to stdout, and also appends successful `dirty` / `CLEAN` / `stage2-*` verdict lines to this file under `flock` when available. |
@@ -238,10 +238,13 @@ candidates:
 # Save the raw scan stream.
 GPU_FILTER=ludicrous ./island.sh search s.bin <START> <N> <CHUNK> | tee cands.log
 
-# Exact stage-2 rejection on candidates only. The default checks 512 trusted
+# Exact stage-2 rejection on candidates only. The default checks all 9024
 # Fiat-Shamir shots, uses EVAL_FAST_REJECT=1, builds one nonce-0 ops.bin for
 # the whole invocation, and streams a durable results log.
-EVAL_STAGE2_SHOTS=512 ./island.sh stage2 "<CFG>" cands.log stage2.log 8
+./island.sh stage2 "<CFG>" cands.log stage2.log 8
+
+# Optional faster triage mode: check only a trusted prefix before full validation.
+EVAL_STAGE2_SHOTS=512 ./island.sh stage2 "<CFG>" cands.log stage2-prefix.log 8
 
 # Full validation is still required for survivors.
 grep '^stage2-pass nonce=' stage2.log | sed -E 's/.*nonce=([0-9]+).*/\1/' \
@@ -250,11 +253,13 @@ grep '^stage2-pass nonce=' stage2.log | sed -E 's/.*nonce=([0-9]+).*/\1/' \
 
 This is no-false-negative in the useful sense: stage 2 rejects only after the
 trusted evaluator observes a real circuit violation on a checked shot. It never
-uses random heuristics or a tightened CUDA GCD condition. A `stage2-pass` means
-"not rejected by this exact prefix"; only a full 9024-shot `CLEAN` is submit-safe.
+uses random heuristics or a tightened CUDA GCD condition. With the default
+`EVAL_STAGE2_SHOTS=9024`, a `stage2-pass` means the nonce passed the full eval shot set.
+With a smaller `EVAL_STAGE2_SHOTS`, a `stage2-pass` only means "not rejected by this exact
+prefix"; only a full 9024-shot result is submit-safe.
 Known clean nonces must pass stage 2 before trusting a new patched validator.
-Rejected lines may show `shots=<512` because `EVAL_FAST_REJECT=1` stops at the first
-failing 64-shot batch; `stage2-pass` lines have checked the requested prefix. Re-running
+Rejected lines may show `shots<9024` because `EVAL_FAST_REJECT=1` stops at the first
+failing 64-shot batch; `stage2-pass` lines have checked the requested shot count. Re-running
 `stage2` against the same results log is resumable: already logged nonces are skipped.
 
 For full validation batches, the same build cache can be used directly:

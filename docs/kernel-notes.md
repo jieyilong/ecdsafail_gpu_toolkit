@@ -81,9 +81,10 @@ nonce.
   ~8.5× avg on dirty candidates; exact (the full eval already checks apply-cleanliness, so
   this *is* the apply pre-scan). Default off keeps scoring byte-identical. Patch:
   `patches/eval_stage2_prefilter.diff`.
-- `EVAL_SHOT_LIMIT=N` / `EVAL_STAGE2_SHOTS=N` limits trusted eval to a prefix for the
-  `./island.sh stage2` candidate prefilter. Partial runs do not write `score.json` or
-  `results.tsv`; a prefix pass is only a survivor, not a clean-island proof.
+- `EVAL_SHOT_LIMIT=N` / `EVAL_STAGE2_SHOTS=N` controls the trusted eval shot count for
+  `./island.sh stage2`. Default is `9024`, so stage 2 is full-shot eval with early reject.
+  Lower values, such as `512`, make stage 2 a prefix prefilter. Partial runs do not write
+  `score.json` or `results.tsv`; a prefix pass is only a survivor, not a clean-island proof.
 - `VALIDATE_REUSE_OPS=1` makes validation build one nonce-0 `ops.bin` and reuse it for
   a batch of nonces. The patched evaluator's `EVAL_TAIL_NONCE` rewrites only the
   Fiat-Shamir hash of the 96-op identity tail, so this removes repeated `build_circuit`
