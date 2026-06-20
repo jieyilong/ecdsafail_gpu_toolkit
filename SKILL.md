@@ -87,9 +87,14 @@ the previous-release binary and this branch with the scan baseline both measured
   at the first bad shot): early-failing dirty candidates hit ~1.9s, but GCD-clean-but-eval-dirty
   ones — exactly what a GPU hunt feeds the validator — fail *later*, ~6s; vs ~17s stock
   (~2.6–8.5×). Clean islands still take the full ~17s (they must check all 9024 shots).
-  **Needs `patches/eval_fast_reject.diff` applied + `cargo build --release --bin eval_circuit`**
+  **Needs `patches/eval_stage2_prefilter.diff` applied + `cargo build --release --bin eval_circuit`**
   (reset by `ecdsafail sync`; `eval_circuit.rs` is a local tool, not a submitted file, so this
   never touches the grader). `island.sh validate` sets `EVAL_FAST_REJECT=1` by default.
+- `EVAL_SHOT_LIMIT=N` / `EVAL_STAGE2_SHOTS=N` — **stage-2 exact prefilter**: after
+  `GPU_FILTER=ludicrous` emits GCD-clean candidates, run `./island.sh stage2 CFG cands.log
+  stage2.log <jobs>`. This invokes the trusted evaluator on a shot prefix and rejects only
+  when a checked shot has a real circuit violation. A `stage2-pass` is only a survivor for
+  later full 9024-shot validation, never a submit-safe clean proof.
 
 For production island searches on a large NVIDIA GPU, prefer the safer fast mode that has
 passed a known-clean nonce check on the current base. As of the RTX 5090 measurements on the

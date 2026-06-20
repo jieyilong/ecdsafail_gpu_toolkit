@@ -138,11 +138,14 @@ cd $CHALLENGE && ecdsafail submit --note-file note.md --model "..." --claimed-sc
 | 3. build kernel | `./island.sh build` | `nvcc` the kernel (local, or scp+build on your remote box) |
 | 4. dump | `./island.sh dump DIALOG_GCD_ACTIVE_ITERATIONS=258 s.bin` | encode the GCD filter+comb+prefix for that config |
 | 5. search | `./island.sh search s.bin 1 2000000` | GPU-screen 2M nonces → `CLEAN nonce=...` candidates |
-| 6. validate | `./island.sh validate DIALOG_GCD_ACTIVE_ITERATIONS=258 <n>...` | quantum-confirm 0/0/0 + print score |
-| 7. bake | `./island.sh bake DIALOG_GCD_ACTIVE_ITERATIONS 258 DIALOG_TAIL_NONCE <n>` | CRLF-safe edit + `ecdsafail run` |
-| 8. submit | `ecdsafail submit ...` | (in the challenge repo) |
+| 6. optional stage 2 | `./island.sh stage2 DIALOG_GCD_ACTIVE_ITERATIONS=258 cands.log stage2.log 8` | exact validator-backed prefilter on GPU-emitted candidates |
+| 7. validate | `./island.sh validate DIALOG_GCD_ACTIVE_ITERATIONS=258 <n>...` | quantum-confirm 0/0/0 + print score |
+| 8. bake | `./island.sh bake DIALOG_GCD_ACTIVE_ITERATIONS 258 DIALOG_TAIL_NONCE <n>` | CRLF-safe edit + `ecdsafail run` |
+| 9. submit | `ecdsafail submit ...` | (in the challenge repo) |
 
-`./island.sh hunt CFG START N` chains steps 2/4/5/6. See `examples/walkthrough.md`.
+`./island.sh hunt CFG START N` chains the original measure/dump/search/full-validate path.
+Use `search | tee cands.log` plus `stage2` explicitly when you want the two-stage pipeline.
+See `examples/walkthrough.md`.
 
 ### Experimental search-kernel knobs
 The default search path preserves the previous release's `gpu_island2` behavior:
@@ -180,7 +183,8 @@ GPU_GCD_MODE=trunc_first ./island.sh search s.bin 1 2000000
 | `GPU_GCD_MODE` | `full_first`, `trunc_first`, `single_pass`, `trunc_only` | `full_first` is the default. `trunc_first` is the safer fast mode: it runs the truncated width-envelope check first, then still runs the full untruncated convergence check, so it preserves the baseline GCD filter while sometimes rejecting hard factors earlier. `single_pass` folds those checks into one truncated walk; after the 1221-qubit SOTA update it is **experimental only** because it missed the baked clean nonce `165002130437`. `trunc_only` is a noisy prefilter that can emit extra false positives, so always validate. |
 | `GPU_WAVE` | `32`..`256` | CUDA block threads per nonce wave. Default `128`; values are rounded up to a warp multiple and capped at `256`. |
 | `GPU_FAN_BITS` | `0`..`26` | Nonce-fan: precompute the SHAKE sponge for the low `K` tail bits so each nonce only absorbs its high bits. `0` = off. Exact candidate set. Table is `2^K * 208 B` (`K=20`≈208 MiB, `K=24`≈3.5 GiB). Measured gain is small (~+1.5% on the current SOTA base — `squeeze_init` is not the bottleneck there); may help more on init-bound bases. |
-| `EVAL_FAST_REJECT` | `0`/`1` | **Phase-2 (CPU validate) knob, not a scan knob** — no-op on a `search` line. `1` defers the per-shot EC-muls into the batch loop and stops at the **first failing shot**. Speedup is candidate-dependent: early-failing dirty candidates ~1.9s, but GCD-clean-but-eval-dirty ones (what the GPU hunt feeds the validator) fail later → ~6s; vs ~17s stock (~2.6–8.5×). Exact — clean islands still read `0/0/0` and take the full ~17s; with the var unset the eval is byte-identical, so `ecdsafail run` scoring is unaffected (default `0`). `island.sh validate` sets it to `1`. **Setup:** apply `patches/eval_fast_reject.diff` + `cargo build --release --bin eval_circuit` (reset by `ecdsafail sync`; `eval_circuit.rs` is a local tool, not submitted). Per-candidate context: `build_circuit` is only ~1.2s, so the whole per-candidate cost is this eval. |
+| `EVAL_FAST_REJECT` | `0`/`1` | **Phase-2 (CPU validate) knob, not a scan knob** — no-op on a `search` line. `1` defers the per-shot EC-muls into the batch loop and stops at the **first failing shot**. Speedup is candidate-dependent: early-failing dirty candidates ~1.9s, but GCD-clean-but-eval-dirty ones (what the GPU hunt feeds the validator) fail later → ~6s; vs ~17s stock (~2.6–8.5×). Exact — clean islands still read `0/0/0` and take the full ~17s; with the var unset the eval is byte-identical, so `ecdsafail run` scoring is unaffected (default `0`). `island.sh validate` sets it to `1`. **Setup:** apply `patches/eval_stage2_prefilter.diff` + `cargo build --release --bin eval_circuit` (reset by `ecdsafail sync`; `eval_circuit.rs` is a local tool, not submitted). Per-candidate context: `build_circuit` is only ~1.2s, so the whole per-candidate cost is this eval. |
+| `EVAL_SHOT_LIMIT` / `EVAL_STAGE2_SHOTS` | `1..9024` | **Stage-2 prefilter knob.** Limits trusted eval to a shot prefix and disables `score.json` / `results.tsv` writes for partial runs. A failure on any checked shot is an exact rejection; a pass is only `stage2-pass`, not a clean-island proof. Default stage-2 prefix is `512` shots. |
 
 **Every improvement is an independent on/off knob** (all default to the conservative/exact baseline): `GPU_BATCH_INV`, `GPU_COMB_BITS`, `GPU_GCD_MODE` (`trunc_first` is the safer fast choice; `single_pass` is experimental), `GPU_WAVE`, `GPU_FAN_BITS`, and `EVAL_FAST_REJECT`. They compose; benchmark combinations with `bench-gpu-knobs`.
 
@@ -210,6 +214,29 @@ GPU_FILTER=ludicrous ./island.sh search s.bin 28565 1
 ```
 
 It must print `CLEAN nonce=28565` before larger scans are trusted.
+
+`GPU_FILTER=ludicrous` is intentionally only a GCD prefilter. For high-density
+TrailMix-ludicrous hunts, add a second exact prevalidation stage on the emitted
+candidates:
+
+```bash
+# Save the raw scan stream.
+GPU_FILTER=ludicrous ./island.sh search s.bin <START> <N> <CHUNK> | tee cands.log
+
+# Exact stage-2 rejection on candidates only. The default checks 512 trusted
+# Fiat-Shamir shots with EVAL_FAST_REJECT=1 and writes a durable results log.
+EVAL_STAGE2_SHOTS=512 ./island.sh stage2 "<CFG>" cands.log stage2.log 8
+
+# Full validation is still required for survivors.
+grep '^stage2-pass nonce=' stage2.log | sed -E 's/.*nonce=([0-9]+).*/\1/' \
+  | xargs ./island.sh validate "<CFG>"
+```
+
+This is no-false-negative in the useful sense: stage 2 rejects only after the
+trusted evaluator observes a real circuit violation on a checked shot. It never
+uses random heuristics or a tightened CUDA GCD condition. A `stage2-pass` means
+"not rejected by this exact prefix"; only a full 9024-shot `CLEAN` is submit-safe.
+Known clean nonces must pass stage 2 before trusting a new patched validator.
 
 On the 2026-06-10 1221-qubit SOTA (`155ebc5` / local commit `572bba4`), this found the baked
 clean nonce and measured about **12.3k nonce/s** on the RTX 5090 (`~1.2x` the previous-release

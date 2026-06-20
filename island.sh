@@ -11,6 +11,7 @@
 #   ./island.sh dump   CFG OUT.bin                      # gpu_state dump for a config
 #   ./island.sh probe  STATE                            # GPU Keccak probe cross-check
 #   ./island.sh search STATE START N [CHUNK]            # multi-GPU search -> CLEAN nonce=...
+#   ./island.sh stage2 CFG CANDIDATES [RESULTS] [JOBS]  # exact validator-backed prefilter
 #   ./island.sh test-gpu-knobs [CFG] [START] [N]        # correctness smoke for GPU knobs
 #   ./island.sh bench-gpu-knobs [CFG] [START] [N]       # throughput benchmark for GPU knobs
 #   ./island.sh validate CFG NONCE...                  # quantum-confirm 0/0/0 + score
@@ -58,6 +59,7 @@ esac
 : "${CHALLENGE:?set CHALLENGE in config.env}"; : "${GPU:=local}"; : "${REMOTE_SSH:=}"
 : "${REMOTE_DIR:=.ecdsafail_island}"; : "${NVCC_ARCH:=auto}"; : "${GPUS:=auto}"; : "${BLOCKS:=512}"
 : "${GPU_BATCH_INV:=0}"; : "${GPU_COMB_BITS:=8}"; : "${GPU_GCD_MODE:=full_first}"; : "${GPU_WAVE:=128}"; : "${GPU_FAN_BITS:=0}"; : "${GPU_FILTER:=dialog}"; : "${GPU_TRAILMIX_THIN:=0}"; : "${GPU_TRAILMIX_SLACK:=0}"; : "${GPU_TRAILMIX_WINDOW:=0}"; : "${GPU_STREAM_CANDIDATES:=1}"
+: "${EVAL_STAGE2_SHOTS:=512}"
 BIN="$CHALLENGE/target/release"; KSRC="$HERE/cuda/gpu_island2.cu"; RDIR="$REMOTE_DIR"
 need_remote(){ [ -n "$REMOTE_SSH" ] || die "GPU=remote needs REMOTE_SSH (init-remote)"; }
 rhost(){ echo "$REMOTE_SSH" | grep -oE '[^ ]+@[^ ]+' | head -1; }
@@ -115,6 +117,31 @@ run_raw_search(){ # envs state start n
     need_remote
     rsh "GPU_STATE=$state KERNEL2=1 BLOCKS=$BLOCKS $envs \$HOME/$RDIR/gpu_island2 $start $n"
   fi
+}
+default_jobs(){
+  if [ -n "${STAGE2_JOBS:-}" ]; then echo "$STAGE2_JOBS"; return; fi
+  if command -v nproc >/dev/null 2>&1; then nproc; return; fi
+  if command -v sysctl >/dev/null 2>&1; then sysctl -n hw.ncpu 2>/dev/null && return; fi
+  echo 4
+}
+extract_nonces(){
+  sed -nE '
+    s/.*nonce=([0-9]+).*/\1/p
+    /^[[:space:]]*[0-9]+[[:space:]]*$/ {
+      s/[[:space:]]//g
+      p
+    }
+  ' | sort -n -u
+}
+extract_file_nonces(){ # file
+  [ -s "$1" ] || return 0
+  extract_nonces < "$1"
+}
+line_score_suffix(){ # tof qubits
+  local tof="$1" q="$2" score
+  [ -n "$tof" ] && [ -n "$q" ] || return 0
+  score=$(awk -v t="$tof" -v q="$q" 'BEGIN{printf "%d", int(t + 0.5) * q}')
+  printf ' score=%s' "$score"
 }
 bench_variant(){ # name envs state start n summary_file
   local name="$1" envs="$2" state="$3" start="$4" n="$5" summary="$6"
@@ -340,15 +367,81 @@ validate)
   CFG="${1:-}"; shift || true; [ $# -gt 0 ] || die "usage: validate CFG NONCE..."
   for nonce in "$@"; do
     d="$(mktemp -d)"
-    ( cd "$d" && env ${CFG:+$CFG} DIALOG_TAIL_NONCE="$nonce" "$BIN/build_circuit" >/dev/null 2>&1 )
-    out=$( cd "$d" && env ${CFG:+$CFG} EVAL_FAST_REJECT="${EVAL_FAST_REJECT:-1}" DIALOG_TAIL_NONCE="$nonce" "$BIN/eval_circuit" --note "isl-$nonce" 2>&1 ); rm -rf "$d"
+    build_out=$( cd "$d" && env ${CFG:+$CFG} DIALOG_TAIL_NONCE="$nonce" "$BIN/build_circuit" 2>&1 )
+    build_rc=$?
+    if [ "$build_rc" -ne 0 ]; then
+      detail=$(echo "$build_out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')
+      rm -rf "$d"
+      echo "ERROR nonce=$nonce stage=build rc=$build_rc detail=${detail:-build_circuit failed}"
+      continue
+    fi
+    out=$( cd "$d" && env ${CFG:+$CFG} EVAL_FAST_REJECT="${EVAL_FAST_REJECT:-1}" DIALOG_TAIL_NONCE="$nonce" "$BIN/eval_circuit" --note "isl-$nonce" 2>&1 )
+    eval_rc=$?
+    rm -rf "$d"
     cls=$(echo "$out"|grep "classical mismatches"|grep -oE '[0-9]+$'); pha=$(echo "$out"|grep "phase-garbage"|grep -oE '[0-9]+$')
     anc=$(echo "$out"|grep "ancilla-garbage"|grep -oE '[0-9]+$'); tof=$(echo "$out"|grep "avg executed Toffoli"|grep -oE '[0-9.]+'|head -1)
-    q=$(echo "$out"|grep -E '^  qubits '|grep -oE '[0-9]+$'|head -1)
+    q=$(echo "$out"|grep -E '^  qubits '|grep -oE '[0-9]+$'|head -1); shots=$(echo "$out"|grep "tested shots"|grep -oE '[0-9]+$'|head -1)
+    if [ -z "${cls:-}" ] || [ -z "${pha:-}" ] || [ -z "${anc:-}" ]; then
+      detail=$(echo "$out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')
+      echo "ERROR nonce=$nonce stage=eval rc=$eval_rc detail=${detail:-eval_circuit failed}"
+      continue
+    fi
+    prefix=0
+    truthy "${EVAL_STAGE2_MODE:-0}" && prefix=1
+    [ -n "${EVAL_SHOT_LIMIT:-}" ] && prefix=1
     if [ "${cls:-x}" = 0 ] && [ "${pha:-x}" = 0 ] && [ "${anc:-x}" = 0 ]; then
-      echo "CLEAN nonce=$nonce tof=$tof qubits=$q score=$(python3 -c "print(int(round(float('$tof')))*int('$q'))")"
-    else echo "dirty nonce=$nonce cls=${cls:-?} pha=${pha:-?} anc=${anc:-?}"; fi
+      if [ "$prefix" = 1 ]; then
+        echo "stage2-pass nonce=$nonce shots=${shots:-?} cls=0 pha=0 anc=0 tof=${tof:-?} qubits=${q:-?}"
+      else
+        echo "CLEAN nonce=$nonce cls=0 pha=0 anc=0 tof=$tof qubits=$q$(line_score_suffix "$tof" "$q")"
+      fi
+    else
+      if [ "$prefix" = 1 ]; then
+        echo "stage2-reject nonce=$nonce shots=${shots:-?} cls=${cls:-?} pha=${pha:-?} anc=${anc:-?} tof=${tof:-?} qubits=${q:-?}"
+      else
+        echo "dirty nonce=$nonce cls=${cls:-?} pha=${pha:-?} anc=${anc:-?} tof=${tof:-?} qubits=${q:-?}"
+      fi
+    fi
   done
+  ;;
+
+stage2)
+  CFG="${1:-}"; CAND="${2:-}"; OUT="${3:-stage2-results.log}"; JOBS="${4:-$(default_jobs)}"
+  [ -n "$CAND" ] || die "usage: stage2 CFG CANDIDATES|- [RESULTS.log] [JOBS]"
+  [ "$JOBS" -gt 0 ] 2>/dev/null || die "JOBS must be a positive integer"
+  ALL="$(mktemp)"; SEEN="$(mktemp)"; TODO="$(mktemp)"
+  trap 'rm -f "$ALL" "$SEEN" "$TODO"' EXIT
+  if [ "$CAND" = "-" ]; then
+    extract_nonces > "$ALL"
+  else
+    [ -f "$CAND" ] || die "candidate file not found: $CAND"
+    extract_nonces < "$CAND" > "$ALL"
+  fi
+  extract_file_nonces "$OUT" > "$SEEN"
+  awk 'NR==FNR { done[$1]=1; next } !($1 in done)' "$SEEN" "$ALL" > "$TODO"
+  total=$(wc -l < "$ALL" | tr -d ' ')
+  seen=$(wc -l < "$SEEN" | tr -d ' ')
+  todo=$(wc -l < "$TODO" | tr -d ' ')
+  echo ">> stage2 exact prefilter: candidates=$total already_logged=$seen todo=$todo shots=${EVAL_SHOT_LIMIT:-$EVAL_STAGE2_SHOTS} jobs=$JOBS out=$OUT"
+  if [ "$todo" = 0 ]; then
+    echo ">> stage2: no new candidates"
+    exit 0
+  fi
+  mkdir -p "$(dirname "$OUT")"
+  export EVAL_STAGE2_PREFIX="${EVAL_SHOT_LIMIT:-$EVAL_STAGE2_SHOTS}"
+  export EVAL_FAST_REJECT="${EVAL_FAST_REJECT:-1}"
+  xargs -n1 -P "$JOBS" bash -c '
+    self="$1"; cfg="$2"; out_file="$3"; nonce="$4"
+    line=$(EVAL_STAGE2_MODE=1 EVAL_SHOT_LIMIT="$EVAL_STAGE2_PREFIX" "$self" validate "$cfg" "$nonce" 2>&1)
+    rc=$?
+    if [ "$rc" -ne 0 ] && ! echo "$line" | grep -Eq "^(stage2-pass|stage2-reject|dirty|CLEAN|ERROR) nonce="; then
+      detail=$(echo "$line" | tr "\n" " " | sed -E "s/[[:space:]]+/ /g")
+      line="ERROR nonce=$nonce stage=stage2 rc=$rc detail=${detail:-stage2 failed}"
+    fi
+    printf "%s\n" "$line" >> "$out_file"
+    printf "%s\n" "$line"
+  ' _ "$SELF" "$CFG" "$OUT" < "$TODO"
+  echo ">> stage2 survivors: $(grep -c '^stage2-pass nonce=' "$OUT" 2>/dev/null || true)"
   ;;
 
 bake)

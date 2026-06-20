@@ -80,7 +80,10 @@ nonce.
   it defers the per-shot EC-muls into the batch loop and stops at the first failing batch.
   ~8.5× avg on dirty candidates; exact (the full eval already checks apply-cleanliness, so
   this *is* the apply pre-scan). Default off keeps scoring byte-identical. Patch:
-  `patches/eval_fast_reject.diff`.
+  `patches/eval_stage2_prefilter.diff`.
+- `EVAL_SHOT_LIMIT=N` / `EVAL_STAGE2_SHOTS=N` limits trusted eval to a prefix for the
+  `./island.sh stage2` candidate prefilter. Partial runs do not write `score.json` or
+  `results.tsv`; a prefix pass is only a survivor, not a clean-island proof.
 
 Recommended safer search settings on the RTX 5090:
 

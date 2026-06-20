@@ -300,7 +300,12 @@ and simulates all 9024 shots and reads `0/0/0`.
 This is the **exact "apply pre-scan"**: the full eval already checks apply-cleanliness, so a
 fast-rejecting eval *is* the apply pre-scan — with zero false negatives and no GPU
 re-implementation of the apply phase. The change lives in the challenge repo (reset by
-`ecdsafail sync`); re-apply `patches/eval_fast_reject.diff`.
+`ecdsafail sync`); re-apply `patches/eval_stage2_prefilter.diff`.
+
+For high-density TrailMix-ludicrous scans, the same patch also supports
+`EVAL_SHOT_LIMIT` / `EVAL_STAGE2_SHOTS`. That turns trusted eval into an exact stage-2
+candidate prefilter: a checked-shot failure rejects the nonce, while a prefix pass is only
+a survivor for later full validation.
 
 ## `dx`-First Quick Filter
 

@@ -75,8 +75,17 @@ GPU `CLEAN` is necessary but not sufficient: ~9% of GCD-clean candidates fail th
 `eval_circuit` 0/0/0 check (usually 1–3 apply-phase "phase-garbage" shots). Always
 quantum-confirm before submitting — `./island.sh validate` does this.
 
+For TrailMix-ludicrous, that blind spot is larger because `GPU_FILTER=ludicrous` checks only
+whether the two inversion factors fit the baked product-min jump-GCD schedule. Use it as
+stage 1, then run `./island.sh stage2` on the emitted candidates. Stage 2 is not a heuristic:
+it invokes the trusted evaluator on a configurable Fiat-Shamir shot prefix with
+`EVAL_FAST_REJECT=1`. Any rejection is a real circuit violation on a checked shot, so a clean
+9024-shot nonce cannot be lost. A pass is only a `stage2-pass`; it must still be fully
+validated before baking or submitting.
+
 ## Pipeline summary
 ```
 config (lever)  --dump_gpu_state-->  gpu_state.bin  --gpu_island2-->  CLEAN candidates
-   --eval_circuit-->  0/0/0 island   --bake (perl, CRLF-safe)-->  mod.rs   --ecdsafail submit-->
+   --stage2 exact prefix prefilter--> survivors --eval_circuit-->  0/0/0 island
+   --bake (perl, CRLF-safe)-->  mod.rs   --ecdsafail submit-->
 ```

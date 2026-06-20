@@ -4,6 +4,32 @@ This file records not only what changed, but also why we made the change, what s
 we expect, and what still needs to be validated. For future work, add an entry whenever a
 change affects search behavior, performance assumptions, correctness risk, or workflow.
 
+## 2026-06-19 - TrailMix-ludicrous stage-2 exact prefilter
+
+Branch: `codex/ludicrous-stage2-prefilter`
+
+### Summary
+
+Added a second-stage, validator-backed prefilter for high-density `GPU_FILTER=ludicrous`
+hunts. The CUDA filter remains an intentionally weak GCD schedule check; stage 2 runs only on
+emitted GCD-clean candidates and rejects candidates only when the trusted evaluator observes a
+real circuit violation on a checked Fiat-Shamir shot prefix.
+
+### Main Changes
+
+- Added `./island.sh stage2 CFG CANDIDATES [RESULTS] [JOBS]`.
+  - accepts raw `CLEAN nonce=...` logs or bare nonce lists;
+  - de-duplicates candidates and skips nonces already present in the results log;
+  - validates in parallel with `EVAL_FAST_REJECT=1` and `EVAL_SHOT_LIMIT`;
+  - writes durable one-line `stage2-pass`, `stage2-reject`, or `ERROR` results.
+- Made `./island.sh validate` prefix-aware so explicit stage-2 runs cannot print submit-safe
+  `CLEAN` for a partial shot prefix.
+- Added `patches/eval_stage2_prefilter.diff`, a superset of the fast-reject helper that also
+  supports `EVAL_SHOT_LIMIT` / `EVAL_STAGE2_SHOTS` and disables `score.json` / `results.tsv`
+  writes for partial evaluations.
+- Updated README and docs to describe the no-false-negative contract: stage 2 rejects only by
+  exact trusted-eval failure; all survivors still require full 9024-shot validation.
+
 ## 2026-06-10 - Safer 1221-SOTA scan recipe; demote `single_pass`
 
 Branch: `main`

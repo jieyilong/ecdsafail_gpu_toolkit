@@ -1,0 +1,366 @@
+diff --git a/src/bin/eval_circuit.rs b/src/bin/eval_circuit.rs
+index ab15ba9..0e87715 100644
+--- a/src/bin/eval_circuit.rs
++++ b/src/bin/eval_circuit.rs
+@@ -37,6 +37,17 @@ const OP_BYTES: usize = OP_FIELDS * FIELD_BYTES;
+ const MAX_OPS: u64 = 4_000_000_000;
+ const NUM_TESTS: usize = 9024;
+ 
++fn env_truthy(name: &str) -> bool {
++    matches!(
++        std::env::var(name).ok().as_deref(),
++        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
++    )
++}
++
++fn env_usize(name: &str) -> Option<usize> {
++    std::env::var(name).ok()?.parse().ok()
++}
++
+ // ─── Bounded ops.bin loader ────────────────────────────────────────────────
+ //
+ // Hand-rolled fixed-width LE framing. Per-op layout:
+@@ -110,8 +121,8 @@ fn load_ops(path: &str) -> Result<Vec<Op>, String> {
+     let mut off = MAGIC.len() + 8;
+     for i in 0..n {
+         let kind_raw = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+-        let kind = op_kind_from_u32(kind_raw)
+-            .ok_or_else(|| format!("op {i}: unknown kind {kind_raw}"))?;
++        let kind =
++            op_kind_from_u32(kind_raw).ok_or_else(|| format!("op {i}: unknown kind {kind_raw}"))?;
+         // bytes[off+4..off+8] are reserved padding for 8-byte alignment.
+         let q_control2 = QubitId(read_u64(&bytes, off + 8));
+         let q_control1 = QubitId(read_u64(&bytes, off + 16));
+@@ -221,33 +232,49 @@ fn run_tests(
+ ) -> SeedReport {
+     let curve = secp256k1();
+ 
+-    let mut targets = Vec::with_capacity(target_shots);
+-    let mut offsets = Vec::with_capacity(target_shots);
+-    let mut expected = Vec::with_capacity(target_shots);
++    // EVAL_FAST_REJECT=1: stop at the first failing batch AND defer the expensive scalar
++    // multiplications into the batch loop. A dirty candidate then pays only for the batches
++    // it actually reaches. Default off, so normal scoring/submission runs stay complete.
++    let fast_reject = env_truthy("EVAL_FAST_REJECT");
++
++    // Read all (k1,k2) byte pairs first so the XOF consumption order -- and therefore the
++    // simulator's phase seeding below -- is identical in fast and full paths.
++    let mut ks = Vec::with_capacity(target_shots);
+     for _ in 0..target_shots {
+         let mut rb = [[0u8; 32]; 2];
+         xof.read(&mut rb[0]);
+         xof.read(&mut rb[1]);
+-        let k1 = U256::from_le_bytes(rb[0]);
+-        let k2 = U256::from_le_bytes(rb[1]);
+-        let t = curve.mul(curve.gx, curve.gy, k1);
+-        let o = curve.mul(curve.gx, curve.gy, k2);
+-        if t.0 == o.0 {
+-            continue;
+-        }
+-        if t.0.is_zero() && t.1.is_zero() {
+-            continue;
+-        }
+-        if o.0.is_zero() && o.1.is_zero() {
+-            continue;
+-        }
+-        let e = curve.add(t.0, t.1, o.0, o.1);
+-        targets.push(t);
+-        offsets.push(o);
+-        expected.push(e);
++        ks.push((U256::from_le_bytes(rb[0]), U256::from_le_bytes(rb[1])));
+     }
+-    let n = targets.len();
+ 
++    // Full path derives every point up front and filters degenerate inputs exactly as the
++    // stock evaluator did. Fast path derives only the current batch, but applies the same
++    // degenerate-input skips lazily before loading simulator lanes.
++    let mut targets = Vec::new();
++    let mut offsets = Vec::new();
++    let mut expected = Vec::new();
++    if !fast_reject {
++        targets.reserve(target_shots);
++        offsets.reserve(target_shots);
++        expected.reserve(target_shots);
++        for &(k1, k2) in &ks {
++            let t = curve.mul(curve.gx, curve.gy, k1);
++            let o = curve.mul(curve.gx, curve.gy, k2);
++            if t.0 == o.0 {
++                continue;
++            }
++            if t.0.is_zero() && t.1.is_zero() {
++                continue;
++            }
++            if o.0.is_zero() && o.1.is_zero() {
++                continue;
++            }
++            let e = curve.add(t.0, t.1, o.0, o.1);
++            targets.push(t);
++            offsets.push(o);
++            expected.push(e);
++        }
++    }
+     let mut sim = Simulator::new(total_qubits as usize, num_bits as usize, &mut xof);
+     let mut ok = true;
+     let mut fail_reason: Option<String> = None;
+@@ -256,90 +283,140 @@ fn run_tests(
+     let mut ancilla_garbage_batches = 0usize;
+ 
+     const BATCH: usize = 64;
+-    let num_batches = (n + BATCH - 1) / BATCH;
+-    for batch in 0..num_batches {
+-        let bs = BATCH.min(n - batch * BATCH);
+-        let cond_mask: u64 = if bs == 64 { u64::MAX } else { (1u64 << bs) - 1 };
+-
+-        sim.clear_for_shot();
+-        for shot in 0..bs {
+-            let i = batch * BATCH + shot;
+-            sim.set_register(&layout_regs[0], targets[i].0, shot);
+-            sim.set_register(&layout_regs[1], targets[i].1, shot);
+-            sim.set_register(&layout_regs[2], offsets[i].0, shot);
+-            sim.set_register(&layout_regs[3], offsets[i].1, shot);
+-        }
++    let mut checked_shots = 0usize;
++
++    macro_rules! eval_batch {
++        ($bin:expr) => {{
++            let bs = $bin.len();
++            let cond_mask: u64 = if bs == 64 { u64::MAX } else { (1u64 << bs) - 1 };
++
++            sim.clear_for_shot();
++            for shot in 0..bs {
++                let (_, t, o, _) = $bin[shot];
++                sim.set_register(&layout_regs[0], t.0, shot);
++                sim.set_register(&layout_regs[1], t.1, shot);
++                sim.set_register(&layout_regs[2], o.0, shot);
++                sim.set_register(&layout_regs[3], o.1, shot);
++            }
+ 
+-        sim.apply_iter(ops.iter());
++            sim.apply_iter(ops.iter());
++
++            for shot in 0..bs {
++                let (i, _, _, e) = $bin[shot];
++                let gx = sim.get_register(&layout_regs[0], shot);
++                let gy = sim.get_register(&layout_regs[1], shot);
++                if gx != e.0 || gy != e.1 {
++                    classical_failures += 1;
++                    if fail_reason.is_none() {
++                        fail_reason = Some(format!(
++                            "CLASSICAL MISMATCH shot {i}: got ({:#x},{:#x}) exp ({:#x},{:#x})",
++                            gx, gy, e.0, e.1
++                        ));
++                    }
++                    ok = false;
++                }
++            }
+ 
+-        for shot in 0..bs {
+-            let i = batch * BATCH + shot;
+-            let gx = sim.get_register(&layout_regs[0], shot);
+-            let gy = sim.get_register(&layout_regs[1], shot);
+-            if gx != expected[i].0 || gy != expected[i].1 {
+-                classical_failures += 1;
++            let phase = sim.phase & cond_mask;
++            if phase != 0 {
++                phase_garbage_batches += 1;
++                let msg = format!(
++                    "PHASE GARBAGE: global_phase = {:#018x} across {} live shots (must be 0)",
++                    phase, bs
++                );
+                 if fail_reason.is_none() {
+-                    fail_reason = Some(format!(
+-                        "CLASSICAL MISMATCH shot {i}: got ({:#x},{:#x}) exp ({:#x},{:#x})",
+-                        gx, gy, expected[i].0, expected[i].1
+-                    ));
++                    fail_reason = Some(msg);
+                 }
+                 ok = false;
+             }
+-        }
+ 
+-        let phase = sim.phase & cond_mask;
+-        if phase != 0 {
+-            phase_garbage_batches += 1;
+-            let msg = format!(
+-                "PHASE GARBAGE: global_phase = {:#018x} across {} live shots (must be 0)",
+-                phase, bs
+-            );
+-            if fail_reason.is_none() {
+-                fail_reason = Some(msg);
++            for register in layout_regs {
++                for qb in register {
++                    if let QubitOrBit::Qubit(q) = *qb {
++                        *sim.qubit_mut(q) = 0;
++                    }
++                }
+             }
+-            ok = false;
+-        }
++            let mut garbage_q: Option<u64> = None;
++            for q in 0..total_qubits {
++                let v = sim.qubit(QubitId(q)) & cond_mask;
++                if v != 0 {
++                    garbage_q = Some(q);
++                    break;
++                }
++            }
++            if let Some(q) = garbage_q {
++                ancilla_garbage_batches += 1;
++                let v = sim.qubit(QubitId(q)) & cond_mask;
++                let msg = format!(
++                    "ANCILLA GARBAGE: qubit {} = {:#018x} (live shots) at end of forward; \
++                     every non-register qubit must be |0⟩ on every live shot",
++                    q, v
++                );
++                if fail_reason.is_none() {
++                    fail_reason = Some(msg);
++                }
++                ok = false;
++            }
++            checked_shots += bs;
++        }};
++    }
+ 
+-        for register in layout_regs {
+-            for qb in register {
+-                if let QubitOrBit::Qubit(q) = *qb {
+-                    *sim.qubit_mut(q) = 0;
++    if fast_reject {
++        let mut cursor = 0usize;
++        while cursor < ks.len() {
++            let mut bin: Vec<(usize, (U256, U256), (U256, U256), (U256, U256))> =
++                Vec::with_capacity(BATCH);
++            while cursor < ks.len() && bin.len() < BATCH {
++                let i = cursor;
++                cursor += 1;
++                let (k1, k2) = ks[i];
++                let t = curve.mul(curve.gx, curve.gy, k1);
++                let o = curve.mul(curve.gx, curve.gy, k2);
++                if t.0 == o.0 {
++                    continue;
+                 }
++                if t.0.is_zero() && t.1.is_zero() {
++                    continue;
++                }
++                if o.0.is_zero() && o.1.is_zero() {
++                    continue;
++                }
++                let e = curve.add(t.0, t.1, o.0, o.1);
++                bin.push((i, t, o, e));
+             }
+-        }
+-        let mut garbage_q: Option<u64> = None;
+-        for q in 0..total_qubits {
+-            let v = sim.qubit(QubitId(q)) & cond_mask;
+-            if v != 0 {
+-                garbage_q = Some(q);
++            if bin.is_empty() {
++                continue;
++            }
++            eval_batch!(bin);
++            if !ok {
+                 break;
+             }
+         }
+-        if let Some(q) = garbage_q {
+-            ancilla_garbage_batches += 1;
+-            let v = sim.qubit(QubitId(q)) & cond_mask;
+-            let msg = format!(
+-                "ANCILLA GARBAGE: qubit {} = {:#018x} (live shots) at end of forward; \
+-                 every non-register qubit must be |0⟩ on every live shot",
+-                q, v
+-            );
+-            if fail_reason.is_none() {
+-                fail_reason = Some(msg);
++    } else {
++        let n = targets.len();
++        let num_batches = (n + BATCH - 1) / BATCH;
++        for batch in 0..num_batches {
++            let bs = BATCH.min(n - batch * BATCH);
++            let mut bin: Vec<(usize, (U256, U256), (U256, U256), (U256, U256))> =
++                Vec::with_capacity(bs);
++            for shot in 0..bs {
++                let i = batch * BATCH + shot;
++                bin.push((i, targets[i], offsets[i], expected[i]));
+             }
+-            ok = false;
++            eval_batch!(bin);
+         }
+     }
+ 
+     let _ = num_bits;
+-    let denom = n.max(1) as f64;
++    let denom = checked_shots.max(1) as f64;
+     SeedReport {
+         ok,
+         avg_cliff: sim.stats.clifford_gates as f64 / denom,
+         avg_tof: sim.stats.toffoli_gates as f64 / denom,
+         tot_tof: sim.stats.toffoli_gates,
+         tot_cliff: sim.stats.clifford_gates,
+-        n_shots: n,
++        n_shots: checked_shots,
+         classical_failures,
+         phase_garbage_batches,
+         ancilla_garbage_batches,
+@@ -488,25 +565,38 @@ fn main() {
+     println!("  qubits      : {}", total_qubits);
+     println!("  bits        : {}", num_bits);
+ 
+-    println!("\n-- correctness tests ({} shots) --", NUM_TESTS);
++    let target_shots = env_usize("EVAL_SHOT_LIMIT")
++        .or_else(|| env_usize("EVAL_STAGE2_SHOTS"))
++        .map(|n| n.clamp(1, NUM_TESTS))
++        .unwrap_or(NUM_TESTS);
++    let partial_eval = target_shots != NUM_TESTS;
++    println!("\n-- correctness tests ({} shots) --", target_shots);
++    if partial_eval {
++        println!("  partial prefilter      : true (score.json/results.tsv disabled)");
++    }
+     let xof = fiat_shamir_seed(&ops);
+-    let r = run_tests(&ops, &regs, total_qubits, num_bits, xof, NUM_TESTS);
++    let r = run_tests(&ops, &regs, total_qubits, num_bits, xof, target_shots);
+     println!("  tested shots            : {}", r.n_shots);
+     println!("  classical mismatches    : {}", r.classical_failures);
+     println!("  phase-garbage batches   : {}", r.phase_garbage_batches);
+     println!("  ancilla-garbage batches : {}", r.ancilla_garbage_batches);
+     if !r.ok {
+-        let reason = r.fail_reason.clone().unwrap_or_else(|| "(no detail)".into());
++        let reason = r
++            .fail_reason
++            .clone()
++            .unwrap_or_else(|| "(no detail)".into());
+         println!("\n!! correctness FAILED: {reason}");
+         let fail_note = format!("{note} | {reason}");
+-        append_results_row(
+-            "FAIL",
+-            r.avg_tof,
+-            r.avg_cliff,
+-            total_qubits,
+-            ops.len(),
+-            &fail_note,
+-        );
++        if !partial_eval {
++            append_results_row(
++                "FAIL",
++                r.avg_tof,
++                r.avg_cliff,
++                total_qubits,
++                ops.len(),
++                &fail_note,
++            );
++        }
+         std::process::exit(1);
+     }
+     println!("  all {} shots OK", r.n_shots);
+@@ -522,6 +612,11 @@ fn main() {
+     println!("  emitted ops           : {}", ops.len());
+     println!("  qubits                : {}", total_qubits);
+ 
++    if partial_eval {
++        println!("\n=== stage2 prefilter OK (partial; not a clean-island proof) ===");
++        return;
++    }
++
+     append_results_row("OK", r.avg_tof, r.avg_cliff, total_qubits, ops.len(), &note);
+     write_score(r.avg_tof, total_qubits);
+ 
