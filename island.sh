@@ -24,6 +24,34 @@ SELF="$HERE/island.sh"
 CFGF="${ISLAND_CONFIG:-$HERE/config.env}"
 die(){ echo "ERROR: $*" >&2; exit 1; }
 truthy(){ case "${1:-}" in 1|true|TRUE|yes|YES|on|ON) return 0;; *) return 1;; esac; }
+line_score_suffix(){ # tof qubits
+  local tof="${1:-}" q="${2:-}" score
+  [ -n "$tof" ] && [ -n "$q" ] || return 0
+  score=$(awk -v t="$tof" -v q="$q" 'BEGIN{printf "%d", int(t + 0.5) * q}')
+  printf ' score=%s' "$score"
+}
+emit_validation_record(){ # line
+  local line="$1" dest lock dir
+  echo "$line"
+  [ -n "${VALIDATE_RESULTS_LOG:-}" ] || return 0
+  case "$line" in
+    ERROR*)
+      dest="${VALIDATE_ERRORS_LOG:-$(dirname "$VALIDATE_RESULTS_LOG")/errors.log}"
+      ;;
+    *)
+      dest="$VALIDATE_RESULTS_LOG"
+      ;;
+  esac
+  dir="$(dirname "$dest")"
+  mkdir -p "$dir"
+  lock="${VALIDATE_LOCK_FILE:-$VALIDATE_RESULTS_LOG.lock}"
+  mkdir -p "$(dirname "$lock")"
+  if command -v flock >/dev/null 2>&1; then
+    { flock 9; printf '%s\n' "$line" >> "$dest"; } 9>"$lock"
+  else
+    printf '%s\n' "$line" >> "$dest"
+  fi
+}
 
 # ---- config helpers (init-* don't require an existing config.env) ----
 cmd="${1:-help}"; shift || true
@@ -71,6 +99,39 @@ push_runtime(){ rsh "mkdir -p $RDIR"; rcp "$KSRC" gpu_island2.cu; for s in build
 tail_nonce(){
   grep -E 'set_default_env\("DIALOG_TAIL_NONCE", "[0-9]+"\)' "$CHALLENGE/src/point_add/mod.rs" \
     | tail -1 | grep -oE '"[0-9]+"' | tr -d '"'
+}
+eval_supports_tail_nonce(){
+  grep -a -q "EVAL_TAIL_NONCE" "$BIN/eval_circuit" 2>/dev/null
+}
+emit_validation_line(){ # nonce out eval_rc
+  local nonce="$1" out="$2" eval_rc="$3" cls pha anc tof q shots detail prefix
+  cls=$(echo "$out"|grep "classical mismatches"|grep -oE '[0-9]+$')
+  pha=$(echo "$out"|grep "phase-garbage"|grep -oE '[0-9]+$')
+  anc=$(echo "$out"|grep "ancilla-garbage"|grep -oE '[0-9]+$')
+  tof=$(echo "$out"|grep "avg executed Toffoli"|grep -oE '[0-9.]+'|head -1)
+  q=$(echo "$out"|grep -E '^  qubits '|grep -oE '[0-9]+$'|head -1)
+  shots=$(echo "$out"|grep "tested shots"|grep -oE '[0-9]+$'|head -1)
+  if [ -z "${cls:-}" ] || [ -z "${pha:-}" ] || [ -z "${anc:-}" ]; then
+    detail=$(echo "$out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')
+    emit_validation_record "ERROR nonce=$nonce stage=eval rc=$eval_rc detail=${detail:-eval_circuit failed}"
+    return
+  fi
+  prefix=0
+  truthy "${EVAL_STAGE2_MODE:-0}" && prefix=1
+  [ -n "${EVAL_SHOT_LIMIT:-}" ] && prefix=1
+  if [ "${cls:-x}" = 0 ] && [ "${pha:-x}" = 0 ] && [ "${anc:-x}" = 0 ]; then
+    if [ "$prefix" = 1 ]; then
+      emit_validation_record "stage2-pass nonce=$nonce shots=${shots:-?} cls=0 pha=0 anc=0 tof=${tof:-?} qubits=${q:-?}"
+    else
+      emit_validation_record "CLEAN nonce=$nonce cls=0 pha=0 anc=0 tof=$tof qubits=$q$(line_score_suffix "$tof" "$q")"
+    fi
+  else
+    if [ "$prefix" = 1 ]; then
+      emit_validation_record "stage2-reject nonce=$nonce shots=${shots:-?} cls=${cls:-?} pha=${pha:-?} anc=${anc:-?} tof=${tof:-?} qubits=${q:-?}"
+    else
+      emit_validation_record "dirty nonce=$nonce cls=${cls:-?} pha=${pha:-?} anc=${anc:-?} tof=${tof:-?} qubits=${q:-?}"
+    fi
+  fi
 }
 run_variant_search(){ # envs state start n chunk
   local envs="$1" state="$2" start="$3" n="$4" chunk="${5:-200000}"
@@ -136,45 +197,6 @@ extract_nonces(){
 extract_file_nonces(){ # file
   [ -s "$1" ] || return 0
   extract_nonces < "$1"
-}
-line_score_suffix(){ # tof qubits
-  local tof="$1" q="$2" score
-  [ -n "$tof" ] && [ -n "$q" ] || return 0
-  score=$(awk -v t="$tof" -v q="$q" 'BEGIN{printf "%d", int(t + 0.5) * q}')
-  printf ' score=%s' "$score"
-}
-eval_supports_tail_nonce(){
-  strings "$BIN/eval_circuit" 2>/dev/null | grep -q "EVAL_TAIL_NONCE"
-}
-emit_validation_line(){ # nonce out eval_rc
-  local nonce="$1" out="$2" eval_rc="$3" cls pha anc tof q shots detail prefix
-  cls=$(echo "$out"|grep "classical mismatches"|grep -oE '[0-9]+$')
-  pha=$(echo "$out"|grep "phase-garbage"|grep -oE '[0-9]+$')
-  anc=$(echo "$out"|grep "ancilla-garbage"|grep -oE '[0-9]+$')
-  tof=$(echo "$out"|grep "avg executed Toffoli"|grep -oE '[0-9.]+'|head -1)
-  q=$(echo "$out"|grep -E '^  qubits '|grep -oE '[0-9]+$'|head -1)
-  shots=$(echo "$out"|grep "tested shots"|grep -oE '[0-9]+$'|head -1)
-  if [ -z "${cls:-}" ] || [ -z "${pha:-}" ] || [ -z "${anc:-}" ]; then
-    detail=$(echo "$out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')
-    echo "ERROR nonce=$nonce stage=eval rc=$eval_rc detail=${detail:-eval_circuit failed}"
-    return
-  fi
-  prefix=0
-  truthy "${EVAL_STAGE2_MODE:-0}" && prefix=1
-  [ -n "${EVAL_SHOT_LIMIT:-}" ] && prefix=1
-  if [ "${cls:-x}" = 0 ] && [ "${pha:-x}" = 0 ] && [ "${anc:-x}" = 0 ]; then
-    if [ "$prefix" = 1 ]; then
-      echo "stage2-pass nonce=$nonce shots=${shots:-?} cls=0 pha=0 anc=0 tof=${tof:-?} qubits=${q:-?}"
-    else
-      echo "CLEAN nonce=$nonce cls=0 pha=0 anc=0 tof=$tof qubits=$q$(line_score_suffix "$tof" "$q")"
-    fi
-  else
-    if [ "$prefix" = 1 ]; then
-      echo "stage2-reject nonce=$nonce shots=${shots:-?} cls=${cls:-?} pha=${pha:-?} anc=${anc:-?} tof=${tof:-?} qubits=${q:-?}"
-    else
-      echo "dirty nonce=$nonce cls=${cls:-?} pha=${pha:-?} anc=${anc:-?} tof=${tof:-?} qubits=${q:-?}"
-    fi
-  fi
 }
 bench_variant(){ # name envs state start n summary_file
   local name="$1" envs="$2" state="$3" start="$4" n="$5" summary="$6"
@@ -406,7 +428,7 @@ validate)
     if [ "$build_rc" -ne 0 ]; then
       detail=$(echo "$build_out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')
       rm -rf "$d"
-      for nonce in "$@"; do echo "ERROR nonce=$nonce stage=build rc=$build_rc detail=${detail:-build_circuit failed}"; done
+      for nonce in "$@"; do emit_validation_record "ERROR nonce=$nonce stage=build rc=$build_rc detail=${detail:-build_circuit failed}"; done
       exit 0
     fi
     for nonce in "$@"; do
@@ -423,7 +445,7 @@ validate)
       if [ "$build_rc" -ne 0 ]; then
         detail=$(echo "$build_out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')
         rm -rf "$d"
-        echo "ERROR nonce=$nonce stage=build rc=$build_rc detail=${detail:-build_circuit failed}"
+        emit_validation_record "ERROR nonce=$nonce stage=build rc=$build_rc detail=${detail:-build_circuit failed}"
         continue
       fi
       out=$( cd "$d" && env ${CFG:+$CFG} EVAL_FAST_REJECT="${EVAL_FAST_REJECT:-1}" DIALOG_TAIL_NONCE="$nonce" "$BIN/eval_circuit" --note "isl-$nonce" 2>&1 )

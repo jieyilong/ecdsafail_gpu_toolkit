@@ -30,8 +30,19 @@ real circuit violation on a checked Fiat-Shamir shot prefix.
 - Added `VALIDATE_REUSE_OPS=1`: build one nonce-0 `ops.bin`, then evaluate many candidates by
   overriding only the Fiat-Shamir hash of the final 96 identity-tail ops. This targets the
   validation bottleneck where `build_circuit` dominated per-nonce runtime.
+- Added validate-only durable ledger support. When `VALIDATE_RESULTS_LOG` is set,
+  `island.sh validate` appends successful `dirty` / `CLEAN` / `stage2-*` verdict lines to
+  that file while routing `ERROR ... stage=build/eval ...` rows to `VALIDATE_ERRORS_LOG`
+  (or `errors.log` next to the results file by default). Appends use `flock` when available.
 - Updated README and docs to describe the no-false-negative contract: stage 2 rejects only by
   exact trusted-eval failure; all survivors still require full 9024-shot validation.
+
+### Expected impact
+
+This removes repeated `build_circuit` calls from validation batches without changing the
+simulated unitary. On the q1162 timing check, three old-style builds took 159.9s total
+while one cached nonce-0 build took 54.9s; the default 32-candidate batch should save
+roughly 31 repeated builds.
 
 ## 2026-06-10 - Safer 1221-SOTA scan recipe; demote `single_pass`
 

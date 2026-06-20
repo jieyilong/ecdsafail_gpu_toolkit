@@ -49,6 +49,8 @@ GPU_BATCH_INV=1 GPU_COMB_BITS=22 GPU_GCD_MODE=trunc_first GPU_FAN_BITS=22 GPU_WA
   ./island.sh search s.bin <START> <N>
 # Phase 2 — CPU VALIDATE (EVAL_FAST_REJECT lives here): confirms 0/0/0 + score
 EVAL_FAST_REJECT=1 ./island.sh validate "<CFG>" <nonce> [<nonce>...]
+# Batch validation: build the circuit body once, then replay candidate tail nonces
+VALIDATE_REUSE_OPS=1 EVAL_FAST_REJECT=1 ./island.sh validate "<CFG>" <nonce> [<nonce>...]
 ```
 
 `EVAL_FAST_REJECT` is a **Phase-2 (eval) knob, not a scan knob** — putting it on a `search`
@@ -100,6 +102,23 @@ the previous-release binary and this branch with the scan baseline both measured
   is exact because `DIALOG_TAIL_NONCE` only changes the target IDs of the final 96 `X;X`
   identity-tail ops. Use this for large batches and remote own-host validation. `stage2`
   enables it automatically and uses `STAGE2_BATCH=32` unless overridden.
+- `VALIDATE_RESULTS_LOG=/path/results.log` — optional validate-only durable verdict ledger.
+  `island.sh validate` still prints every result to stdout, and additionally appends successful
+  `dirty` / `CLEAN` / `stage2-*` verdict lines to this file under `flock` when available.
+- `VALIDATE_ERRORS_LOG=/path/errors.log` — optional validate-only retry ledger for
+  `ERROR ... stage=build/eval ...` rows. If omitted, errors go to `errors.log` next to
+  `VALIDATE_RESULTS_LOG`. Do not count these nonces as validated; rerun them.
+- `VALIDATE_LOCK_FILE=/path/validate.lock` — optional shared append lock. Use one lock across
+  `results.log` and `errors.log` when multiple validators run on the same host.
+
+For remote distributed validation, prefer:
+
+```bash
+VALIDATE_REUSE_OPS=1 \
+VALIDATE_RESULTS_LOG=/root/<route>_validation/results.log \
+VALIDATE_ERRORS_LOG=/root/<route>_validation/errors.log \
+./island.sh validate "$CFG" <nonce...>
+```
 
 For production island searches on a large NVIDIA GPU, prefer the safer fast mode that has
 passed a known-clean nonce check on the current base. As of the RTX 5090 measurements on the

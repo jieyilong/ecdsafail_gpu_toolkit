@@ -89,6 +89,8 @@ nonce.
   Fiat-Shamir hash of the 96-op identity tail, so this removes repeated `build_circuit`
   cost while preserving exact candidate inputs. `stage2` enables this automatically and
   batches candidates with `STAGE2_BATCH` (default `32`).
+- `VALIDATE_RESULTS_LOG` / `VALIDATE_ERRORS_LOG` can split durable validation verdicts
+  from retryable build/eval errors during distributed validation.
 
 Recommended safer search settings on the RTX 5090:
 

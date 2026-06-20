@@ -187,8 +187,21 @@ GPU_GCD_MODE=trunc_first ./island.sh search s.bin 1 2000000
 | `EVAL_SHOT_LIMIT` / `EVAL_STAGE2_SHOTS` | `1..9024` | **Stage-2 prefilter knob.** Limits trusted eval to a shot prefix and disables `score.json` / `results.tsv` writes for partial runs. A failure on any checked shot is an exact rejection; a pass is only `stage2-pass`, not a clean-island proof. Default stage-2 prefix is `512` shots. |
 | `VALIDATE_REUSE_OPS` | `0`/`1` | **Build-cache validation knob.** `1` builds one nonce-0 `ops.bin` per validator process and evaluates every requested nonce by overriding only the Fiat-Shamir identity-tail hash with `EVAL_TAIL_NONCE`. This avoids the expensive `build_circuit` call for every candidate. Exact because the tail is 48 `X;X` identity pairs; only the serialized tail targets reseed SHAKE. Requires `patches/eval_stage2_prefilter.diff`. `stage2` enables this automatically. |
 | `STAGE2_BATCH` | positive integer | Nonces per stage-2 worker invocation. Default `32`; each worker pays one cached build for up to this many candidates, then runs exact prefix evals. |
+| `VALIDATE_RESULTS_LOG` | path | Optional validate-only durable ledger. When set, `island.sh validate` still prints every line to stdout, and also appends successful `dirty` / `CLEAN` / `stage2-*` verdict lines to this file under `flock` when available. |
+| `VALIDATE_ERRORS_LOG` | path | Optional validate-only error ledger. `ERROR ... stage=build/eval ...` lines are routed here instead of `VALIDATE_RESULTS_LOG`; defaults to `errors.log` next to `VALIDATE_RESULTS_LOG`. Error nonces are retryable and should not be counted as validated. |
+| `VALIDATE_LOCK_FILE` | path | Optional shared lock path for `VALIDATE_RESULTS_LOG` / `VALIDATE_ERRORS_LOG` appends. Defaults to `<VALIDATE_RESULTS_LOG>.lock`. |
 
-**Every improvement is an independent on/off knob** (all default to the conservative/exact baseline): `GPU_BATCH_INV`, `GPU_COMB_BITS`, `GPU_GCD_MODE` (`trunc_first` is the safer fast choice; `single_pass` is experimental), `GPU_WAVE`, `GPU_FAN_BITS`, and `EVAL_FAST_REJECT`. They compose; benchmark combinations with `bench-gpu-knobs`.
+**Every improvement is an independent on/off knob** (all default to the conservative/exact baseline): `GPU_BATCH_INV`, `GPU_COMB_BITS`, `GPU_GCD_MODE` (`trunc_first` is the safer fast choice; `single_pass` is experimental), `GPU_WAVE`, `GPU_FAN_BITS`, `EVAL_FAST_REJECT`, `VALIDATE_REUSE_OPS`, and the optional validation ledger paths. They compose; benchmark combinations with `bench-gpu-knobs`.
+
+For distributed validation, keep the verdict ledger clean and route build/eval failures to a
+separate retry ledger:
+
+```bash
+VALIDATE_REUSE_OPS=1 \
+VALIDATE_RESULTS_LOG=/root/<route>_validation/results.log \
+VALIDATE_ERRORS_LOG=/root/<route>_validation/errors.log \
+  ./island.sh validate "$CFG" <nonce...>
+```
 
 Recommended safer scan settings on the RTX 5090:
 
