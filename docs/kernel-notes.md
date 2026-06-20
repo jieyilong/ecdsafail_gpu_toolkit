@@ -81,6 +81,10 @@ nonce.
   ~8.5× avg on dirty candidates; exact (the full eval already checks apply-cleanliness, so
   this *is* the apply pre-scan). Default off keeps scoring byte-identical. Patch:
   `patches/eval_fast_reject.diff`.
+- `VALIDATE_REUSE_OPS=1` is also an eval-phase knob: `island.sh validate` builds one
+  nonce-0 circuit body, then validates each supplied candidate by setting `EVAL_TAIL_NONCE`
+  in the patched evaluator. This removes repeated `build_circuit` calls from validation
+  batches and is exact for the standard fixed 96-op `DIALOG_TAIL_NONCE` identity tail.
 
 Recommended safer search settings on the RTX 5090:
 
