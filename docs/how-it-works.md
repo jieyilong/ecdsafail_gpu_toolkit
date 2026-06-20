@@ -101,9 +101,26 @@ which is equivalent because each tail bit is an `X;X` identity pair. `./island.s
 uses that one-build path automatically; `VALIDATE_REUSE_OPS=1 ./island.sh validate ...`
 offers the same trick for ad hoc validation batches.
 
+## Generic exact obligation prefilters
+
+Not every false positive should be pushed into the CUDA GCD kernel. Carry drops, narrowed
+comparators, fold overflows, and phase-tail controls are more circuit-specific, and they
+change as new SOTA submissions reshuffle the circuit. The stable interface is an
+obligation manifest: the builder or an audited optimization pass writes down exact
+conditions that a clean execution must satisfy, and `obligation_filter` evaluates those
+conditions over the same Fiat-Shamir shot values used by the evaluator.
+
+The checker is generic. It derives `tx`, `ty`, `ox`, `oy`, `rx`, `ry`, `dx`, and `c` for
+each shot, then applies simple predicates such as `high_zero`, `add_no_carry`,
+`sub_no_borrow`, `compare_window_agrees`, `low_eq`, `nonzero`, and legacy
+`gcd_factor_fits`. Unknown predicates are errors rather than silent passes. The default
+manifest is empty, so it cannot introduce a false negative; production manifests must be
+smoke-tested against known clean submitted nonces before use.
+
 ## Pipeline summary
 ```
 config (lever)  --dump_gpu_state-->  gpu_state.bin  --gpu_island2-->  CLEAN candidates
+   --optional obligation manifest filter--> candidates
    --stage2 exact eval filter--> survivors --eval_circuit-->  0/0/0 island
    --bake (perl, CRLF-safe)-->  mod.rs   --ecdsafail submit-->
 ```

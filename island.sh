@@ -12,6 +12,8 @@
 #   ./island.sh probe  STATE                            # GPU Keccak probe cross-check
 #   ./island.sh search STATE START N [CHUNK]            # multi-GPU search -> CLEAN nonce=...
 #   ./island.sh stage2 CFG CANDIDATES [RESULTS] [JOBS]  # exact validator-backed prefilter
+#   ./island.sh obligations emit-default|emit-dialog-gcd [OUT]
+#   ./island.sh obligations check CFG MANIFEST CANDIDATES [RESULTS] [JOBS]
 #   ./island.sh test-gpu-knobs [CFG] [START] [N]        # correctness smoke for GPU knobs
 #   ./island.sh bench-gpu-knobs [CFG] [START] [N]       # throughput benchmark for GPU knobs
 #   ./island.sh validate CFG NONCE...                  # quantum-confirm 0/0/0 + score
@@ -235,7 +237,7 @@ doctor)
 install)
   cp "$HERE"/rust/*.rs "$CHALLENGE/src/bin/"
   ( cd "$CHALLENGE" && cargo build --release \
-      --bin build_circuit --bin eval_circuit --bin dump_gpu_state --bin count_tof --bin island_search )
+      --bin build_circuit --bin eval_circuit --bin dump_gpu_state --bin count_tof --bin island_search --bin obligation_filter )
   echo ">> installed. Sanity: (cd $CHALLENGE && ecdsafail run) must print the leaderboard score, 0/0/0."
   ;;
 
@@ -526,6 +528,99 @@ stage2)
     printf "%s\n" "$line"
   ' _ "$BIN" "$WORK" "$CFG" "$OUT" "$OUT.lock" "$EVAL_STAGE2_PREFIX" "$EVAL_FAST_REJECT" < "$TODO"
   echo ">> stage2 survivors: $(grep -c '^stage2-pass nonce=' "$OUT" 2>/dev/null || true)"
+  ;;
+
+obligations)
+  SUB="${1:-help}"; shift || true
+  case "$SUB" in
+  emit-default|emit-dialog-gcd)
+    OUT="${1:-}"
+    MODE="${SUB#emit-}"
+    [ -x "$BIN/obligation_filter" ] || die "obligation_filter not built. Run: ./island.sh install"
+    if [ -n "$OUT" ]; then
+      mkdir -p "$(dirname "$OUT")"
+      "$BIN/obligation_filter" "emit-$MODE" > "$OUT"
+      echo ">> wrote obligation manifest $OUT"
+    else
+      "$BIN/obligation_filter" "emit-$MODE"
+    fi
+    ;;
+  check)
+    CFG="${1:-}"; MANIFEST="${2:-}"; CAND="${3:-}"; OUT="${4:-obligation-results.log}"; JOBS="${5:-${OBLIGATION_JOBS:-$(default_jobs)}}"
+    [ -n "$CAND" ] || die "usage: obligations check CFG MANIFEST CANDIDATES|- [RESULTS.log] [JOBS]"
+    [ -f "$MANIFEST" ] || die "manifest file not found: $MANIFEST"
+    [ "$JOBS" -gt 0 ] 2>/dev/null || die "JOBS must be a positive integer"
+    [ -x "$BIN/obligation_filter" ] || die "obligation_filter not built. Run: ./island.sh install"
+    ALL="$(mktemp)"; SEEN="$(mktemp)"; TODO="$(mktemp)"
+    trap 'rm -f "$ALL" "$SEEN" "$TODO"' EXIT
+    if [ "$CAND" = "-" ]; then
+      extract_nonces > "$ALL"
+    else
+      [ -f "$CAND" ] || die "candidate file not found: $CAND"
+      extract_nonces < "$CAND" > "$ALL"
+    fi
+    extract_file_nonces "$OUT" > "$SEEN"
+    if [ -s "$SEEN" ]; then
+      awk 'NR==FNR { done[$1]=1; next } !($1 in done)' "$SEEN" "$ALL" > "$TODO"
+    else
+      cp "$ALL" "$TODO"
+    fi
+    total=$(wc -l < "$ALL" | tr -d ' ')
+    seen=$(wc -l < "$SEEN" | tr -d ' ')
+    todo=$(wc -l < "$TODO" | tr -d ' ')
+    OBLIGATION_SHOTS="${OBLIGATION_SHOTS:-9024}"
+    OBLIGATION_BATCH="${OBLIGATION_BATCH:-64}"
+    [ "$OBLIGATION_SHOTS" -gt 0 ] 2>/dev/null || die "OBLIGATION_SHOTS must be a positive integer"
+    [ "$OBLIGATION_SHOTS" -le 9024 ] 2>/dev/null || die "OBLIGATION_SHOTS must be <= 9024"
+    [ "$OBLIGATION_BATCH" -gt 0 ] 2>/dev/null || die "OBLIGATION_BATCH must be a positive integer"
+    ERR="${OBLIGATION_ERRORS_LOG:-$(dirname "$OUT")/obligation-errors.log}"
+    echo ">> exact obligation prefilter: candidates=$total already_logged=$seen todo=$todo shots=$OBLIGATION_SHOTS jobs=$JOBS batch=$OBLIGATION_BATCH out=$OUT errors=$ERR"
+    if [ "$todo" = 0 ]; then
+      echo ">> obligations: no new candidates"
+      exit 0
+    fi
+    mkdir -p "$(dirname "$OUT")" "$(dirname "$ERR")"
+    export OBLIGATION_SHOTS
+    xargs -n "$OBLIGATION_BATCH" -P "$JOBS" bash -c '
+      bin="$1"; cfg="$2"; manifest="$3"; out_file="$4"; out_lock="$5"; err_file="$6"; err_lock="$7"; shift 7
+      out=$(env ${cfg:+$cfg} "$bin/obligation_filter" check "$manifest" "$@" 2>&1)
+      rc=$?
+      if [ "$rc" -ne 0 ]; then
+        detail=$(printf "%s\n" "$out" | tr "\n" " " | sed -E "s/[[:space:]]+/ /g" | cut -c1-2000)
+        for nonce in "$@"; do
+          line="ERROR nonce=$nonce stage=obligations rc=$rc detail=${detail:-obligation_filter failed}"
+          if command -v flock >/dev/null 2>&1; then
+            { flock 9; printf "%s\n" "$line" >> "$err_file"; } 9>"$err_lock"
+          else
+            printf "%s\n" "$line" >> "$err_file"
+          fi
+          printf "%s\n" "$line"
+        done
+        exit 0
+      fi
+      printf "%s\n" "$out" | while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in
+          obligation-pass\ nonce=*|obligation-reject\ nonce=*) ;;
+          *) printf "%s\n" "$line" >&2; continue ;;
+        esac
+        if command -v flock >/dev/null 2>&1; then
+          { flock 9; printf "%s\n" "$line" >> "$out_file"; } 9>"$out_lock"
+        else
+          printf "%s\n" "$line" >> "$out_file"
+        fi
+        printf "%s\n" "$line"
+      done
+    ' _ "$BIN" "$CFG" "$MANIFEST" "$OUT" "$OUT.lock" "$ERR" "$ERR.lock" < "$TODO"
+    echo ">> obligation survivors: $(grep -c '^obligation-pass nonce=' "$OUT" 2>/dev/null || true)"
+    ;;
+  help|*)
+    echo "usage:"
+    echo "  ./island.sh obligations emit-default [OUT]"
+    echo "  ./island.sh obligations emit-dialog-gcd [OUT]"
+    echo "  ./island.sh obligations check CFG MANIFEST CANDIDATES|- [RESULTS.log] [JOBS]"
+    ;;
+  esac
   ;;
 
 bake)

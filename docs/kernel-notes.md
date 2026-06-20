@@ -94,6 +94,12 @@ nonce.
   parallelism.
 - `VALIDATE_RESULTS_LOG` / `VALIDATE_ERRORS_LOG` can split durable validation verdicts
   from retryable build/eval errors during distributed validation.
+- `obligation_filter` is a CPU-side exact partial prefilter for circuit-specific
+  obligations that should not be hard-coded into the CUDA GCD kernel. It derives stable
+  point-add shot values (`tx`, `ty`, `ox`, `oy`, `rx`, `ry`, `dx`, `c`) and evaluates a
+  line-oriented manifest. The default manifest is empty; production manifests must contain
+  only exact builder/audit obligations and must be smoke-tested against known clean nonces.
+  Use `./island.sh obligations check` between GPU search and stage2/full validation.
 
 Recommended safer search settings on the RTX 5090:
 

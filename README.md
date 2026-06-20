@@ -138,10 +138,11 @@ cd $CHALLENGE && ecdsafail submit --note-file note.md --model "..." --claimed-sc
 | 3. build kernel | `./island.sh build` | `nvcc` the kernel (local, or scp+build on your remote box) |
 | 4. dump | `./island.sh dump DIALOG_GCD_ACTIVE_ITERATIONS=258 s.bin` | encode the GCD filter+comb+prefix for that config |
 | 5. search | `./island.sh search s.bin 1 2000000` | GPU-screen 2M nonces → `CLEAN nonce=...` candidates |
-| 6. optional stage 2 | `./island.sh stage2 DIALOG_GCD_ACTIVE_ITERATIONS=258 cands.log stage2.log 8` | exact validator-backed prefilter on GPU-emitted candidates |
-| 7. validate | `./island.sh validate DIALOG_GCD_ACTIVE_ITERATIONS=258 <n>...` | quantum-confirm 0/0/0 + print score |
-| 8. bake | `./island.sh bake DIALOG_GCD_ACTIVE_ITERATIONS 258 DIALOG_TAIL_NONCE <n>` | CRLF-safe edit + `ecdsafail run` |
-| 9. submit | `ecdsafail submit ...` | (in the challenge repo) |
+| 6. optional obligations | `./island.sh obligations check "<CFG>" obligations.txt cands.log obligation.log 8` | exact manifest-driven partial prefilter on GPU-emitted candidates |
+| 7. optional stage 2 | `./island.sh stage2 DIALOG_GCD_ACTIVE_ITERATIONS=258 cands.log stage2.log 8` | exact validator-backed prefilter on GPU-emitted candidates |
+| 8. validate | `./island.sh validate DIALOG_GCD_ACTIVE_ITERATIONS=258 <n>...` | quantum-confirm 0/0/0 + print score |
+| 9. bake | `./island.sh bake DIALOG_GCD_ACTIVE_ITERATIONS 258 DIALOG_TAIL_NONCE <n>` | CRLF-safe edit + `ecdsafail run` |
+| 10. submit | `ecdsafail submit ...` | (in the challenge repo) |
 
 `./island.sh hunt CFG START N` chains the original measure/dump/search/full-validate path.
 Use `search | tee cands.log` plus `stage2` explicitly when you want the two-stage pipeline.
@@ -190,6 +191,10 @@ GPU_GCD_MODE=trunc_first ./island.sh search s.bin 1 2000000
 | `VALIDATE_RESULTS_LOG` | path | Optional validate-only durable ledger. When set, `island.sh validate` still prints every line to stdout, and also appends successful `dirty` / `CLEAN` / `stage2-*` verdict lines to this file under `flock` when available. |
 | `VALIDATE_ERRORS_LOG` | path | Optional validate-only error ledger. `ERROR ... stage=build/eval ...` lines are routed here instead of `VALIDATE_RESULTS_LOG`; defaults to `errors.log` next to `VALIDATE_RESULTS_LOG`. Error nonces are retryable and should not be counted as validated. |
 | `VALIDATE_LOCK_FILE` | path | Optional shared lock path for `VALIDATE_RESULTS_LOG` / `VALIDATE_ERRORS_LOG` appends. Defaults to `<VALIDATE_RESULTS_LOG>.lock`. |
+| `OBLIGATION_SHOTS` | `1..9024` | Shot count for the manifest-driven obligation checker. Defaults to `9024`. A rejection is only as strong as the audited obligation and checked shot count. |
+| `OBLIGATION_BATCH` | integer | Number of nonces per `obligation_filter` process. Defaults to `64`, so each process builds the circuit context once and amortizes it over a small batch. |
+| `OBLIGATION_JOBS` | integer | Parallel worker count for `./island.sh obligations check`; otherwise the stage2/default CPU count is used. |
+| `OBLIGATION_ERRORS_LOG` | path | Retryable errors from `obligation_filter`; defaults to `obligation-errors.log` next to the obligation results log. |
 
 **Every improvement is an independent on/off knob** (all default to the conservative/exact baseline): `GPU_BATCH_INV`, `GPU_COMB_BITS`, `GPU_GCD_MODE` (`trunc_first` is the safer fast choice; `single_pass` is experimental), `GPU_WAVE`, `GPU_FAN_BITS`, `EVAL_FAST_REJECT`, `VALIDATE_REUSE_OPS`, and the optional validation ledger paths. They compose; benchmark combinations with `bench-gpu-knobs`.
 
@@ -272,6 +277,51 @@ This should be the default for large remote validation batches once the patched
 `eval_circuit` binary is installed. If the binary does not contain
 `EVAL_TAIL_NONCE` support, `island.sh` refuses `VALIDATE_REUSE_OPS=1` rather than
 silently validating every nonce against the nonce-0 input stream.
+
+### Exact obligation manifests: stable partial filtering
+
+Some false positives are not GCD failures at all: they are exact circuit obligations such
+as a dropped carry bit, a narrowed comparator window, a pseudo-Mersenne fold overflow, or a
+phase-tail control that the full evaluator discovers later. The stable way to prefilter
+those without hand-porting every new circuit is to let the circuit-builder side emit a
+small manifest of exact obligations, then run a generic checker over the Fiat-Shamir
+shot values.
+
+This branch includes that first generic layer:
+
+```bash
+# Emits an empty universal-safe manifest with the supported line formats.
+./island.sh obligations emit-default obligations.txt
+
+# Optional legacy dialog-GCD manifest; only use for circuits whose GCD schedule is
+# represented by DialogGcdFilterConfig, and always smoke-test known clean nonces.
+./island.sh obligations emit-dialog-gcd dialog-gcd-obligations.txt
+
+# Run exact manifest checks on candidate logs; pass/reject lines are durable and resumable.
+OBLIGATION_SHOTS=9024 OBLIGATION_BATCH=64 \
+  ./island.sh obligations check "<CFG>" obligations.txt cands.log obligation.log 8
+```
+
+Manifest lines are intentionally simple and fail closed if unknown:
+
+```text
+gcd_factor_fits <name> <tx|ty|ox|oy|rx|ry|dx|c>
+high_zero <name> <value> <keep_bits>
+low_eq <name> <left> <right> <bits>
+compare_window_agrees <name> <left> <right> <lo> <width>
+add_no_carry <name> <left> <right> <bits>
+sub_no_borrow <name> <left> <right> <bits>
+nonzero <name> <value>
+```
+
+No-false-negative rule: add a line only when it is an exact obligation of the submitted
+circuit, not a statistical shortcut. For example, if the builder drops a carry beyond bit
+`k`, it can emit an `add_no_carry` obligation for the exact low-limb expression that must
+not carry. If a comparator is narrowed to a top window, it can emit
+`compare_window_agrees` for that exact window. The checker is route-stable because it only
+knows generic point-add shot values (`tx`, `ty`, `ox`, `oy`, `rx`, `ry`, `dx`, `c`) and
+generic predicates; circuit-specific meaning lives in the manifest. Known clean submitted
+nonces must pass a new manifest before it is trusted in production.
 
 On the 2026-06-10 1221-qubit SOTA (`155ebc5` / local commit `572bba4`), this found the baked
 clean nonce and measured about **12.3k nonce/s** on the RTX 5090 (`~1.2x` the previous-release

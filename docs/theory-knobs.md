@@ -316,6 +316,15 @@ validator can therefore build once and hash the tail as the candidate nonce duri
 candidate evals with `EVAL_TAIL_NONCE`, and immediate `stage2-pass` / `stage2-reject`
 log streaming. `STAGE2_BATCH` is no longer part of the stage-2 cost model.
 
+When a circuit optimization has an exact classical side condition that is not part of the
+GCD schedule, prefer an obligation manifest over a new hand-coded CUDA filter. Examples:
+a discarded carry must be zero, a narrowed comparator window must agree with the full
+comparison, or a low-limb subtract must not borrow. `obligation_filter` implements those
+generic predicates over stable point-add shot values and can be run with
+`./island.sh obligations check` before full stage2 validation. The no-false-negative rule is
+unchanged: only emit obligations that the clean circuit is mathematically required to
+satisfy, and smoke-test known clean nonces before using a manifest on a production hunt.
+
 ## `dx`-First Quick Filter
 
 Point addition needs the slope
