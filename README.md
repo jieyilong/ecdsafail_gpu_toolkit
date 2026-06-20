@@ -185,6 +185,8 @@ GPU_GCD_MODE=trunc_first ./island.sh search s.bin 1 2000000
 | `GPU_FAN_BITS` | `0`..`26` | Nonce-fan: precompute the SHAKE sponge for the low `K` tail bits so each nonce only absorbs its high bits. `0` = off. Exact candidate set. Table is `2^K * 208 B` (`K=20`≈208 MiB, `K=24`≈3.5 GiB). Measured gain is small (~+1.5% on the current SOTA base — `squeeze_init` is not the bottleneck there); may help more on init-bound bases. |
 | `EVAL_FAST_REJECT` | `0`/`1` | **Phase-2 (CPU validate) knob, not a scan knob** — no-op on a `search` line. `1` defers the per-shot EC-muls into the batch loop and stops at the **first failing shot**. Speedup is candidate-dependent: early-failing dirty candidates ~1.9s, but GCD-clean-but-eval-dirty ones (what the GPU hunt feeds the validator) fail later → ~6s; vs ~17s stock (~2.6–8.5×). Exact — clean islands still read `0/0/0` and take the full ~17s; with the var unset the eval is byte-identical, so `ecdsafail run` scoring is unaffected (default `0`). `island.sh validate` sets it to `1`. **Setup:** apply `patches/eval_stage2_prefilter.diff` + `cargo build --release --bin eval_circuit` (reset by `ecdsafail sync`; `eval_circuit.rs` is a local tool, not submitted). Per-candidate context: `build_circuit` is only ~1.2s, so the whole per-candidate cost is this eval. |
 | `EVAL_SHOT_LIMIT` / `EVAL_STAGE2_SHOTS` | `1..9024` | **Stage-2 prefilter knob.** Limits trusted eval to a shot prefix and disables `score.json` / `results.tsv` writes for partial runs. A failure on any checked shot is an exact rejection; a pass is only `stage2-pass`, not a clean-island proof. Default stage-2 prefix is `512` shots. |
+| `VALIDATE_REUSE_OPS` | `0`/`1` | **Build-cache validation knob.** `1` builds one nonce-0 `ops.bin` per validator process and evaluates every requested nonce by overriding only the Fiat-Shamir identity-tail hash with `EVAL_TAIL_NONCE`. This avoids the expensive `build_circuit` call for every candidate. Exact because the tail is 48 `X;X` identity pairs; only the serialized tail targets reseed SHAKE. Requires `patches/eval_stage2_prefilter.diff`. `stage2` enables this automatically. |
+| `STAGE2_BATCH` | positive integer | Nonces per stage-2 worker invocation. Default `32`; each worker pays one cached build for up to this many candidates, then runs exact prefix evals. |
 
 **Every improvement is an independent on/off knob** (all default to the conservative/exact baseline): `GPU_BATCH_INV`, `GPU_COMB_BITS`, `GPU_GCD_MODE` (`trunc_first` is the safer fast choice; `single_pass` is experimental), `GPU_WAVE`, `GPU_FAN_BITS`, and `EVAL_FAST_REJECT`. They compose; benchmark combinations with `bench-gpu-knobs`.
 
@@ -224,7 +226,8 @@ candidates:
 GPU_FILTER=ludicrous ./island.sh search s.bin <START> <N> <CHUNK> | tee cands.log
 
 # Exact stage-2 rejection on candidates only. The default checks 512 trusted
-# Fiat-Shamir shots with EVAL_FAST_REJECT=1 and writes a durable results log.
+# Fiat-Shamir shots, uses EVAL_FAST_REJECT=1, reuses one nonce-0 build per
+# worker batch, and writes a durable results log.
 EVAL_STAGE2_SHOTS=512 ./island.sh stage2 "<CFG>" cands.log stage2.log 8
 
 # Full validation is still required for survivors.
@@ -237,6 +240,17 @@ trusted evaluator observes a real circuit violation on a checked shot. It never
 uses random heuristics or a tightened CUDA GCD condition. A `stage2-pass` means
 "not rejected by this exact prefix"; only a full 9024-shot `CLEAN` is submit-safe.
 Known clean nonces must pass stage 2 before trusting a new patched validator.
+
+For full validation batches, the same build cache can be used directly:
+
+```bash
+VALIDATE_REUSE_OPS=1 ./island.sh validate "<CFG>" <nonce1> <nonce2> ...
+```
+
+This should be the default for large remote validation batches once the patched
+`eval_circuit` binary is installed. If the binary does not contain
+`EVAL_TAIL_NONCE` support, `island.sh` refuses `VALIDATE_REUSE_OPS=1` rather than
+silently validating every nonce against the nonce-0 input stream.
 
 On the 2026-06-10 1221-qubit SOTA (`155ebc5` / local commit `572bba4`), this found the baked
 clean nonce and measured about **12.3k nonce/s** on the RTX 5090 (`~1.2x` the previous-release

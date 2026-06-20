@@ -95,6 +95,11 @@ the previous-release binary and this branch with the scan baseline both measured
   stage2.log <jobs>`. This invokes the trusted evaluator on a shot prefix and rejects only
   when a checked shot has a real circuit violation. A `stage2-pass` is only a survivor for
   later full 9024-shot validation, never a submit-safe clean proof.
+- `VALIDATE_REUSE_OPS=1` — **validation build cache**: build one nonce-0 `ops.bin`, then
+  evaluate many candidate nonces by setting `EVAL_TAIL_NONCE` in the patched evaluator. This
+  is exact because `DIALOG_TAIL_NONCE` only changes the target IDs of the final 96 `X;X`
+  identity-tail ops. Use this for large batches and remote own-host validation. `stage2`
+  enables it automatically and uses `STAGE2_BATCH=32` unless overridden.
 
 For production island searches on a large NVIDIA GPU, prefer the safer fast mode that has
 passed a known-clean nonce check on the current base. As of the RTX 5090 measurements on the

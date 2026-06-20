@@ -20,13 +20,16 @@ real circuit violation on a checked Fiat-Shamir shot prefix.
 - Added `./island.sh stage2 CFG CANDIDATES [RESULTS] [JOBS]`.
   - accepts raw `CLEAN nonce=...` logs or bare nonce lists;
   - de-duplicates candidates and skips nonces already present in the results log;
-  - validates in parallel with `EVAL_FAST_REJECT=1` and `EVAL_SHOT_LIMIT`;
+  - validates in parallel with `EVAL_FAST_REJECT=1`, `EVAL_SHOT_LIMIT`, and cached nonce-0 builds;
   - writes durable one-line `stage2-pass`, `stage2-reject`, or `ERROR` results.
 - Made `./island.sh validate` prefix-aware so explicit stage-2 runs cannot print submit-safe
   `CLEAN` for a partial shot prefix.
 - Added `patches/eval_stage2_prefilter.diff`, a superset of the fast-reject helper that also
-  supports `EVAL_SHOT_LIMIT` / `EVAL_STAGE2_SHOTS` and disables `score.json` / `results.tsv`
-  writes for partial evaluations.
+  supports `EVAL_SHOT_LIMIT` / `EVAL_STAGE2_SHOTS`, `EVAL_TAIL_NONCE`, and disables
+  `score.json` / `results.tsv` writes for partial evaluations.
+- Added `VALIDATE_REUSE_OPS=1`: build one nonce-0 `ops.bin`, then evaluate many candidates by
+  overriding only the Fiat-Shamir hash of the final 96 identity-tail ops. This targets the
+  validation bottleneck where `build_circuit` dominated per-nonce runtime.
 - Updated README and docs to describe the no-false-negative contract: stage 2 rejects only by
   exact trusted-eval failure; all survivors still require full 9024-shot validation.
 

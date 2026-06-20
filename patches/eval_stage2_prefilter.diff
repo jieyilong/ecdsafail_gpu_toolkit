@@ -1,11 +1,11 @@
 diff --git a/src/bin/eval_circuit.rs b/src/bin/eval_circuit.rs
-index ab15ba9..0e87715 100644
+index ab15ba9..c59422c 100644
 --- a/src/bin/eval_circuit.rs
 +++ b/src/bin/eval_circuit.rs
-@@ -37,6 +37,17 @@ const OP_BYTES: usize = OP_FIELDS * FIELD_BYTES;
+@@ -37,6 +37,21 @@ const OP_BYTES: usize = OP_FIELDS * FIELD_BYTES;
  const MAX_OPS: u64 = 4_000_000_000;
  const NUM_TESTS: usize = 9024;
- 
+
 +fn env_truthy(name: &str) -> bool {
 +    matches!(
 +        std::env::var(name).ok().as_deref(),
@@ -17,10 +17,14 @@ index ab15ba9..0e87715 100644
 +    std::env::var(name).ok()?.parse().ok()
 +}
 +
++fn env_u64(name: &str) -> Option<u64> {
++    std::env::var(name).ok()?.parse().ok()
++}
++
  // ─── Bounded ops.bin loader ────────────────────────────────────────────────
  //
  // Hand-rolled fixed-width LE framing. Per-op layout:
-@@ -110,8 +121,8 @@ fn load_ops(path: &str) -> Result<Vec<Op>, String> {
+@@ -110,8 +125,8 @@ fn load_ops(path: &str) -> Result<Vec<Op>, String> {
      let mut off = MAGIC.len() + 8;
      for i in 0..n {
          let kind_raw = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
@@ -31,10 +35,82 @@ index ab15ba9..0e87715 100644
          // bytes[off+4..off+8] are reserved padding for 8-byte alignment.
          let q_control2 = QubitId(read_u64(&bytes, off + 8));
          let q_control1 = QubitId(read_u64(&bytes, off + 16));
-@@ -221,33 +232,49 @@ fn run_tests(
+@@ -180,18 +195,62 @@ fn secp256k1() -> WeierstrassEllipticCurve {
+ // SHAKE256 over the op stream. Determines test inputs, simulator RNG for
+ // R/Hmr phase randomization, etc.
+
+-fn fiat_shamir_seed(ops: &[Op]) -> sha3::Shake256Reader {
++fn feed_hash_op(hasher: &mut Shake256, op: &Op) {
++    hasher.update(&[op.kind as u8]);
++    hasher.update(&op.q_control2.0.to_le_bytes());
++    hasher.update(&op.q_control1.0.to_le_bytes());
++    hasher.update(&op.q_target.0.to_le_bytes());
++    hasher.update(&op.c_target.0.to_le_bytes());
++    hasher.update(&op.c_condition.0.to_le_bytes());
++    hasher.update(&op.r_target.0.to_le_bytes());
++}
++
++fn feed_tail_x(hasher: &mut Shake256, q_target: u64) {
++    const NO: u64 = u64::MAX;
++    hasher.update(&[OperationType::X as u8]);
++    hasher.update(&NO.to_le_bytes());
++    hasher.update(&NO.to_le_bytes());
++    hasher.update(&q_target.to_le_bytes());
++    hasher.update(&NO.to_le_bytes());
++    hasher.update(&NO.to_le_bytes());
++    hasher.update(&NO.to_le_bytes());
++}
++
++fn fiat_shamir_seed(
++    ops: &[Op],
++    tail_nonce: Option<u64>,
++    tx0: u64,
++    tx1: u64,
++) -> sha3::Shake256Reader {
+     let mut hasher = Shake256::default();
+     hasher.update(b"quantum_ecc-fiat-shamir-v2");
+     hasher.update(&(ops.len() as u64).to_le_bytes());
+-    for op in ops {
+-        hasher.update(&[op.kind as u8]);
+-        hasher.update(&op.q_control2.0.to_le_bytes());
+-        hasher.update(&op.q_control1.0.to_le_bytes());
+-        hasher.update(&op.q_target.0.to_le_bytes());
+-        hasher.update(&op.c_target.0.to_le_bytes());
+-        hasher.update(&op.c_condition.0.to_le_bytes());
+-        hasher.update(&op.r_target.0.to_le_bytes());
++    if let Some(nonce) = tail_nonce {
++        assert!(
++            ops.len() >= 96,
++            "EVAL_TAIL_NONCE requires a 96-op identity tail"
++        );
++        let split = ops.len() - 96;
++        for op in &ops[..split] {
++            feed_hash_op(&mut hasher, op);
++        }
++        for (j, op) in ops[split..].iter().enumerate() {
++            assert_eq!(op.kind as u8, OperationType::X as u8, "tail op {j} not X");
++            assert_eq!(op.q_control2.0, u64::MAX, "tail op {j} has q_control2");
++            assert_eq!(op.q_control1.0, u64::MAX, "tail op {j} has q_control1");
++            assert_eq!(op.c_target.0, u64::MAX, "tail op {j} has c_target");
++            assert_eq!(op.c_condition.0, u64::MAX, "tail op {j} has c_condition");
++            assert_eq!(op.r_target.0, u64::MAX, "tail op {j} has r_target");
++        }
++        for i in 0..48u32 {
++            let q = if (nonce >> i) & 1 == 1 { tx1 } else { tx0 };
++            feed_tail_x(&mut hasher, q);
++            feed_tail_x(&mut hasher, q);
++        }
++    } else {
++        for op in ops {
++            feed_hash_op(&mut hasher, op);
++        }
+     }
+     hasher.finalize_xof()
+ }
+@@ -221,33 +280,49 @@ fn run_tests(
  ) -> SeedReport {
      let curve = secp256k1();
- 
+
 -    let mut targets = Vec::with_capacity(target_shots);
 -    let mut offsets = Vec::with_capacity(target_shots);
 -    let mut expected = Vec::with_capacity(target_shots);
@@ -70,7 +146,7 @@ index ab15ba9..0e87715 100644
 +        ks.push((U256::from_le_bytes(rb[0]), U256::from_le_bytes(rb[1])));
      }
 -    let n = targets.len();
- 
+
 +    // Full path derives every point up front and filters degenerate inputs exactly as the
 +    // stock evaluator did. Fast path derives only the current batch, but applies the same
 +    // degenerate-input skips lazily before loading simulator lanes.
@@ -102,9 +178,9 @@ index ab15ba9..0e87715 100644
      let mut sim = Simulator::new(total_qubits as usize, num_bits as usize, &mut xof);
      let mut ok = true;
      let mut fail_reason: Option<String> = None;
-@@ -256,90 +283,140 @@ fn run_tests(
+@@ -256,90 +331,140 @@ fn run_tests(
      let mut ancilla_garbage_batches = 0usize;
- 
+
      const BATCH: usize = 64;
 -    let num_batches = (n + BATCH - 1) / BATCH;
 -    for batch in 0..num_batches {
@@ -134,7 +210,7 @@ index ab15ba9..0e87715 100644
 +                sim.set_register(&layout_regs[2], o.0, shot);
 +                sim.set_register(&layout_regs[3], o.1, shot);
 +            }
- 
+
 -        sim.apply_iter(ops.iter());
 +            sim.apply_iter(ops.iter());
 +
@@ -153,7 +229,7 @@ index ab15ba9..0e87715 100644
 +                    ok = false;
 +                }
 +            }
- 
+
 -        for shot in 0..bs {
 -            let i = batch * BATCH + shot;
 -            let gx = sim.get_register(&layout_regs[0], shot);
@@ -177,7 +253,7 @@ index ab15ba9..0e87715 100644
                  ok = false;
              }
 -        }
- 
+
 -        let phase = sim.phase & cond_mask;
 -        if phase != 0 {
 -            phase_garbage_batches += 1;
@@ -220,7 +296,7 @@ index ab15ba9..0e87715 100644
 +            checked_shots += bs;
 +        }};
 +    }
- 
+
 -        for register in layout_regs {
 -            for qb in register {
 -                if let QubitOrBit::Qubit(q) = *qb {
@@ -238,13 +314,13 @@ index ab15ba9..0e87715 100644
 +                let o = curve.mul(curve.gx, curve.gy, k2);
 +                if t.0 == o.0 {
 +                    continue;
-                 }
++                }
 +                if t.0.is_zero() && t.1.is_zero() {
 +                    continue;
 +                }
 +                if o.0.is_zero() && o.1.is_zero() {
 +                    continue;
-+                }
+                 }
 +                let e = curve.add(t.0, t.1, o.0, o.1);
 +                bin.push((i, t, o, e));
              }
@@ -287,7 +363,7 @@ index ab15ba9..0e87715 100644
 +            eval_batch!(bin);
          }
      }
- 
+
      let _ = num_bits;
 -    let denom = n.max(1) as f64;
 +    let denom = checked_shots.max(1) as f64;
@@ -302,11 +378,26 @@ index ab15ba9..0e87715 100644
          classical_failures,
          phase_garbage_batches,
          ancilla_garbage_batches,
-@@ -488,25 +565,38 @@ fn main() {
+@@ -488,25 +613,51 @@ fn main() {
      println!("  qubits      : {}", total_qubits);
      println!("  bits        : {}", num_bits);
- 
+
 -    println!("\n-- correctness tests ({} shots) --", NUM_TESTS);
+-    let xof = fiat_shamir_seed(&ops);
+-    let r = run_tests(&ops, &regs, total_qubits, num_bits, xof, NUM_TESTS);
++    let tx0 = match regs[0][0] {
++        QubitOrBit::Qubit(q) => q.0,
++        _ => unreachable!("register 0 was checked to be qubits"),
++    };
++    let tx1 = match regs[0][1] {
++        QubitOrBit::Qubit(q) => q.0,
++        _ => unreachable!("register 0 was checked to be qubits"),
++    };
++    let tail_nonce = env_u64("EVAL_TAIL_NONCE");
++    if let Some(nonce) = tail_nonce {
++        println!("  tail nonce override    : {nonce}");
++    }
++
 +    let target_shots = env_usize("EVAL_SHOT_LIMIT")
 +        .or_else(|| env_usize("EVAL_STAGE2_SHOTS"))
 +        .map(|n| n.clamp(1, NUM_TESTS))
@@ -316,8 +407,7 @@ index ab15ba9..0e87715 100644
 +    if partial_eval {
 +        println!("  partial prefilter      : true (score.json/results.tsv disabled)");
 +    }
-     let xof = fiat_shamir_seed(&ops);
--    let r = run_tests(&ops, &regs, total_qubits, num_bits, xof, NUM_TESTS);
++    let xof = fiat_shamir_seed(&ops, tail_nonce, tx0, tx1);
 +    let r = run_tests(&ops, &regs, total_qubits, num_bits, xof, target_shots);
      println!("  tested shots            : {}", r.n_shots);
      println!("  classical mismatches    : {}", r.classical_failures);
@@ -352,10 +442,10 @@ index ab15ba9..0e87715 100644
          std::process::exit(1);
      }
      println!("  all {} shots OK", r.n_shots);
-@@ -522,6 +612,11 @@ fn main() {
+@@ -522,6 +673,11 @@ fn main() {
      println!("  emitted ops           : {}", ops.len());
      println!("  qubits                : {}", total_qubits);
- 
+
 +    if partial_eval {
 +        println!("\n=== stage2 prefilter OK (partial; not a clean-island proof) ===");
 +        return;
@@ -363,4 +453,4 @@ index ab15ba9..0e87715 100644
 +
      append_results_row("OK", r.avg_tof, r.avg_cliff, total_qubits, ops.len(), &note);
      write_score(r.avg_tof, total_qubits);
- 
+

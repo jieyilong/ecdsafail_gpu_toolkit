@@ -84,6 +84,11 @@ nonce.
 - `EVAL_SHOT_LIMIT=N` / `EVAL_STAGE2_SHOTS=N` limits trusted eval to a prefix for the
   `./island.sh stage2` candidate prefilter. Partial runs do not write `score.json` or
   `results.tsv`; a prefix pass is only a survivor, not a clean-island proof.
+- `VALIDATE_REUSE_OPS=1` makes validation build one nonce-0 `ops.bin` and reuse it for
+  a batch of nonces. The patched evaluator's `EVAL_TAIL_NONCE` rewrites only the
+  Fiat-Shamir hash of the 96-op identity tail, so this removes repeated `build_circuit`
+  cost while preserving exact candidate inputs. `stage2` enables this automatically and
+  batches candidates with `STAGE2_BATCH` (default `32`).
 
 Recommended safer search settings on the RTX 5090:
 

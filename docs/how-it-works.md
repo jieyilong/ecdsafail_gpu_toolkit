@@ -83,6 +83,13 @@ it invokes the trusted evaluator on a configurable Fiat-Shamir shot prefix with
 9024-shot nonce cannot be lost. A pass is only a `stage2-pass`; it must still be fully
 validated before baking or submitting.
 
+Validation can also skip nearly all per-candidate circuit-building cost. The point-add circuit
+body is independent of `DIALOG_TAIL_NONCE`; only the final 96 identity-tail ops change their
+target qubit IDs to reseed SHAKE256. With the stage-2 evaluator patch, `VALIDATE_REUSE_OPS=1`
+builds nonce 0 once, keeps that `ops.bin`, and asks `eval_circuit` to hash the tail as
+`EVAL_TAIL_NONCE=<candidate>` for each candidate. The simulator still runs the nonce-0 tail,
+which is equivalent because each tail bit is an `X;X` identity pair.
+
 ## Pipeline summary
 ```
 config (lever)  --dump_gpu_state-->  gpu_state.bin  --gpu_island2-->  CLEAN candidates

@@ -307,6 +307,11 @@ For high-density TrailMix-ludicrous scans, the same patch also supports
 candidate prefilter: a checked-shot failure rejects the nonce, while a prefix pass is only
 a survivor for later full validation.
 
+The patch also supports `EVAL_TAIL_NONCE`, which removes repeated circuit-build cost. Since
+the nonce tail is fixed-length `X;X` identities, a nonce-0 `ops.bin` has the same unitary as
+any nonce's `ops.bin`; only the serialized tail target IDs change the Fiat-Shamir hash. The
+validator can therefore build once and hash the tail as the candidate nonce during eval.
+
 ## `dx`-First Quick Filter
 
 Point addition needs the slope

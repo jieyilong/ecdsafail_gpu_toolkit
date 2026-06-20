@@ -143,6 +143,39 @@ line_score_suffix(){ # tof qubits
   score=$(awk -v t="$tof" -v q="$q" 'BEGIN{printf "%d", int(t + 0.5) * q}')
   printf ' score=%s' "$score"
 }
+eval_supports_tail_nonce(){
+  strings "$BIN/eval_circuit" 2>/dev/null | grep -q "EVAL_TAIL_NONCE"
+}
+emit_validation_line(){ # nonce out eval_rc
+  local nonce="$1" out="$2" eval_rc="$3" cls pha anc tof q shots detail prefix
+  cls=$(echo "$out"|grep "classical mismatches"|grep -oE '[0-9]+$')
+  pha=$(echo "$out"|grep "phase-garbage"|grep -oE '[0-9]+$')
+  anc=$(echo "$out"|grep "ancilla-garbage"|grep -oE '[0-9]+$')
+  tof=$(echo "$out"|grep "avg executed Toffoli"|grep -oE '[0-9.]+'|head -1)
+  q=$(echo "$out"|grep -E '^  qubits '|grep -oE '[0-9]+$'|head -1)
+  shots=$(echo "$out"|grep "tested shots"|grep -oE '[0-9]+$'|head -1)
+  if [ -z "${cls:-}" ] || [ -z "${pha:-}" ] || [ -z "${anc:-}" ]; then
+    detail=$(echo "$out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')
+    echo "ERROR nonce=$nonce stage=eval rc=$eval_rc detail=${detail:-eval_circuit failed}"
+    return
+  fi
+  prefix=0
+  truthy "${EVAL_STAGE2_MODE:-0}" && prefix=1
+  [ -n "${EVAL_SHOT_LIMIT:-}" ] && prefix=1
+  if [ "${cls:-x}" = 0 ] && [ "${pha:-x}" = 0 ] && [ "${anc:-x}" = 0 ]; then
+    if [ "$prefix" = 1 ]; then
+      echo "stage2-pass nonce=$nonce shots=${shots:-?} cls=0 pha=0 anc=0 tof=${tof:-?} qubits=${q:-?}"
+    else
+      echo "CLEAN nonce=$nonce cls=0 pha=0 anc=0 tof=$tof qubits=$q$(line_score_suffix "$tof" "$q")"
+    fi
+  else
+    if [ "$prefix" = 1 ]; then
+      echo "stage2-reject nonce=$nonce shots=${shots:-?} cls=${cls:-?} pha=${pha:-?} anc=${anc:-?} tof=${tof:-?} qubits=${q:-?}"
+    else
+      echo "dirty nonce=$nonce cls=${cls:-?} pha=${pha:-?} anc=${anc:-?} tof=${tof:-?} qubits=${q:-?}"
+    fi
+  fi
+}
 bench_variant(){ # name envs state start n summary_file
   local name="$1" envs="$2" state="$3" start="$4" n="$5" summary="$6"
   local warmups="${GPU_BENCH_WARMUPS:-1}" runs="${GPU_BENCH_RUNS:-3}"
@@ -365,44 +398,40 @@ bench-gpu-knobs)
 
 validate)
   CFG="${1:-}"; shift || true; [ $# -gt 0 ] || die "usage: validate CFG NONCE..."
-  for nonce in "$@"; do
+  if truthy "${VALIDATE_REUSE_OPS:-0}"; then
+    eval_supports_tail_nonce || die "VALIDATE_REUSE_OPS=1 needs patches/eval_stage2_prefilter.diff applied and eval_circuit rebuilt"
     d="$(mktemp -d)"
-    build_out=$( cd "$d" && env ${CFG:+$CFG} DIALOG_TAIL_NONCE="$nonce" "$BIN/build_circuit" 2>&1 )
+    build_out=$( cd "$d" && env ${CFG:+$CFG} DIALOG_TAIL_NONCE=0 "$BIN/build_circuit" 2>&1 )
     build_rc=$?
     if [ "$build_rc" -ne 0 ]; then
       detail=$(echo "$build_out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')
       rm -rf "$d"
-      echo "ERROR nonce=$nonce stage=build rc=$build_rc detail=${detail:-build_circuit failed}"
-      continue
+      for nonce in "$@"; do echo "ERROR nonce=$nonce stage=build rc=$build_rc detail=${detail:-build_circuit failed}"; done
+      exit 0
     fi
-    out=$( cd "$d" && env ${CFG:+$CFG} EVAL_FAST_REJECT="${EVAL_FAST_REJECT:-1}" DIALOG_TAIL_NONCE="$nonce" "$BIN/eval_circuit" --note "isl-$nonce" 2>&1 )
-    eval_rc=$?
+    for nonce in "$@"; do
+      out=$( cd "$d" && env ${CFG:+$CFG} EVAL_FAST_REJECT="${EVAL_FAST_REJECT:-1}" EVAL_TAIL_NONCE="$nonce" "$BIN/eval_circuit" --note "isl-$nonce" 2>&1 )
+      eval_rc=$?
+      emit_validation_line "$nonce" "$out" "$eval_rc"
+    done
     rm -rf "$d"
-    cls=$(echo "$out"|grep "classical mismatches"|grep -oE '[0-9]+$'); pha=$(echo "$out"|grep "phase-garbage"|grep -oE '[0-9]+$')
-    anc=$(echo "$out"|grep "ancilla-garbage"|grep -oE '[0-9]+$'); tof=$(echo "$out"|grep "avg executed Toffoli"|grep -oE '[0-9.]+'|head -1)
-    q=$(echo "$out"|grep -E '^  qubits '|grep -oE '[0-9]+$'|head -1); shots=$(echo "$out"|grep "tested shots"|grep -oE '[0-9]+$'|head -1)
-    if [ -z "${cls:-}" ] || [ -z "${pha:-}" ] || [ -z "${anc:-}" ]; then
-      detail=$(echo "$out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')
-      echo "ERROR nonce=$nonce stage=eval rc=$eval_rc detail=${detail:-eval_circuit failed}"
-      continue
-    fi
-    prefix=0
-    truthy "${EVAL_STAGE2_MODE:-0}" && prefix=1
-    [ -n "${EVAL_SHOT_LIMIT:-}" ] && prefix=1
-    if [ "${cls:-x}" = 0 ] && [ "${pha:-x}" = 0 ] && [ "${anc:-x}" = 0 ]; then
-      if [ "$prefix" = 1 ]; then
-        echo "stage2-pass nonce=$nonce shots=${shots:-?} cls=0 pha=0 anc=0 tof=${tof:-?} qubits=${q:-?}"
-      else
-        echo "CLEAN nonce=$nonce cls=0 pha=0 anc=0 tof=$tof qubits=$q$(line_score_suffix "$tof" "$q")"
+  else
+    for nonce in "$@"; do
+      d="$(mktemp -d)"
+      build_out=$( cd "$d" && env ${CFG:+$CFG} DIALOG_TAIL_NONCE="$nonce" "$BIN/build_circuit" 2>&1 )
+      build_rc=$?
+      if [ "$build_rc" -ne 0 ]; then
+        detail=$(echo "$build_out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')
+        rm -rf "$d"
+        echo "ERROR nonce=$nonce stage=build rc=$build_rc detail=${detail:-build_circuit failed}"
+        continue
       fi
-    else
-      if [ "$prefix" = 1 ]; then
-        echo "stage2-reject nonce=$nonce shots=${shots:-?} cls=${cls:-?} pha=${pha:-?} anc=${anc:-?} tof=${tof:-?} qubits=${q:-?}"
-      else
-        echo "dirty nonce=$nonce cls=${cls:-?} pha=${pha:-?} anc=${anc:-?} tof=${tof:-?} qubits=${q:-?}"
-      fi
-    fi
-  done
+      out=$( cd "$d" && env ${CFG:+$CFG} EVAL_FAST_REJECT="${EVAL_FAST_REJECT:-1}" DIALOG_TAIL_NONCE="$nonce" "$BIN/eval_circuit" --note "isl-$nonce" 2>&1 )
+      eval_rc=$?
+      rm -rf "$d"
+      emit_validation_line "$nonce" "$out" "$eval_rc"
+    done
+  fi
   ;;
 
 stage2)
@@ -430,13 +459,15 @@ stage2)
   mkdir -p "$(dirname "$OUT")"
   export EVAL_STAGE2_PREFIX="${EVAL_SHOT_LIMIT:-$EVAL_STAGE2_SHOTS}"
   export EVAL_FAST_REJECT="${EVAL_FAST_REJECT:-1}"
-  xargs -n1 -P "$JOBS" bash -c '
-    self="$1"; cfg="$2"; out_file="$3"; nonce="$4"
-    line=$(EVAL_STAGE2_MODE=1 EVAL_SHOT_LIMIT="$EVAL_STAGE2_PREFIX" "$self" validate "$cfg" "$nonce" 2>&1)
+  export STAGE2_BATCH="${STAGE2_BATCH:-32}"
+  xargs -n "$STAGE2_BATCH" -P "$JOBS" bash -c '
+    self="$1"; cfg="$2"; out_file="$3"; shift 3
+    line=$(VALIDATE_REUSE_OPS=1 EVAL_STAGE2_MODE=1 EVAL_SHOT_LIMIT="$EVAL_STAGE2_PREFIX" "$self" validate "$cfg" "$@" 2>&1)
     rc=$?
     if [ "$rc" -ne 0 ] && ! echo "$line" | grep -Eq "^(stage2-pass|stage2-reject|dirty|CLEAN|ERROR) nonce="; then
       detail=$(echo "$line" | tr "\n" " " | sed -E "s/[[:space:]]+/ /g")
-      line="ERROR nonce=$nonce stage=stage2 rc=$rc detail=${detail:-stage2 failed}"
+      first="${1:-unknown}"
+      line="ERROR nonce=$first stage=stage2 rc=$rc detail=${detail:-stage2 failed}"
     fi
     printf "%s\n" "$line" >> "$out_file"
     printf "%s\n" "$line"
