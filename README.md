@@ -138,11 +138,15 @@ cd $CHALLENGE && ecdsafail submit --note-file note.md --model "..." --claimed-sc
 | 3. build kernel | `./island.sh build` | `nvcc` the kernel (local, or scp+build on your remote box) |
 | 4. dump | `./island.sh dump DIALOG_GCD_ACTIVE_ITERATIONS=258 s.bin` | encode the GCD filter+comb+prefix for that config |
 | 5. search | `./island.sh search s.bin 1 2000000` | GPU-screen 2M nonces → `CLEAN nonce=...` candidates |
-| 6. validate | `./island.sh validate DIALOG_GCD_ACTIVE_ITERATIONS=258 <n>...` | quantum-confirm 0/0/0 + print score |
-| 7. bake | `./island.sh bake DIALOG_GCD_ACTIVE_ITERATIONS 258 DIALOG_TAIL_NONCE <n>` | CRLF-safe edit + `ecdsafail run` |
-| 8. submit | `ecdsafail submit ...` | (in the challenge repo) |
+| 6. optional obligations | `./island.sh obligations check "<CFG>" obligations.txt cands.log obligation.log 8` | exact manifest-driven partial prefilter on GPU-emitted candidates |
+| 7. optional stage 2 | `./island.sh stage2 DIALOG_GCD_ACTIVE_ITERATIONS=258 cands.log stage2.log 8` | exact validator-backed prefilter on GPU-emitted candidates |
+| 8. validate | `./island.sh validate DIALOG_GCD_ACTIVE_ITERATIONS=258 <n>...` | quantum-confirm 0/0/0 + print score |
+| 9. bake | `./island.sh bake DIALOG_GCD_ACTIVE_ITERATIONS 258 DIALOG_TAIL_NONCE <n>` | CRLF-safe edit + `ecdsafail run` |
+| 10. submit | `ecdsafail submit ...` | (in the challenge repo) |
 
-`./island.sh hunt CFG START N` chains steps 2/4/5/6. See `examples/walkthrough.md`.
+`./island.sh hunt CFG START N` chains the original measure/dump/search/full-validate path.
+Use `search | tee cands.log` plus `stage2` explicitly when you want the two-stage pipeline.
+See `examples/walkthrough.md`.
 
 ### Experimental search-kernel knobs
 The default search path preserves the previous release's `gpu_island2` behavior:
@@ -180,11 +184,17 @@ GPU_GCD_MODE=trunc_first ./island.sh search s.bin 1 2000000
 | `GPU_GCD_MODE` | `full_first`, `trunc_first`, `single_pass`, `trunc_only` | `full_first` is the default. `trunc_first` is the safer fast mode: it runs the truncated width-envelope check first, then still runs the full untruncated convergence check, so it preserves the baseline GCD filter while sometimes rejecting hard factors earlier. `single_pass` folds those checks into one truncated walk; after the 1221-qubit SOTA update it is **experimental only** because it missed the baked clean nonce `165002130437`. `trunc_only` is a noisy prefilter that can emit extra false positives, so always validate. |
 | `GPU_WAVE` | `32`..`256` | CUDA block threads per nonce wave. Default `128`; values are rounded up to a warp multiple and capped at `256`. |
 | `GPU_FAN_BITS` | `0`..`26` | Nonce-fan: precompute the SHAKE sponge for the low `K` tail bits so each nonce only absorbs its high bits. `0` = off. Exact candidate set. Table is `2^K * 208 B` (`K=20`≈208 MiB, `K=24`≈3.5 GiB). Measured gain is small (~+1.5% on the current SOTA base — `squeeze_init` is not the bottleneck there); may help more on init-bound bases. |
-| `EVAL_FAST_REJECT` | `0`/`1` | **Phase-2 (CPU validate) knob, not a scan knob** — no-op on a `search` line. `1` defers the per-shot EC-muls into the batch loop and stops at the **first failing shot**. Speedup is candidate-dependent: early-failing dirty candidates ~1.9s, but GCD-clean-but-eval-dirty ones (what the GPU hunt feeds the validator) fail later → ~6s; vs ~17s stock (~2.6–8.5×). Exact — clean islands still read `0/0/0` and take the full ~17s; with the var unset the eval is byte-identical, so `ecdsafail run` scoring is unaffected (default `0`). `island.sh validate` sets it to `1`. **Setup:** apply `patches/eval_fast_reject.diff` + `cargo build --release --bin eval_circuit` (reset by `ecdsafail sync`; `eval_circuit.rs` is a local tool, not submitted). Per-candidate context: `build_circuit` is only ~1.2s, so the whole per-candidate cost is this eval. |
-| `VALIDATE_REUSE_OPS` | `0`/`1` | **Phase-2 batch validation knob.** `1` builds one nonce-0 `ops.bin` per `validate` invocation, then evaluates each requested nonce with `EVAL_TAIL_NONCE=<nonce>` so the trusted Fiat-Shamir hash sees the exact 96-op identity tail for that nonce. This avoids rebuilding the same circuit body for every candidate. Exact for circuits with the standard fixed 48-pair `DIALOG_TAIL_NONCE` `X;X` tail; the evaluator refuses the override if the tail shape is not present. Requires the updated `patches/eval_fast_reject.diff` and rebuilt `eval_circuit`. |
-| `VALIDATE_RESULTS_LOG` | path | Optional validate-only durable ledger. When set, `island.sh validate` still prints every line to stdout, and also appends successful `dirty` / `CLEAN` verdict lines to this file under `flock` when available. |
+| `EVAL_FAST_REJECT` | `0`/`1` | **Phase-2 (CPU validate) knob, not a scan knob** — no-op on a `search` line. `1` defers the per-shot EC-muls into the batch loop and stops at the **first failing shot**. Speedup is candidate-dependent: early-failing dirty candidates ~1.9s, but GCD-clean-but-eval-dirty ones (what the GPU hunt feeds the validator) fail later → ~6s; vs ~17s stock (~2.6–8.5×). Exact — clean islands still read `0/0/0` and take the full ~17s; with the var unset the eval is byte-identical, so `ecdsafail run` scoring is unaffected (default `0`). `island.sh validate` sets it to `1`. **Setup:** apply `patches/eval_stage2_prefilter.diff` + `cargo build --release --bin eval_circuit` (reset by `ecdsafail sync`; `eval_circuit.rs` is a local tool, not submitted). Per-candidate context: `build_circuit` is only ~1.2s, so the whole per-candidate cost is this eval. |
+| `EVAL_SHOT_LIMIT` / `EVAL_STAGE2_SHOTS` | `1..9024` | **Stage-2 shot-count knob.** Stage 2 defaults to full 9024-shot eval with early reject. Lower values, such as `512`, turn it into a trusted prefix prefilter; partial runs do not write `score.json` / `results.tsv`. A failure on any checked shot is an exact rejection. A `stage2-pass` at `shots=9024` has passed the full eval shot set; a pass at a lower shot count is only a survivor for later full validation. |
+| `VALIDATE_REUSE_OPS` | `0`/`1` | **Build-cache validation knob.** `1` builds one nonce-0 `ops.bin` per validator process and evaluates every requested nonce by overriding only the Fiat-Shamir identity-tail hash with `EVAL_TAIL_NONCE`. This avoids the expensive `build_circuit` call for every candidate. Exact because the tail is 48 `X;X` identity pairs; only the serialized tail targets reseed SHAKE. Requires `patches/eval_stage2_prefilter.diff`. |
+| `STAGE2_BATCH` | deprecated | Ignored by `stage2`. Stage 2 now builds one nonce-0 `ops.bin` for the whole invocation, then evaluates one candidate nonce per worker using `EVAL_TAIL_NONCE`. Use the `JOBS` argument or `STAGE2_JOBS` to control parallelism. |
+| `VALIDATE_RESULTS_LOG` | path | Optional validate-only durable ledger. When set, `island.sh validate` still prints every line to stdout, and also appends successful `dirty` / `CLEAN` / `stage2-*` verdict lines to this file under `flock` when available. |
 | `VALIDATE_ERRORS_LOG` | path | Optional validate-only error ledger. `ERROR ... stage=build/eval ...` lines are routed here instead of `VALIDATE_RESULTS_LOG`; defaults to `errors.log` next to `VALIDATE_RESULTS_LOG`. Error nonces are retryable and should not be counted as validated. |
 | `VALIDATE_LOCK_FILE` | path | Optional shared lock path for `VALIDATE_RESULTS_LOG` / `VALIDATE_ERRORS_LOG` appends. Defaults to `<VALIDATE_RESULTS_LOG>.lock`. |
+| `OBLIGATION_SHOTS` | `1..9024` | Shot count for the manifest-driven obligation checker. Defaults to `9024`. A rejection is only as strong as the audited obligation and checked shot count. |
+| `OBLIGATION_BATCH` | integer | Number of nonces per `obligation_filter` process. Defaults to `64`, so each process builds the circuit context once and amortizes it over a small batch. |
+| `OBLIGATION_JOBS` | integer | Parallel worker count for `./island.sh obligations check`; otherwise the stage2/default CPU count is used. |
+| `OBLIGATION_ERRORS_LOG` | path | Retryable errors from `obligation_filter`; defaults to `obligation-errors.log` next to the obligation results log. |
 
 **Every improvement is an independent on/off knob** (all default to the conservative/exact baseline): `GPU_BATCH_INV`, `GPU_COMB_BITS`, `GPU_GCD_MODE` (`trunc_first` is the safer fast choice; `single_pass` is experimental), `GPU_WAVE`, `GPU_FAN_BITS`, `EVAL_FAST_REJECT`, `VALIDATE_REUSE_OPS`, and the optional validation ledger paths. They compose; benchmark combinations with `bench-gpu-knobs`.
 
@@ -224,6 +234,110 @@ GPU_FILTER=ludicrous ./island.sh search s.bin 28565 1
 ```
 
 It must print `CLEAN nonce=28565` before larger scans are trusted.
+
+`GPU_FILTER=ludicrous` is intentionally only a GCD prefilter. For high-density
+TrailMix-ludicrous hunts, add a second exact prevalidation stage on the emitted
+candidates:
+
+```bash
+# Save the raw scan stream.
+GPU_FILTER=ludicrous ./island.sh search s.bin <START> <N> <CHUNK> | tee cands.log
+
+# Exact stage-2 rejection on candidates only. The default checks all 9024
+# Fiat-Shamir shots, uses EVAL_FAST_REJECT=1, builds one nonce-0 ops.bin for
+# the whole invocation, and streams a durable results log.
+./island.sh stage2 "<CFG>" cands.log stage2.log 8
+
+# Optional faster triage mode: check only a trusted prefix before full validation.
+EVAL_STAGE2_SHOTS=512 ./island.sh stage2 "<CFG>" cands.log stage2-prefix.log 8
+
+# Full validation is still required for survivors.
+grep '^stage2-pass nonce=' stage2.log | sed -E 's/.*nonce=([0-9]+).*/\1/' \
+  | xargs ./island.sh validate "<CFG>"
+```
+
+This is no-false-negative in the useful sense: stage 2 rejects only after the
+trusted evaluator observes a real circuit violation on a checked shot. It never
+uses random heuristics or a tightened CUDA GCD condition. With the default
+`EVAL_STAGE2_SHOTS=9024`, a `stage2-pass` means the nonce passed the full eval shot set.
+With a smaller `EVAL_STAGE2_SHOTS`, a `stage2-pass` only means "not rejected by this exact
+prefix"; only a full 9024-shot result is submit-safe.
+Known clean nonces must pass stage 2 before trusting a new patched validator.
+Rejected lines may show `shots<9024` because `EVAL_FAST_REJECT=1` stops at the first
+failing 64-shot batch; `stage2-pass` lines have checked the requested shot count. Re-running
+`stage2` against the same results log is resumable: already logged nonces are skipped.
+
+For full validation batches, the same build cache can be used directly:
+
+```bash
+VALIDATE_REUSE_OPS=1 ./island.sh validate "<CFG>" <nonce1> <nonce2> ...
+```
+
+This should be the default for large remote validation batches once the patched
+`eval_circuit` binary is installed. If the binary does not contain
+`EVAL_TAIL_NONCE` support, `island.sh` refuses `VALIDATE_REUSE_OPS=1` rather than
+silently validating every nonce against the nonce-0 input stream.
+
+### Exact obligation manifests: stable partial filtering
+
+Some false positives are not GCD failures at all: they are exact circuit obligations such
+as a dropped carry bit, a narrowed comparator window, a pseudo-Mersenne fold overflow, or a
+phase-tail control that the full evaluator discovers later. The stable way to prefilter
+those without hand-porting every new circuit is to let the circuit-builder side emit a
+small manifest of exact obligations, then run a generic checker over the Fiat-Shamir
+shot values.
+
+This branch includes that first generic layer:
+
+```bash
+# Emits an empty universal-safe manifest with the supported line formats.
+./island.sh obligations emit-default obligations.txt
+
+# Optional legacy dialog-GCD manifest; only use for circuits whose GCD schedule is
+# represented by DialogGcdFilterConfig, and always smoke-test known clean nonces.
+./island.sh obligations emit-dialog-gcd dialog-gcd-obligations.txt
+
+# TrailMix-ludicrous/product-min safe manifest. This checks exact top-level
+# ec_add pseudo-Mersenne +f/-f fold no-escape obligations only.
+./island.sh obligations emit-trailmix-ludicrous trailmix-ludicrous-obligations.txt
+
+# Run exact manifest checks on candidate logs; pass/reject lines are durable and resumable.
+OBLIGATION_SHOTS=9024 OBLIGATION_BATCH=64 \
+  ./island.sh obligations check "<CFG>" obligations.txt cands.log obligation.log 8
+```
+
+Manifest lines are intentionally simple and fail closed if unknown:
+
+```text
+gcd_factor_fits <name> <tx|ty|ox|oy|rx|ry|dx|dy|c>
+high_zero <name> <value> <keep_bits>
+low_eq <name> <left> <right> <bits>
+compare_window_agrees <name> <left> <right> <lo> <width>
+add_no_carry <name> <left> <right> <bits>
+sub_no_borrow <name> <left> <right> <bits>
+nonzero <name> <value>
+trailmix_top_level_fold_exact <name>
+```
+
+No-false-negative rule: add a line only when it is an exact obligation of the submitted
+circuit, not a statistical shortcut. For example, if the builder drops a carry beyond bit
+`k`, it can emit an `add_no_carry` obligation for the exact low-limb expression that must
+not carry. If a comparator is narrowed to a top window, it can emit
+`compare_window_agrees` for that exact window. The checker is route-stable because it only
+knows generic point-add shot values (`tx`, `ty`, `ox`, `oy`, `rx`, `ry`, `dx`, `dy`, `c`)
+and generic predicates; circuit-specific meaning lives in the manifest. Known clean
+submitted nonces must pass a new manifest before it is trusted in production.
+
+For the f5c7775 q1162 TrailMix-ludicrous circuit, `emit-trailmix-ludicrous` emits one
+active manifest line: `trailmix_top_level_fold_exact`. It checks only the top-level
+`ec_add` coordinate primitive fold obligations from the submitted product-min builder:
+`x2 -= ox`, `y2 -= oy`, the `x2 += ox; temp = 2*ox; x2 += 2*ox` chain, `y2 -= oy`, and
+`x2 -= ox` before the final negate. A nonce is rejected only when the required +f/-f
+pseudo-Mersenne correction would carry or borrow out of the low `PAD + F_BITLEN` limb, which
+is a hard dropped-bit violation. The known-clean f5c7775 nonce `168011267` passes this
+manifest over all 9024 shots. Internal jump-GCD apply/phase effects are intentionally not
+replayed by this manifest; use `./island.sh stage2` with `EVAL_STAGE2_SHOTS=9024` for the
+full exact evaluator path on that family.
 
 On the 2026-06-10 1221-qubit SOTA (`155ebc5` / local commit `572bba4`), this found the baked
 clean nonce and measured about **12.3k nonce/s** on the RTX 5090 (`~1.2x` the previous-release

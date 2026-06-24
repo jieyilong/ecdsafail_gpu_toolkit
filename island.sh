@@ -11,6 +11,9 @@
 #   ./island.sh dump   CFG OUT.bin                      # gpu_state dump for a config
 #   ./island.sh probe  STATE                            # GPU Keccak probe cross-check
 #   ./island.sh search STATE START N [CHUNK]            # multi-GPU search -> CLEAN nonce=...
+#   ./island.sh stage2 CFG CANDIDATES [RESULTS] [JOBS]  # exact validator-backed prefilter
+#   ./island.sh obligations emit-default|emit-dialog-gcd [OUT]
+#   ./island.sh obligations check CFG MANIFEST CANDIDATES [RESULTS] [JOBS]
 #   ./island.sh test-gpu-knobs [CFG] [START] [N]        # correctness smoke for GPU knobs
 #   ./island.sh bench-gpu-knobs [CFG] [START] [N]       # throughput benchmark for GPU knobs
 #   ./island.sh validate CFG NONCE...                  # quantum-confirm 0/0/0 + score
@@ -86,6 +89,7 @@ esac
 : "${CHALLENGE:?set CHALLENGE in config.env}"; : "${GPU:=local}"; : "${REMOTE_SSH:=}"
 : "${REMOTE_DIR:=.ecdsafail_island}"; : "${NVCC_ARCH:=auto}"; : "${GPUS:=auto}"; : "${BLOCKS:=512}"
 : "${GPU_BATCH_INV:=0}"; : "${GPU_COMB_BITS:=8}"; : "${GPU_GCD_MODE:=full_first}"; : "${GPU_WAVE:=128}"; : "${GPU_FAN_BITS:=0}"; : "${GPU_FILTER:=dialog}"; : "${GPU_TRAILMIX_THIN:=0}"; : "${GPU_TRAILMIX_SLACK:=0}"; : "${GPU_TRAILMIX_WINDOW:=0}"; : "${GPU_STREAM_CANDIDATES:=1}"
+: "${EVAL_STAGE2_SHOTS:=9024}"
 BIN="$CHALLENGE/target/release"; KSRC="$HERE/cuda/gpu_island2.cu"; RDIR="$REMOTE_DIR"
 need_remote(){ [ -n "$REMOTE_SSH" ] || die "GPU=remote needs REMOTE_SSH (init-remote)"; }
 rhost(){ echo "$REMOTE_SSH" | grep -oE '[^ ]+@[^ ]+' | head -1; }
@@ -102,21 +106,33 @@ eval_supports_tail_nonce(){
   grep -a -q "EVAL_TAIL_NONCE" "$BIN/eval_circuit" 2>/dev/null
 }
 emit_validation_line(){ # nonce out eval_rc
-  local nonce="$1" out="$2" eval_rc="$3" cls pha anc tof q detail
+  local nonce="$1" out="$2" eval_rc="$3" cls pha anc tof q shots detail prefix
   cls=$(echo "$out"|grep "classical mismatches"|grep -oE '[0-9]+$')
   pha=$(echo "$out"|grep "phase-garbage"|grep -oE '[0-9]+$')
   anc=$(echo "$out"|grep "ancilla-garbage"|grep -oE '[0-9]+$')
   tof=$(echo "$out"|grep "avg executed Toffoli"|grep -oE '[0-9.]+'|head -1)
   q=$(echo "$out"|grep -E '^  qubits '|grep -oE '[0-9]+$'|head -1)
+  shots=$(echo "$out"|grep "tested shots"|grep -oE '[0-9]+$'|head -1)
   if [ -z "${cls:-}" ] || [ -z "${pha:-}" ] || [ -z "${anc:-}" ]; then
     detail=$(echo "$out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g')
     emit_validation_record "ERROR nonce=$nonce stage=eval rc=$eval_rc detail=${detail:-eval_circuit failed}"
     return
   fi
+  prefix=0
+  truthy "${EVAL_STAGE2_MODE:-0}" && prefix=1
+  [ -n "${EVAL_SHOT_LIMIT:-}" ] && prefix=1
   if [ "${cls:-x}" = 0 ] && [ "${pha:-x}" = 0 ] && [ "${anc:-x}" = 0 ]; then
-    emit_validation_record "CLEAN nonce=$nonce tof=$tof qubits=$q$(line_score_suffix "$tof" "$q")"
+    if [ "$prefix" = 1 ]; then
+      emit_validation_record "stage2-pass nonce=$nonce shots=${shots:-?} cls=0 pha=0 anc=0 tof=${tof:-?} qubits=${q:-?}"
+    else
+      emit_validation_record "CLEAN nonce=$nonce cls=0 pha=0 anc=0 tof=$tof qubits=$q$(line_score_suffix "$tof" "$q")"
+    fi
   else
-    emit_validation_record "dirty nonce=$nonce cls=${cls:-?} pha=${pha:-?} anc=${anc:-?}"
+    if [ "$prefix" = 1 ]; then
+      emit_validation_record "stage2-reject nonce=$nonce shots=${shots:-?} cls=${cls:-?} pha=${pha:-?} anc=${anc:-?} tof=${tof:-?} qubits=${q:-?}"
+    else
+      emit_validation_record "dirty nonce=$nonce cls=${cls:-?} pha=${pha:-?} anc=${anc:-?} tof=${tof:-?} qubits=${q:-?}"
+    fi
   fi
 }
 run_variant_search(){ # envs state start n chunk
@@ -165,6 +181,25 @@ run_raw_search(){ # envs state start n
     rsh "GPU_STATE=$state KERNEL2=1 BLOCKS=$BLOCKS $envs \$HOME/$RDIR/gpu_island2 $start $n"
   fi
 }
+default_jobs(){
+  if [ -n "${STAGE2_JOBS:-}" ]; then echo "$STAGE2_JOBS"; return; fi
+  if command -v nproc >/dev/null 2>&1; then nproc; return; fi
+  if command -v sysctl >/dev/null 2>&1; then sysctl -n hw.ncpu 2>/dev/null && return; fi
+  echo 4
+}
+extract_nonces(){
+  sed -nE '
+    s/.*nonce=([0-9]+).*/\1/p
+    /^[[:space:]]*[0-9]+[[:space:]]*$/ {
+      s/[[:space:]]//g
+      p
+    }
+  ' | sort -n -u
+}
+extract_file_nonces(){ # file
+  [ -s "$1" ] || return 0
+  extract_nonces < "$1"
+}
 bench_variant(){ # name envs state start n summary_file
   local name="$1" envs="$2" state="$3" start="$4" n="$5" summary="$6"
   local warmups="${GPU_BENCH_WARMUPS:-1}" runs="${GPU_BENCH_RUNS:-3}"
@@ -202,7 +237,7 @@ doctor)
 install)
   cp "$HERE"/rust/*.rs "$CHALLENGE/src/bin/"
   ( cd "$CHALLENGE" && cargo build --release \
-      --bin build_circuit --bin eval_circuit --bin dump_gpu_state --bin count_tof --bin island_search )
+      --bin build_circuit --bin eval_circuit --bin dump_gpu_state --bin count_tof --bin island_search --bin obligation_filter )
   echo ">> installed. Sanity: (cd $CHALLENGE && ecdsafail run) must print the leaderboard score, 0/0/0."
   ;;
 
@@ -388,7 +423,7 @@ bench-gpu-knobs)
 validate)
   CFG="${1:-}"; shift || true; [ $# -gt 0 ] || die "usage: validate CFG NONCE..."
   if truthy "${VALIDATE_REUSE_OPS:-0}"; then
-    eval_supports_tail_nonce || die "VALIDATE_REUSE_OPS=1 needs patches/eval_fast_reject.diff applied and eval_circuit rebuilt"
+    eval_supports_tail_nonce || die "VALIDATE_REUSE_OPS=1 needs patches/eval_stage2_prefilter.diff applied and eval_circuit rebuilt"
     d="$(mktemp -d)"
     build_out=$( cd "$d" && env ${CFG:+$CFG} DIALOG_TAIL_NONCE=0 "$BIN/build_circuit" 2>&1 )
     build_rc=$?
@@ -421,6 +456,172 @@ validate)
       emit_validation_line "$nonce" "$out" "$eval_rc"
     done
   fi
+  ;;
+
+stage2)
+  CFG="${1:-}"; CAND="${2:-}"; OUT="${3:-stage2-results.log}"; JOBS="${4:-$(default_jobs)}"
+  [ -n "$CAND" ] || die "usage: stage2 CFG CANDIDATES|- [RESULTS.log] [JOBS]"
+  [ "$JOBS" -gt 0 ] 2>/dev/null || die "JOBS must be a positive integer"
+  eval_supports_tail_nonce || die "stage2 needs patches/eval_stage2_prefilter.diff applied and eval_circuit rebuilt with EVAL_TAIL_NONCE support"
+  ALL="$(mktemp)"; SEEN="$(mktemp)"; TODO="$(mktemp)"
+  WORK="$(mktemp -d)"
+  trap 'rm -f "$ALL" "$SEEN" "$TODO"; rm -rf "$WORK"' EXIT
+  if [ "$CAND" = "-" ]; then
+    extract_nonces > "$ALL"
+  else
+    [ -f "$CAND" ] || die "candidate file not found: $CAND"
+    extract_nonces < "$CAND" > "$ALL"
+  fi
+  extract_file_nonces "$OUT" > "$SEEN"
+  if [ -s "$SEEN" ]; then
+    awk 'NR==FNR { done[$1]=1; next } !($1 in done)' "$SEEN" "$ALL" > "$TODO"
+  else
+    cp "$ALL" "$TODO"
+  fi
+  total=$(wc -l < "$ALL" | tr -d ' ')
+  seen=$(wc -l < "$SEEN" | tr -d ' ')
+  todo=$(wc -l < "$TODO" | tr -d ' ')
+  EVAL_STAGE2_PREFIX="${EVAL_SHOT_LIMIT:-$EVAL_STAGE2_SHOTS}"
+  [ "$EVAL_STAGE2_PREFIX" -gt 0 ] 2>/dev/null || die "EVAL_STAGE2_SHOTS/EVAL_SHOT_LIMIT must be a positive integer"
+  EVAL_FAST_REJECT="${EVAL_FAST_REJECT:-1}"
+  echo ">> stage2 exact prefilter: candidates=$total already_logged=$seen todo=$todo shots=$EVAL_STAGE2_PREFIX jobs=$JOBS fast_reject=$EVAL_FAST_REJECT out=$OUT"
+  if [ "$todo" = 0 ]; then
+    echo ">> stage2: no new candidates"
+    exit 0
+  fi
+  mkdir -p "$(dirname "$OUT")"
+  if [ -n "${STAGE2_BATCH:-}" ]; then
+    echo ">> stage2: STAGE2_BATCH is ignored; this command now builds once and evaluates one nonce per worker"
+  fi
+  echo ">> stage2: building reusable nonce-0 ops.bin"
+  build_out=$( cd "$WORK" && env ${CFG:+$CFG} DIALOG_TAIL_NONCE=0 "$BIN/build_circuit" 2>&1 )
+  build_rc=$?
+  if [ "$build_rc" -ne 0 ]; then
+    detail=$(echo "$build_out" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g' | cut -c1-2000)
+    die "stage2 build failed rc=$build_rc detail=${detail:-build_circuit failed}"
+  fi
+  [ -s "$WORK/ops.bin" ] || die "stage2 build did not produce ops.bin in $WORK"
+  export EVAL_STAGE2_PREFIX EVAL_FAST_REJECT
+  xargs -n 1 -P "$JOBS" bash -c '
+    bin="$1"; work="$2"; cfg="$3"; out_file="$4"; lock_file="$5"; prefix="$6"; fast="$7"; nonce="$8"
+    out=$( cd "$work" && env ${cfg:+$cfg} EVAL_STAGE2_MODE=1 EVAL_FAST_REJECT="$fast" EVAL_SHOT_LIMIT="$prefix" EVAL_TAIL_NONCE="$nonce" "$bin/eval_circuit" --note "stage2-$nonce" 2>&1 )
+    rc=$?
+    cls=$(printf "%s\n" "$out" | grep "classical mismatches" | grep -oE "[0-9]+$" | tail -1)
+    pha=$(printf "%s\n" "$out" | grep "phase-garbage" | grep -oE "[0-9]+$" | tail -1)
+    anc=$(printf "%s\n" "$out" | grep "ancilla-garbage" | grep -oE "[0-9]+$" | tail -1)
+    tof=$(printf "%s\n" "$out" | grep "avg executed Toffoli" | grep -oE "[0-9.]+" | head -1)
+    q=$(printf "%s\n" "$out" | grep -E "^  qubits " | grep -oE "[0-9]+$" | head -1)
+    shots=$(printf "%s\n" "$out" | grep "tested shots" | grep -oE "[0-9]+$" | head -1)
+    if [ -z "${cls:-}" ] || [ -z "${pha:-}" ] || [ -z "${anc:-}" ]; then
+      detail=$(printf "%s\n" "$out" | tr "\n" " " | sed -E "s/[[:space:]]+/ /g" | cut -c1-2000)
+      line="ERROR nonce=$nonce stage=stage2 rc=$rc detail=${detail:-eval_circuit failed}"
+    elif [ "$cls" = 0 ] && [ "$pha" = 0 ] && [ "$anc" = 0 ]; then
+      line="stage2-pass nonce=$nonce shots=${shots:-?} cls=0 pha=0 anc=0 tof=${tof:-?} qubits=${q:-?}"
+    else
+      line="stage2-reject nonce=$nonce shots=${shots:-?} cls=${cls:-?} pha=${pha:-?} anc=${anc:-?} tof=${tof:-?} qubits=${q:-?}"
+    fi
+    if command -v flock >/dev/null 2>&1; then
+      { flock 9; printf "%s\n" "$line" >> "$out_file"; } 9>"$lock_file"
+    else
+      printf "%s\n" "$line" >> "$out_file"
+    fi
+    printf "%s\n" "$line"
+  ' _ "$BIN" "$WORK" "$CFG" "$OUT" "$OUT.lock" "$EVAL_STAGE2_PREFIX" "$EVAL_FAST_REJECT" < "$TODO"
+  echo ">> stage2 survivors: $(grep -c '^stage2-pass nonce=' "$OUT" 2>/dev/null || true)"
+  ;;
+
+obligations)
+  SUB="${1:-help}"; shift || true
+  case "$SUB" in
+  emit-default|emit-dialog-gcd|emit-trailmix-ludicrous)
+    OUT="${1:-}"
+    MODE="${SUB#emit-}"
+    [ -x "$BIN/obligation_filter" ] || die "obligation_filter not built. Run: ./island.sh install"
+    if [ -n "$OUT" ]; then
+      mkdir -p "$(dirname "$OUT")"
+      "$BIN/obligation_filter" "emit-$MODE" > "$OUT"
+      echo ">> wrote obligation manifest $OUT"
+    else
+      "$BIN/obligation_filter" "emit-$MODE"
+    fi
+    ;;
+  check)
+    CFG="${1:-}"; MANIFEST="${2:-}"; CAND="${3:-}"; OUT="${4:-obligation-results.log}"; JOBS="${5:-${OBLIGATION_JOBS:-$(default_jobs)}}"
+    [ -n "$CAND" ] || die "usage: obligations check CFG MANIFEST CANDIDATES|- [RESULTS.log] [JOBS]"
+    [ -f "$MANIFEST" ] || die "manifest file not found: $MANIFEST"
+    [ "$JOBS" -gt 0 ] 2>/dev/null || die "JOBS must be a positive integer"
+    [ -x "$BIN/obligation_filter" ] || die "obligation_filter not built. Run: ./island.sh install"
+    ALL="$(mktemp)"; SEEN="$(mktemp)"; TODO="$(mktemp)"
+    trap 'rm -f "$ALL" "$SEEN" "$TODO"' EXIT
+    if [ "$CAND" = "-" ]; then
+      extract_nonces > "$ALL"
+    else
+      [ -f "$CAND" ] || die "candidate file not found: $CAND"
+      extract_nonces < "$CAND" > "$ALL"
+    fi
+    extract_file_nonces "$OUT" > "$SEEN"
+    if [ -s "$SEEN" ]; then
+      awk 'NR==FNR { done[$1]=1; next } !($1 in done)' "$SEEN" "$ALL" > "$TODO"
+    else
+      cp "$ALL" "$TODO"
+    fi
+    total=$(wc -l < "$ALL" | tr -d ' ')
+    seen=$(wc -l < "$SEEN" | tr -d ' ')
+    todo=$(wc -l < "$TODO" | tr -d ' ')
+    OBLIGATION_SHOTS="${OBLIGATION_SHOTS:-9024}"
+    OBLIGATION_BATCH="${OBLIGATION_BATCH:-64}"
+    [ "$OBLIGATION_SHOTS" -gt 0 ] 2>/dev/null || die "OBLIGATION_SHOTS must be a positive integer"
+    [ "$OBLIGATION_SHOTS" -le 9024 ] 2>/dev/null || die "OBLIGATION_SHOTS must be <= 9024"
+    [ "$OBLIGATION_BATCH" -gt 0 ] 2>/dev/null || die "OBLIGATION_BATCH must be a positive integer"
+    ERR="${OBLIGATION_ERRORS_LOG:-$(dirname "$OUT")/obligation-errors.log}"
+    echo ">> exact obligation prefilter: candidates=$total already_logged=$seen todo=$todo shots=$OBLIGATION_SHOTS jobs=$JOBS batch=$OBLIGATION_BATCH out=$OUT errors=$ERR"
+    if [ "$todo" = 0 ]; then
+      echo ">> obligations: no new candidates"
+      exit 0
+    fi
+    mkdir -p "$(dirname "$OUT")" "$(dirname "$ERR")"
+    export OBLIGATION_SHOTS
+    xargs -n "$OBLIGATION_BATCH" -P "$JOBS" bash -c '
+      bin="$1"; cfg="$2"; manifest="$3"; out_file="$4"; out_lock="$5"; err_file="$6"; err_lock="$7"; shift 7
+      out=$(env ${cfg:+$cfg} "$bin/obligation_filter" check "$manifest" "$@" 2>&1)
+      rc=$?
+      if [ "$rc" -ne 0 ]; then
+        detail=$(printf "%s\n" "$out" | tr "\n" " " | sed -E "s/[[:space:]]+/ /g" | cut -c1-2000)
+        for nonce in "$@"; do
+          line="ERROR nonce=$nonce stage=obligations rc=$rc detail=${detail:-obligation_filter failed}"
+          if command -v flock >/dev/null 2>&1; then
+            { flock 9; printf "%s\n" "$line" >> "$err_file"; } 9>"$err_lock"
+          else
+            printf "%s\n" "$line" >> "$err_file"
+          fi
+          printf "%s\n" "$line"
+        done
+        exit 0
+      fi
+      printf "%s\n" "$out" | while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in
+          obligation-pass\ nonce=*|obligation-reject\ nonce=*) ;;
+          *) printf "%s\n" "$line" >&2; continue ;;
+        esac
+        if command -v flock >/dev/null 2>&1; then
+          { flock 9; printf "%s\n" "$line" >> "$out_file"; } 9>"$out_lock"
+        else
+          printf "%s\n" "$line" >> "$out_file"
+        fi
+        printf "%s\n" "$line"
+      done
+    ' _ "$BIN" "$CFG" "$MANIFEST" "$OUT" "$OUT.lock" "$ERR" "$ERR.lock" < "$TODO"
+    echo ">> obligation survivors: $(grep -c '^obligation-pass nonce=' "$OUT" 2>/dev/null || true)"
+    ;;
+  help|*)
+    echo "usage:"
+    echo "  ./island.sh obligations emit-default [OUT]"
+    echo "  ./island.sh obligations emit-dialog-gcd [OUT]"
+    echo "  ./island.sh obligations emit-trailmix-ludicrous [OUT]"
+    echo "  ./island.sh obligations check CFG MANIFEST CANDIDATES|- [RESULTS.log] [JOBS]"
+    ;;
+  esac
   ;;
 
 bake)

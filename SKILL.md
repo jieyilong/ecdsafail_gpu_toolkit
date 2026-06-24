@@ -89,17 +89,22 @@ the previous-release binary and this branch with the scan baseline both measured
   at the first bad shot): early-failing dirty candidates hit ~1.9s, but GCD-clean-but-eval-dirty
   ones — exactly what a GPU hunt feeds the validator — fail *later*, ~6s; vs ~17s stock
   (~2.6–8.5×). Clean islands still take the full ~17s (they must check all 9024 shots).
-  **Needs `patches/eval_fast_reject.diff` applied + `cargo build --release --bin eval_circuit`**
+  **Needs `patches/eval_stage2_prefilter.diff` applied + `cargo build --release --bin eval_circuit`**
   (reset by `ecdsafail sync`; `eval_circuit.rs` is a local tool, not a submitted file, so this
   never touches the grader). `island.sh validate` sets `EVAL_FAST_REJECT=1` by default.
-- `VALIDATE_REUSE_OPS=1` — **eval build-cache (Phase-2 / validate only)**: builds nonce 0
-  once per `validate` invocation, then evaluates every requested candidate with
-  `EVAL_TAIL_NONCE=<nonce>`. This is exact for circuits with the fixed 96-op `DIALOG_TAIL_NONCE`
-  identity tail: the evaluator hashes the synthetic candidate tail but simulates the same
-  identity body. Use it for multi-candidate validation batches after applying the same patch.
+- `EVAL_SHOT_LIMIT=N` / `EVAL_STAGE2_SHOTS=N` — **stage-2 exact prefilter**: after
+  `GPU_FILTER=ludicrous` emits GCD-clean candidates, run `./island.sh stage2 CFG cands.log
+  stage2.log <jobs>`. This invokes the trusted evaluator on a shot prefix and rejects only
+  when a checked shot has a real circuit violation. A `stage2-pass` is only a survivor for
+  later full 9024-shot validation, never a submit-safe clean proof.
+- `VALIDATE_REUSE_OPS=1` — **validation build cache**: build one nonce-0 `ops.bin`, then
+  evaluate many candidate nonces by setting `EVAL_TAIL_NONCE` in the patched evaluator. This
+  is exact because `DIALOG_TAIL_NONCE` only changes the target IDs of the final 96 `X;X`
+  identity-tail ops. Use this for large batches and remote own-host validation. `stage2`
+  enables it automatically and uses `STAGE2_BATCH=32` unless overridden.
 - `VALIDATE_RESULTS_LOG=/path/results.log` — optional validate-only durable verdict ledger.
   `island.sh validate` still prints every result to stdout, and additionally appends successful
-  `dirty` / `CLEAN` verdict lines to this file under `flock` when available.
+  `dirty` / `CLEAN` / `stage2-*` verdict lines to this file under `flock` when available.
 - `VALIDATE_ERRORS_LOG=/path/errors.log` — optional validate-only retry ledger for
   `ERROR ... stage=build/eval ...` rows. If omitted, errors go to `errors.log` next to
   `VALIDATE_RESULTS_LOG`. Do not count these nonces as validated; rerun them.

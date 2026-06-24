@@ -300,7 +300,30 @@ and simulates all 9024 shots and reads `0/0/0`.
 This is the **exact "apply pre-scan"**: the full eval already checks apply-cleanliness, so a
 fast-rejecting eval *is* the apply pre-scan — with zero false negatives and no GPU
 re-implementation of the apply phase. The change lives in the challenge repo (reset by
-`ecdsafail sync`); re-apply `patches/eval_fast_reject.diff`.
+`ecdsafail sync`); re-apply `patches/eval_stage2_prefilter.diff`.
+
+For high-density TrailMix-ludicrous scans, the same patch also supports
+`EVAL_SHOT_LIMIT` / `EVAL_STAGE2_SHOTS`. Stage 2 defaults to `9024`, so it is full-shot
+trusted eval with early reject. Setting a lower value turns trusted eval into an exact
+stage-2 candidate prefilter: a checked-shot failure rejects the nonce, while a prefix pass
+is only a survivor for later full validation.
+
+The patch also supports `EVAL_TAIL_NONCE`, which removes repeated circuit-build cost. Since
+the nonce tail is fixed-length `X;X` identities, a nonce-0 `ops.bin` has the same unitary as
+any nonce's `ops.bin`; only the serialized tail target IDs change the Fiat-Shamir hash. The
+validator can therefore build once and hash the tail as the candidate nonce during eval.
+`./island.sh stage2` uses this directly: one build per stage-2 invocation, parallel
+candidate evals with `EVAL_TAIL_NONCE`, and immediate `stage2-pass` / `stage2-reject`
+log streaming. `STAGE2_BATCH` is no longer part of the stage-2 cost model.
+
+When a circuit optimization has an exact classical side condition that is not part of the
+GCD schedule, prefer an obligation manifest over a new hand-coded CUDA filter. Examples:
+a discarded carry must be zero, a narrowed comparator window must agree with the full
+comparison, or a low-limb subtract must not borrow. `obligation_filter` implements those
+generic predicates over stable point-add shot values and can be run with
+`./island.sh obligations check` before full stage2 validation. The no-false-negative rule is
+unchanged: only emit obligations that the clean circuit is mathematically required to
+satisfy, and smoke-test known clean nonces before using a manifest on a production hunt.
 
 ## `dx`-First Quick Filter
 

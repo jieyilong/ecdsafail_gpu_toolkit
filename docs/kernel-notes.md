@@ -80,11 +80,32 @@ nonce.
   it defers the per-shot EC-muls into the batch loop and stops at the first failing batch.
   ~8.5× avg on dirty candidates; exact (the full eval already checks apply-cleanliness, so
   this *is* the apply pre-scan). Default off keeps scoring byte-identical. Patch:
-  `patches/eval_fast_reject.diff`.
-- `VALIDATE_REUSE_OPS=1` is also an eval-phase knob: `island.sh validate` builds one
-  nonce-0 circuit body, then validates each supplied candidate by setting `EVAL_TAIL_NONCE`
-  in the patched evaluator. This removes repeated `build_circuit` calls from validation
-  batches and is exact for the standard fixed 96-op `DIALOG_TAIL_NONCE` identity tail.
+  `patches/eval_stage2_prefilter.diff`.
+- `EVAL_SHOT_LIMIT=N` / `EVAL_STAGE2_SHOTS=N` controls the trusted eval shot count for
+  `./island.sh stage2`. Default is `9024`, so stage 2 is full-shot eval with early reject.
+  Lower values, such as `512`, make stage 2 a prefix prefilter. Partial runs do not write
+  `score.json` or `results.tsv`; a prefix pass is only a survivor, not a clean-island proof.
+- `VALIDATE_REUSE_OPS=1` makes validation build one nonce-0 `ops.bin` and reuse it for
+  a batch of nonces. The patched evaluator's `EVAL_TAIL_NONCE` rewrites only the
+  Fiat-Shamir hash of the 96-op identity tail, so this removes repeated `build_circuit`
+  cost while preserving exact candidate inputs. `stage2` uses the same one-build idea
+  directly: it builds once for the whole invocation, then evaluates one candidate nonce
+  per worker. `STAGE2_BATCH` is deprecated and ignored; use `JOBS` / `STAGE2_JOBS` for
+  parallelism.
+- `VALIDATE_RESULTS_LOG` / `VALIDATE_ERRORS_LOG` can split durable validation verdicts
+  from retryable build/eval errors during distributed validation.
+- `obligation_filter` is a CPU-side exact partial prefilter for circuit-specific
+  obligations that should not be hard-coded into the CUDA GCD kernel. It derives stable
+  point-add shot values (`tx`, `ty`, `ox`, `oy`, `rx`, `ry`, `dx`, `dy`, `c`) and evaluates a
+  line-oriented manifest. The default manifest is empty; production manifests must contain
+  only exact builder/audit obligations and must be smoke-tested against known clean nonces.
+  Use `./island.sh obligations check` between GPU search and stage2/full validation.
+  For the f5c7775 q1162 TrailMix-ludicrous/product-min circuit,
+  `./island.sh obligations emit-trailmix-ludicrous` emits an active
+  `trailmix_top_level_fold_exact` manifest. It checks only top-level `ec_add` +f/-f fold
+  no-escape obligations and is smoke-tested against known-clean nonce 168011267. Internal
+  jump-GCD apply/phase behavior remains delegated to `./island.sh stage2` with
+  `EVAL_STAGE2_SHOTS=9024`.
 
 Recommended safer search settings on the RTX 5090:
 

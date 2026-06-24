@@ -80,8 +80,58 @@ GPU `CLEAN` is necessary but not sufficient: ~9% of GCD-clean candidates fail th
 `eval_circuit` 0/0/0 check (usually 1–3 apply-phase "phase-garbage" shots). Always
 quantum-confirm before submitting — `./island.sh validate` does this.
 
+For TrailMix-ludicrous, that blind spot is larger because `GPU_FILTER=ludicrous` checks only
+whether the two inversion factors fit the baked product-min jump-GCD schedule. Use it as
+stage 1, then run `./island.sh stage2` on the emitted candidates. Stage 2 is not a heuristic:
+it invokes the trusted evaluator with `EVAL_FAST_REJECT=1`. By default it checks all 9024
+Fiat-Shamir shots; set `EVAL_STAGE2_SHOTS` lower only when you deliberately want a prefix
+triage pass. Any rejection is a real circuit violation on a checked shot, so a clean
+9024-shot nonce cannot be lost. A default `stage2-pass` has passed the full eval shot set;
+a lower-shot pass is only a survivor for later full validation. The command builds one
+nonce-0 `ops.bin` for the whole stage-2 invocation, then evaluates candidate nonces in
+parallel with `EVAL_TAIL_NONCE`; results are appended as soon as each nonce finishes, so
+long validation batches can be tailed or resumed.
+
+Validation can also skip nearly all per-candidate circuit-building cost. The point-add circuit
+body is independent of `DIALOG_TAIL_NONCE`; only the final 96 identity-tail ops change their
+target qubit IDs to reseed SHAKE256. With the stage-2 evaluator patch, validation can build
+nonce 0 once, keep that `ops.bin`, and ask `eval_circuit` to hash the tail as
+`EVAL_TAIL_NONCE=<candidate>` for each candidate. The simulator still runs the nonce-0 tail,
+which is equivalent because each tail bit is an `X;X` identity pair. `./island.sh stage2`
+uses that one-build path automatically; `VALIDATE_REUSE_OPS=1 ./island.sh validate ...`
+offers the same trick for ad hoc validation batches.
+
+## Generic exact obligation prefilters
+
+Not every false positive should be pushed into the CUDA GCD kernel. Carry drops, narrowed
+comparators, fold overflows, and phase-tail controls are more circuit-specific, and they
+change as new SOTA submissions reshuffle the circuit. The stable interface is an
+obligation manifest: the builder or an audited optimization pass writes down exact
+conditions that a clean execution must satisfy, and `obligation_filter` evaluates those
+conditions over the same Fiat-Shamir shot values used by the evaluator.
+
+The checker is generic. It derives `tx`, `ty`, `ox`, `oy`, `rx`, `ry`, `dx`, `dy`, and `c`
+for each shot, then applies simple predicates such as `high_zero`, `add_no_carry`,
+`sub_no_borrow`, `compare_window_agrees`, `low_eq`, `nonzero`, and legacy
+`gcd_factor_fits`. Unknown predicates are errors rather than silent passes. The default
+manifest is empty, so it cannot introduce a false negative; production manifests must be
+smoke-tested against known clean submitted nonces before use.
+
+For the f5c7775 q1162 TrailMix-ludicrous/product-min circuit,
+`emit-trailmix-ludicrous` emits an active `trailmix_top_level_fold_exact` predicate. It
+checks the top-level `ec_add` coordinate primitive only: the submitted builder's explicit
+`+f`/`-f` pseudo-Mersenne corrections for `x2 -= ox`, `y2 -= oy`, the
+`x2 += ox; temp = 2*ox; x2 += 2*ox` chain, `y2 -= oy`, and `x2 -= ox` before the final
+negate. It rejects only hard fold-escape cases where the correction would carry or borrow
+out of the low `PAD + F_BITLEN` limb. The known-clean f5c7775 nonce 168011267 passes this
+manifest over all 9024 shots. The manifest intentionally does not replay internal
+jump-GCD apply/phase behavior; use `./island.sh stage2` with `EVAL_STAGE2_SHOTS=9024` when
+exact apply/phase filtering is needed for this family.
+
 ## Pipeline summary
 ```
 config (lever)  --dump_gpu_state-->  gpu_state.bin  --gpu_island2-->  CLEAN candidates
-   --eval_circuit-->  0/0/0 island   --bake (perl, CRLF-safe)-->  mod.rs   --ecdsafail submit-->
+   --optional obligation manifest filter--> candidates
+   --stage2 exact eval filter--> survivors --eval_circuit-->  0/0/0 island
+   --bake (perl, CRLF-safe)-->  mod.rs   --ecdsafail submit-->
 ```
